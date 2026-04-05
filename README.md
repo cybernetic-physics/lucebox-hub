@@ -5,8 +5,9 @@
 <h1 align="center">Luce Megakernel</h1>
 
 <p align="center">
-  The first megakernel for hybrid DeltaNet/Attention LLMs.<br/>
+  <strong>The first megakernel for hybrid DeltaNet/Attention LLMs.</strong><br/>
   All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch.<br/>
+  1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2x the throughput.<br/><br/>
   <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/NjweHTtTVj">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
@@ -19,28 +20,121 @@ llama.cpp  (RTX 3090)   11,247       267         0.76
 Apple M5 Max               -         229         1.76
 ```
 
-## What this is
+> The efficiency gap between NVIDIA and Apple isn't inherent to the silicon. It's an artifact of running generic software on capable hardware.
 
-A persistent CUDA kernel that processes the entire Qwen 3.5-0.8B forward pass in one dispatch. 18 DeltaNet layers + 6 attention layers, no CPU round-trips between them.
+## Why this exists
 
+Conventional wisdom says NVIDIA GPUs are fast but power hungry, and Apple Silicon is slower but efficient. On paper, that checks out: llama.cpp on an RTX 3090 gets 267 tok/s at 350W (0.76 tok/J), while an M5 Max gets 229 tok/s at ~130W (1.76 tok/J). NVIDIA is faster, but 2.3x worse on efficiency.
 Qwen 3.5-0.8B uses a hybrid DeltaNet + Attention architecture (linear attention interleaved with standard attention). No fused kernel existed for this pattern. This is the first.
 
 Inspired by [Hazy Research's megakernel work on Llama-1B](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles), we asked: can the same idea work for hybrid DeltaNet/Attention models on consumer GPUs?
 
-## Run
+We thought the problem was never the hardware. The RTX 3090 has 936 GB/s memory bandwidth and 142 TFLOPS FP16 compute. Extracting only 267 tok/s from that is a software problem.
 
-```bash
-pip install -e .
-python bench_pp_tg.py
-```
+**The culprit: ~100 kernel launches per token.** Each layer boundary returns control to the CPU, dispatches the next kernel, re-fetches weights from global memory, and synchronizes threads. For 24 layers, those microseconds add up, and each one burns power doing nothing useful.
 
-Requires NVIDIA Ampere+ GPU, CUDA 12+, PyTorch 2.0+. Tested on RTX 3090.
+So we fused everything into one kernel.
+
+## Results
+
+### Decode and Prefill (Qwen 3.5-0.8B)
+
+| Method | Prefill pp520 (tok/s) | Decode tg128 (tok/s) |
+|--------|:---------------------:|:--------------------:|
+| **Megakernel** | **37,800** | **413** |
+| llama.cpp BF16 | 11,247 | 267 |
+| PyTorch HuggingFace | 7,578 | 108 |
+
+3.4x faster prefill, 1.55x faster decode, 3.8x faster than PyTorch. Same hardware, same model, same weights.
+
+### Energy Efficiency (DVFS Power Sweep)
+
+| Power Limit | Clock | Draw | tok/s | tok/J | vs Stock |
+|:-----------:|:-----:|:----:|:-----:|:-----:|:--------:|
+| 420W (stock) | 1980 MHz | 314W | 433 | 1.38 | baseline |
+| 300W | 1935 MHz | 299W | 432 | 1.44 | 99.8% speed, 5% less power |
+| **220W** | **1635 MHz** | **220W** | **411** | **1.87** | **95% speed, 30% less power** |
+| 150W | 405 MHz | 150W | 194 | 1.29 | too aggressive |
+
+Sweet spot at 220W: 95% of the speed, 30% less power. The curve is nonlinear, tight execution converts directly into saved watts until you starve the GPU too aggressively.
+
+### The Comparison That Shouldn't Exist
+
+| Metric | RTX 3090 (llama.cpp) | M5 Max | RTX 3090 (Megakernel @220W) |
+|--------|:--------------------:|:------:|:---------------------------:|
+| tok/s | 267 | 229 | **411** |
+| Power | 350W | ~130W | 220W |
+| tok/J | 0.76 | 1.76 | **1.87** |
+| GPU price | ~$400 | $2,499+ (system) | ~$400 |
+
+A $400 GPU from 2020, power-limited to 220W, matches Apple's latest chip on efficiency while delivering 1.8x the throughput.
 
 ## How it works
 
-Each token goes through all 24 layers inside one kernel (82 blocks x 512 threads). DeltaNet recurrence stays in F32 registers. KV cache updates in-kernel. Layers sync via cooperative grid instead of separate launches.
+A single persistent CUDA kernel processes the entire Qwen 3.5-0.8B forward pass in one dispatch. No CPU round-trips between layers.
 
-BF16 weights, BF16 activations, FP32 accumulation. Weights loaded directly from HuggingFace.
+**Architecture:** Qwen 3.5-0.8B is a hybrid model, 18 DeltaNet layers (linear attention with learned recurrence) and 6 full attention layers, in a 3:1 ratio. DeltaNet scales linearly with context length vs. quadratic for standard attention. It's an emerging pattern in next-gen models (Qwen3-Next, Kimi Linear), but no framework had optimized kernels for it.
+
+**Kernel specs:**
+- 82 blocks, 512 threads, all SMs on the RTX 3090 kept occupied
+- BF16 weights and activations, FP32 accumulation where it matters
+- DeltaNet recurrence via warp-cooperative state updates in F32 registers
+- Full attention with online softmax (fused QKV, RoPE, causal mask, output projection)
+- Cooperative grid sync between layers instead of kernel launches (zero inter-layer overhead)
+- KV cache updates in-kernel
+- Weights loaded directly from HuggingFace
+
+**What traditional frameworks do:** launch ~100 separate kernels per token, each one paying the cost of CPU dispatch, weight re-fetch, and thread synchronization. The megakernel eliminates all of that.
+
+## Why DeltaNet matters
+
+Standard transformers have years of kernel optimization: FlashAttention, PagedAttention, continuous batching. Hybrid DeltaNet/Attention architectures are newer, and the kernel ecosystem is immature:
+
+- **MLX:** no native DeltaNet kernels
+- **llama.cpp:** generic DeltaNet support, no fusion
+- **vLLM/SGLang:** Triton kernels via flash-linear-attention, but no megakernel fusion
+
+As more models go hybrid (and they will, because linear attention scales better), what you run them on matters less than *how* you run them. When you write a kernel that actually uses what the GPU offers, tensor cores, shared memory, cooperative grid launches, register-resident state, a five-year-old GPU matches Apple's latest chip.
+
+## Lessons from building this
+
+**`grid.sync()` inside loops will deadlock silently.** We tried synchronizing all blocks within the per-token DeltaNet recurrence loop. No error message, just a hang. The fix: synchronize between layers, not within them.
+
+**Register pressure kills performance quietly.** We attempted `S_TILE=16` for more instruction-level parallelism. Silent crash, no CUDA error, registers spilled to local memory, performance collapsed. `S_TILE=8` was the sweet spot.
+
+**The power curve is nonlinear.** 420W to 300W lost almost nothing (99.8% speed). 300W to 220W lost marginally (95%). 220W to 150W collapsed to 45%. The megakernel's tight execution means the GPU hits its compute ceiling before its power ceiling, until you starve it too aggressively.
+
+## Quick start
+
+```bash
+git clone https://github.com/Luce-Org/luce-megakernel
+cd luce-megakernel
+pip install -e .
+python bench_pp_tg.py    # runs pp520 tg128, prints tok/s and tok/J
+```
+
+**Requirements:**
+- NVIDIA GPU (Ampere+), tested on RTX 3090
+- CUDA 12+
+- PyTorch 2.0+
+- ~1.5 GB VRAM for BF16 weights
+
+**Optional:** Set a power limit to find your GPU's sweet spot:
+```bash
+sudo nvidia-smi -pl 220    # or whatever your target wattage
+```
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `kernel.cu` | Decode megakernel, all 24 layers in one dispatch |
+| `prefill.cu` | Prefill (cuBLAS + standalone kernels) |
+| `torch_bindings.cpp` | PyTorch C++ bindings |
+| `model.py` | Weight loading + decoder |
+| `setup.py` | Build configuration |
+| `bench_pp_tg.py` | Benchmark (prefill + decode) |
+| `RESULTS.md` | Full benchmark results and DVFS sweep |
 
 ## Scope and limitations
 
@@ -57,13 +151,19 @@ The goal is to demonstrate that architecture-specific kernel fusion eliminates a
 
 ## Files
 
-```
-kernel.cu            Decode megakernel
-prefill.cu           Prefill (cuBLAS + standalone kernels)
-torch_bindings.cpp   PyTorch C++ bindings
-model.py             Weight loading + Decoder
-setup.py             Build
-bench_pp_tg.py       Benchmark
+Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/NjweHTtTVj).
+
+## Citation
+
+If you use this work in your research:
+
+```bibtex
+@software{luce_megakernel_2026,
+  title  = {Luce Megakernel: Fused Forward Pass for Hybrid DeltaNet/Attention LLMs},
+  author = {Luce},
+  url    = {https://github.com/Luce-Org/luce-megakernel},
+  year   = {2026}
+}
 ```
 
 ## Why llama.cpp as a baseline?
