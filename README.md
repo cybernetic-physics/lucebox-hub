@@ -7,7 +7,7 @@
 <p align="center">
   The first megakernel for hybrid DeltaNet/Attention LLMs.<br/>
   All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch.<br/>
-  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://lucebox.com">lucebox.com</a>
+  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/NjweHTtTVj">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
 ---
@@ -73,6 +73,9 @@ llama.cpp is the most widely used local inference engine. It's what most people 
 ## Why an RTX 3090?
 
 Deliberately chosen as the "worst case" for NVIDIA: a 2020 GPU, widely dismissed as power-hungry, available for ~$900-1,000 used. If the software gap is real on old hardware, it's even larger on newer cards.
+## Community
+
+Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/NjweHTtTVj).
 
 ---
 
