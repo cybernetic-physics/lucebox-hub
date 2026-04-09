@@ -182,3 +182,5 @@ Questions, ideas, or want to see what others are building? Join the [Luce Discor
 MIT · [Lucebox](https://lucebox.com)
 
 Built with [Claude](https://claude.ai)
+
+Inspired by [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel).
