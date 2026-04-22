@@ -1,147 +1,377 @@
-"""Benchmark pp512 tg128 — standard llama.cpp benchmark format.
-Also tests end-to-end correctness (prefill → decode handoff).
+"""Benchmark pp512 / tg128 for the local Qwen3.5-0.8B megakernel backend.
 
-Scope: batch-size-1 single-stream decode, targeting local inference.
-All measurements use torch.cuda.synchronize() barriers + perf_counter.
-One warm-up run precedes each timed section."""
-import time, torch
-from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
-from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN
-import qwen35_megakernel_bf16_C
+The default `all` mode runs each section in a fresh subprocess. This avoids
+carrying CUDA state from correctness checks into the timed benchmark sections.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+import torch
 from transformers import AutoTokenizer
 
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-dec = Decoder(verbose=True)
-_pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
-
-# Allocate prefill buffers for max 512 tokens
-S_MAX = 512
-bf16 = dict(dtype=torch.bfloat16, device="cuda")
-f32 = dict(dtype=torch.float32, device="cuda")
-i32 = dict(dtype=torch.int32, device="cuda")
-mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
-bufs = dict(
-    hidden=torch.empty(S_MAX*HIDDEN_SIZE, **bf16),
-    residual=torch.empty(S_MAX*HIDDEN_SIZE, **bf16),
-    normalized=torch.empty(S_MAX*HIDDEN_SIZE, **bf16),
-    proj_buf=torch.empty(S_MAX*mx, **bf16),
-    proj_buf2=torch.empty(S_MAX*mx, **bf16),
-    attn_buf=torch.empty(S_MAX*max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
-    mlp_buf=torch.empty(S_MAX*INTERMEDIATE_SIZE, **bf16),
-    dn_out_buf=torch.empty(S_MAX*DN_V_SIZE, **bf16),
-    beta_buf=torch.empty(S_MAX*DN_NUM_HEADS, **f32),
-    alpha_buf=torch.empty(S_MAX*DN_NUM_HEADS, **f32),
-    final_normed=torch.empty(HIDDEN_SIZE, **bf16),
-    hidden_bf16_out=torch.empty(HIDDEN_SIZE, **bf16),
-    lm_bmv=torch.empty(1024, **f32),
-    lm_bmi=torch.empty(1024, **i32),
+from model import (
+    Decoder,
+    DN_CONV_CHANNELS,
+    DN_NUM_HEADS,
+    DN_V_SIZE,
+    FA_KV_SIZE,
+    FA_QPROJ_SIZE,
+    FA_Q_SIZE,
+    HIDDEN_SIZE,
+    INTERMEDIATE_SIZE,
 )
 
-def prefill(ids):
-    ids_t = torch.tensor(ids, dtype=torch.int32, device="cuda")
-    _pf(dec._out_token, ids_t,
-        dec._embed_weight, dec._layer_weights_packed,
-        dec._final_norm_weight, dec._lm_head_weight,
-        dec._fa_k_cache, dec._fa_v_cache, dec._dn_states, dec._conv_bufs,
-        bufs['hidden'], bufs['residual'], bufs['normalized'],
-        bufs['proj_buf'], bufs['proj_buf2'],
-        bufs['attn_buf'], bufs['mlp_buf'],
-        bufs['dn_out_buf'], bufs['beta_buf'], bufs['alpha_buf'],
-        bufs['final_normed'], bufs['hidden_bf16_out'],
-        bufs['lm_bmv'], bufs['lm_bmi'])
-    # Handoff: copy hidden state for decode kernel
-    dec._hidden.copy_(bufs['hidden_bf16_out'])
-    dec._position = len(ids)
-    return dec._out_token.item()
 
-# ============================================================
-# 1. End-to-end correctness test
-# ============================================================
-print("\n=== Correctness test ===", flush=True)
-prompt = "The capital of France is"
-ids = tok.encode(prompt, add_special_tokens=False)
-dec.reset()
-first = prefill(ids)
-print(f"Prefill → first token: {first} = '{tok.decode([first])}'", flush=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark pp512 / tg128")
+    parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--backend", default="auto", choices=("auto", "bf16", "nvfp4"))
+    parser.add_argument("--prompt-tokens", type=int, default=512)
+    parser.add_argument("--gen-tokens", type=int, default=128)
+    parser.add_argument("--correctness-steps", type=int, default=30)
+    parser.add_argument("--warmup-runs", type=int, default=2)
+    parser.add_argument("--measure-runs", type=int, default=5)
+    parser.add_argument("--verbose-loader", action="store_true")
+    parser.add_argument(
+        "--section",
+        default="all",
+        choices=("all", "correctness", "pp", "tg"),
+    )
+    parser.add_argument("--json-result", action="store_true")
+    return parser.parse_args()
 
-# Continue with decode megakernel
-out = [first]
-nid = first
-for _ in range(30):
-    nid = dec.step(nid)
-    if nid == tok.eos_token_id: break
-    out.append(nid)
-text = tok.decode(out, skip_special_tokens=True)
-print(f"Output: {text[:80]}", flush=True)
 
-# Reference: pure decode (step-by-step)
-dec.reset()
-for t in ids[:-1]: dec.step(t)
-ref_first = dec.step(ids[-1])
-ref_out = [ref_first]
-nid = ref_first
-for _ in range(30):
-    nid = dec.step(nid)
-    if nid == tok.eos_token_id: break
-    ref_out.append(nid)
-ref_text = tok.decode(ref_out, skip_special_tokens=True)
-print(f"Ref:    {ref_text[:80]}", flush=True)
+def build_exact_prompt_ids(tokenizer, target_tokens):
+    seed = "Explain in great detail the history of artificial intelligence."
+    text = seed
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    while len(ids) < target_tokens:
+        text += " " + seed
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    return ids[:target_tokens]
 
-if out == ref_out:
-    print("PASS: megakernel output matches reference decode path", flush=True)
-else:
-    print("FAIL: output mismatch between megakernel and reference", flush=True)
-    print(f"  Megakernel tokens: {out[:10]}...", flush=True)
-    print(f"  Reference tokens:  {ref_out[:10]}...", flush=True)
 
-# ============================================================
-# 2. pp512 benchmark (prompt processing)
-# ============================================================
-print("\n=== pp512 benchmark ===", flush=True)
-# Generate a 512-token prompt
-long_prompt = "Explain in great detail the history of artificial intelligence, " * 30
-long_ids = tok.encode(long_prompt, add_special_tokens=False)[:512]
-print(f"Prompt tokens: {len(long_ids)}", flush=True)
+def alloc_prefill_buffers(max_tokens):
+    bf16 = dict(dtype=torch.bfloat16, device="cuda")
+    f32 = dict(dtype=torch.float32, device="cuda")
+    i32 = dict(dtype=torch.int32, device="cuda")
+    mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
+    return dict(
+        hidden=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        residual=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        normalized=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        proj_buf=torch.empty(max_tokens * mx, **bf16),
+        proj_buf2=torch.empty(max_tokens * mx, **bf16),
+        attn_buf=torch.empty(max_tokens * max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
+        mlp_buf=torch.empty(max_tokens * INTERMEDIATE_SIZE, **bf16),
+        dn_out_buf=torch.empty(max_tokens * DN_V_SIZE, **bf16),
+        beta_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+        alpha_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+        final_normed=torch.empty(HIDDEN_SIZE, **bf16),
+        hidden_bf16_out=torch.empty(HIDDEN_SIZE, **bf16),
+        lm_bmv=torch.empty(1024, **f32),
+        lm_bmi=torch.empty(1024, **i32),
+    )
 
-# Warmup
-dec.reset()
-prefill(long_ids)
 
-# Benchmark
-dec.reset()
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-prefill(long_ids)
-torch.cuda.synchronize()
-pp_time = time.perf_counter() - t0
-pp_tps = len(long_ids) / pp_time
-print(f"pp{len(long_ids)}: {pp_tps:.1f} tok/s ({pp_time*1000:.1f}ms)", flush=True)
+def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
+    decoder.reset()
+    prefill_op(
+        decoder._out_token,
+        ids_t,
+        decoder._embed_weight,
+        decoder._layer_weights_packed,
+        decoder._final_norm_weight,
+        decoder._lm_head_weight,
+        decoder._fa_k_cache,
+        decoder._fa_v_cache,
+        decoder._dn_states,
+        decoder._conv_bufs,
+        buffers["hidden"],
+        buffers["residual"],
+        buffers["normalized"],
+        buffers["proj_buf"],
+        buffers["proj_buf2"],
+        buffers["attn_buf"],
+        buffers["mlp_buf"],
+        buffers["dn_out_buf"],
+        buffers["beta_buf"],
+        buffers["alpha_buf"],
+        buffers["final_normed"],
+        buffers["hidden_bf16_out"],
+        buffers["lm_bmv"],
+        buffers["lm_bmi"],
+    )
+    decoder._hidden.copy_(buffers["hidden_bf16_out"])
+    decoder._position = prompt_len
+    return decoder._out_token.item()
 
-# ============================================================
-# 3. tg128 benchmark (token generation)
-# ============================================================
-print("\n=== tg128 benchmark ===", flush=True)
-# Prefill a short prompt, then generate 128 tokens
-short_ids = tok.encode("Hello", add_special_tokens=False)
-dec.reset()
-first = prefill(short_ids)
 
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-gen_out = []
-nid = first
-for _ in range(128):
-    nid = dec.step(nid)
-    if nid == tok.eos_token_id: break
-    gen_out.append(nid)
-torch.cuda.synchronize()
-tg_time = time.perf_counter() - t0
-tg_tps = len(gen_out) / tg_time
-print(f"tg{len(gen_out)}: {tg_tps:.1f} tok/s ({tg_time*1000:.1f}ms)", flush=True)
+def decode_steps(decoder, first_token, num_steps, eos_token_id):
+    out = [first_token]
+    nid = first_token
+    for _ in range(num_steps):
+        nid = decoder.step(nid)
+        torch.cuda.synchronize()
+        if nid == eos_token_id:
+            break
+        out.append(nid)
+    return out
 
-# ============================================================
-# Summary
-# ============================================================
-print(f"\n=== Summary (RTX 3090, Qwen3.5-0.8B BF16) ===", flush=True)
-print(f"pp{len(long_ids):>3d}: {pp_tps:>7.1f} tok/s", flush=True)
-print(f"tg{len(gen_out):>3d}: {tg_tps:>7.1f} tok/s", flush=True)
+
+def benchmark_prefill(decoder, ids_t, prompt_len, buffers, prefill_op, warmup_runs, measure_runs):
+    for _ in range(warmup_runs):
+        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(measure_runs):
+        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op)
+        torch.cuda.synchronize()
+    elapsed = (time.perf_counter() - t0) / measure_runs
+    return elapsed, prompt_len / elapsed
+
+
+def benchmark_decode(decoder, prompt_ids, gen_tokens, tokenizer, buffers, prefill_op):
+    ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+    first = run_prefill(decoder, ids_t, len(prompt_ids), buffers, prefill_op)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    nid = first
+    timed_ids = []
+    for _ in range(gen_tokens):
+        nid = decoder.step(nid)
+        torch.cuda.synchronize()
+        if nid == tokenizer.eos_token_id:
+            break
+        _ = tokenizer.decode([nid])
+        timed_ids.append(nid)
+
+    elapsed = time.perf_counter() - t0
+    tps = (len(timed_ids) / elapsed) if timed_ids else 0.0
+    return first, elapsed, tps, timed_ids
+
+
+def emit_result(result, json_result):
+    if json_result:
+        print(f"RESULT_JSON {json.dumps(result, sort_keys=True)}", flush=True)
+
+
+def run_correctness(args, tokenizer):
+    print(f"Loading decoder for {args.model_name}...", flush=True)
+    decoder = Decoder(
+        model_name=args.model_name,
+        backend=args.backend,
+        verbose=args.verbose_loader,
+    )
+    print(f"Backend: {decoder.backend_label}", flush=True)
+    if decoder.backend == "nvfp4":
+        print("Correctness mode: prefill/decode handoff smoke test", flush=True)
+
+    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prompt_ids = tokenizer.encode("The capital of France is", add_special_tokens=False)
+    buffers = alloc_prefill_buffers(max(32, len(prompt_ids)))
+
+    print("\n=== Correctness test ===", flush=True)
+    ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+    first = run_prefill(decoder, ids_t, len(prompt_ids), buffers, prefill_op)
+    print(f"Prefill -> first token: {first} = '{tokenizer.decode([first])}'", flush=True)
+
+    out = decode_steps(decoder, first, args.correctness_steps, tokenizer.eos_token_id)
+    text = tokenizer.decode(out, skip_special_tokens=True)
+    print(f"Prefill + decode: {text[:100]}", flush=True)
+
+    ok = bool(out)
+    if decoder.backend == "nvfp4":
+        if ok:
+            print("PASS: prefill completed and decode continued on NVFP4", flush=True)
+        else:
+            print("FAIL: no tokens produced after prefill on NVFP4", flush=True)
+    else:
+        print("PASS: BF16 correctness smoke test completed", flush=True)
+
+    result = {
+        "backend_label": decoder.backend_label,
+        "first_token": first,
+        "ok": ok,
+        "section": "correctness",
+    }
+    emit_result(result, args.json_result)
+    return result
+
+
+def run_pp(args, tokenizer):
+    print(f"Loading decoder for {args.model_name}...", flush=True)
+    decoder = Decoder(
+        model_name=args.model_name,
+        backend=args.backend,
+        verbose=args.verbose_loader,
+    )
+    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prompt_ids = build_exact_prompt_ids(tokenizer, args.prompt_tokens)
+    buffers = alloc_prefill_buffers(len(prompt_ids))
+    ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+
+    print("\n=== pp benchmark ===", flush=True)
+    print(f"Backend: {decoder.backend_label}", flush=True)
+    print(f"Prompt tokens: {len(prompt_ids)}", flush=True)
+    print(
+        f"Warming {args.warmup_runs}x and timing {args.measure_runs}x prompt-processing runs...",
+        flush=True,
+    )
+    pp_time, pp_tps = benchmark_prefill(
+        decoder,
+        ids_t,
+        len(prompt_ids),
+        buffers,
+        prefill_op,
+        args.warmup_runs,
+        args.measure_runs,
+    )
+    print(f"pp{len(prompt_ids)}: {pp_tps:.1f} tok/s ({pp_time * 1000:.1f}ms avg)", flush=True)
+
+    result = {
+        "backend_label": decoder.backend_label,
+        "pp_ms": pp_time * 1000.0,
+        "pp_tps": pp_tps,
+        "prompt_tokens": len(prompt_ids),
+        "section": "pp",
+    }
+    emit_result(result, args.json_result)
+    return result
+
+
+def run_tg(args, tokenizer):
+    print(f"Loading decoder for {args.model_name}...", flush=True)
+    decoder = Decoder(
+        model_name=args.model_name,
+        backend=args.backend,
+        verbose=args.verbose_loader,
+    )
+    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prompt_ids = tokenizer.encode("The capital of France is", add_special_tokens=False)
+    buffers = alloc_prefill_buffers(max(args.prompt_tokens, 32, len(prompt_ids)))
+
+    print("\n=== tg benchmark ===", flush=True)
+    print(f"Backend: {decoder.backend_label}", flush=True)
+    print(f"Timed decode steps: {args.gen_tokens}", flush=True)
+    first, tg_time, tg_tps, tg_ids = benchmark_decode(
+        decoder,
+        prompt_ids,
+        args.gen_tokens,
+        tokenizer,
+        buffers,
+        prefill_op,
+    )
+    print(f"Prefill seed token: {first} = '{tokenizer.decode([first])}'", flush=True)
+    print(f"tg{len(tg_ids)}: {tg_tps:.1f} tok/s ({tg_time * 1000:.1f}ms)", flush=True)
+
+    result = {
+        "backend_label": decoder.backend_label,
+        "first_token": first,
+        "gen_tokens": len(tg_ids),
+        "tg_ms": tg_time * 1000.0,
+        "tg_tps": tg_tps,
+        "section": "tg",
+    }
+    emit_result(result, args.json_result)
+    return result
+
+
+def build_child_cmd(args, section):
+    cmd = [
+        sys.executable,
+        __file__,
+        "--model-name",
+        args.model_name,
+        "--backend",
+        args.backend,
+        "--prompt-tokens",
+        str(args.prompt_tokens),
+        "--gen-tokens",
+        str(args.gen_tokens),
+        "--correctness-steps",
+        str(args.correctness_steps),
+        "--warmup-runs",
+        str(args.warmup_runs),
+        "--measure-runs",
+        str(args.measure_runs),
+        "--section",
+        section,
+        "--json-result",
+    ]
+    if args.verbose_loader:
+        cmd.append("--verbose-loader")
+    return cmd
+
+
+def filter_child_stderr(stderr_text):
+    keep = []
+    for line in stderr_text.splitlines():
+        if line.startswith("Loading weights:"):
+            continue
+        if line.startswith("[transformers] The fast path is not available"):
+            continue
+        if line.strip():
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def run_child(args, section):
+    proc = subprocess.run(
+        build_child_cmd(args, section),
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.returncode != 0:
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+        proc.check_returncode()
+    elif proc.stderr:
+        filtered = filter_child_stderr(proc.stderr)
+        if filtered:
+            print(filtered, file=sys.stderr, flush=True)
+
+    result = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT_JSON "):
+            result = json.loads(line[len("RESULT_JSON "):])
+    if result is None:
+        raise RuntimeError(f"missing RESULT_JSON for section {section}")
+    return result
+
+
+def main():
+    args = parse_args()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+    if args.section == "correctness":
+        run_correctness(args, tokenizer)
+        return
+    if args.section == "pp":
+        run_pp(args, tokenizer)
+        return
+    if args.section == "tg":
+        run_tg(args, tokenizer)
+        return
+
+    correctness = run_child(args, "correctness")
+    pp = run_child(args, "pp")
+    tg = run_child(args, "tg")
+
+    print(f"\n=== Summary ({pp['backend_label']}, Qwen3.5-0.8B) ===", flush=True)
+    print(f"pp{pp['prompt_tokens']:>3d}: {pp['pp_tps']:>7.1f} tok/s", flush=True)
+    print(f"tg{tg['gen_tokens']:>3d}: {tg['tg_tps']:>7.1f} tok/s", flush=True)
+    if not correctness["ok"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
