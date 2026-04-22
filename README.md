@@ -110,6 +110,8 @@ What we ported and tuned:
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
+> **Qwen3.6-27B (experimental):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With the 3.5-trained draft, throughput lands around ~74 tok/s on HumanEval (vs 129.5 on 3.5). Details in [dflash/README.md](dflash/README.md#qwen36-27b-target-experimental).
+
 ---
 
 ## Why this exists

@@ -72,6 +72,25 @@ HE 10-prompt bench mean in 128K mode (ctx=131072, ddtree-budget=16): **134.78 to
 
 Set `DFLASH27B_KV_Q4=1` to enable. Full sweep in [RESULTS.md](RESULTS.md).
 
+## Qwen3.6-27B target (experimental)
+
+Qwen3.6-27B ships the same `qwen35` architecture string and identical layer/head dims as 3.5, so `test_dflash` loads it with no code change:
+
+```bash
+huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
+```
+
+**Throughput is lower than on 3.5.** The z-lab draft was distilled against Qwen3.5 hidden states; Qwen3.6's captured features at layers {1, 16, 31, 46, 61} are shifted, so per-position accept drops about 30 points uniformly. Measured on the same RTX 3090:
+
+| Target | Bench | AL | Accept | Mean tok/s |
+|---|---|---:|---:|---:|
+| Qwen3.5-27B Q4_K_M | HumanEval (README config) | 8.33 | ~65% | 134.78 |
+| Qwen3.6-27B Q4_K_M | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
+| Qwen3.6-27B Q4_K_M | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
+
+Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFLASH_DRAFT=...` without rebuilding.
+
 ## Quick start
 
 ```bash
