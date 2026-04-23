@@ -382,7 +382,7 @@ pf_deltanet_prepare_qk(
 }
 
 // ===== Standalone DeltaNet recurrence tiled over value channels =====
-template <int BLOCK_THREADS, int BLOCKS_PER_HEAD>
+template <int BLOCK_THREADS, int BLOCKS_PER_HEAD, bool SEPARATE_CTRL>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 pf_deltanet_recurrence_tiled(
     const __nv_bfloat16 *__restrict__ qkv_proj,
@@ -415,30 +415,35 @@ pf_deltanet_recurrence_tiled(
     float dt_b = __bfloat162float(dt_bias[h]);
 
     __shared__ float s_beta, s_decay;
-    __shared__ __align__(16) float s_v_conv[VAL_TILE * DN_CONV_K];
-    __shared__ __align__(16) float s_v_conv_w[VAL_TILE * DN_CONV_K];
 
     float *my_state = state + h * DN_KEY * DN_VAL + val_offset * DN_KEY;
     const int v_base = 2 * DN_QK_SIZE + h * DN_VAL + val_offset;
-
-    for (int idx = tid; idx < VAL_TILE * DN_CONV_K; idx += BLOCK_THREADS) {
-        int channel = idx / DN_CONV_K;
-        int tap = idx % DN_CONV_K;
-        int global_ch = v_base + channel;
-        s_v_conv[idx] = conv_buf[global_ch * DN_CONV_K + tap];
-        s_v_conv_w[idx] = __bfloat162float(conv_w[global_ch * DN_CONV_K + tap]);
-    }
-    __syncthreads();
 
     constexpr int CPW = VAL_TILE / NWARPS;
     constexpr int RPL = DN_KEY / 32;
     static_assert(CPW <= 32, "DeltaNet value channels per warp must fit in one warp");
     float sreg[CPW * RPL];
+    float4 v_hist_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 v_weight_reg = make_float4(0.f, 0.f, 0.f, 0.f);
 
+#pragma unroll
     for (int jj = 0; jj < CPW; jj++) {
         int j = wid * CPW + jj;
-        for (int ii = 0; ii < RPL; ii++)
+        for (int ii = 0; ii < RPL; ii++) {
             sreg[jj * RPL + ii] = my_state[j * DN_KEY + lid + ii * 32];
+        }
+    }
+    if (lid < CPW) {
+        int j = wid * CPW + lid;
+        int global_ch = v_base + j;
+        const float *conv_ptr = conv_buf + global_ch * DN_CONV_K;
+        const __nv_bfloat16 *weight_ptr = conv_w + global_ch * DN_CONV_K;
+        v_hist_reg = make_float4(conv_ptr[0], conv_ptr[1], conv_ptr[2], conv_ptr[3]);
+        v_weight_reg = make_float4(
+            __bfloat162float(weight_ptr[0]),
+            __bfloat162float(weight_ptr[1]),
+            __bfloat162float(weight_ptr[2]),
+            __bfloat162float(weight_ptr[3]));
     }
 
     for (int t = 0; t < S; t++) {
@@ -446,7 +451,7 @@ pf_deltanet_recurrence_tiled(
         const __nv_bfloat16 *qk_t = qk_norm + t * qk_stride + h * (DN_KEY * 2);
         float beta_proj_val;
         float alpha_proj_val;
-        if (beta_proj != nullptr && alpha_proj != nullptr) {
+        if constexpr (SEPARATE_CTRL) {
             const __nv_bfloat16 *beta_t = beta_proj + t * ctrl_stride;
             const __nv_bfloat16 *alpha_t = alpha_proj + t * ctrl_stride;
             beta_proj_val = __bfloat162float(beta_t[h]);
@@ -459,14 +464,13 @@ pf_deltanet_recurrence_tiled(
         float v_lane = 0.0f;
         if (lid < CPW) {
             int j = wid * CPW + lid;
-            int base = j * DN_CONV_K;
-            float4 hist = reinterpret_cast<float4 *>(&s_v_conv[base])[0];
-            float4 weight = reinterpret_cast<float4 *>(&s_v_conv_w[base])[0];
+            float4 hist = v_hist_reg;
+            float4 weight = v_weight_reg;
             hist.x = hist.y;
             hist.y = hist.z;
             hist.z = hist.w;
             hist.w = __bfloat162float(qkv_t[v_base + j]);
-            reinterpret_cast<float4 *>(&s_v_conv[base])[0] = hist;
+            v_hist_reg = hist;
             float co = fmaf(hist.x, weight.x, fmaf(hist.y, weight.y, fmaf(hist.z, weight.z, hist.w * weight.w)));
             v_lane = pf_silu(co);
         }
@@ -521,12 +525,16 @@ pf_deltanet_recurrence_tiled(
         }
     }
 
-    for (int idx = tid; idx < VAL_TILE * DN_CONV_K; idx += BLOCK_THREADS) {
-        int channel = idx / DN_CONV_K;
-        int tap = idx % DN_CONV_K;
-        conv_buf[(v_base + channel) * DN_CONV_K + tap] = s_v_conv[idx];
+    if (lid < CPW) {
+        int j = wid * CPW + lid;
+        float *conv_ptr = conv_buf + (v_base + j) * DN_CONV_K;
+        conv_ptr[0] = v_hist_reg.x;
+        conv_ptr[1] = v_hist_reg.y;
+        conv_ptr[2] = v_hist_reg.z;
+        conv_ptr[3] = v_hist_reg.w;
     }
 
+#pragma unroll
     for (int jj = 0; jj < CPW; jj++) {
         int j = wid * CPW + jj;
         for (int ii = 0; ii < RPL; ii++) {
@@ -1280,15 +1288,27 @@ static void launch_prefill_bf16_impl(
                 S);
 
             // Standalone recurrence
-            pf_deltanet_recurrence_tiled<PREFILL_DN_BLOCK_SIZE, PREFILL_DN_BLOCKS_PER_HEAD>
-                <<<DN_HEADS * PREFILL_DN_BLOCKS_PER_HEAD, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
-                proj_buf, dn_proj_stride,
-                proj_buf2, DN_QK_PRECOMP_STRIDE,
-                beta_proj_bf16, alpha_proj_bf16, DN_CTRL_STRIDE,
-                conv_w, a_log, dt_bias,
-                dn_states + dn_idx*dn_stride,
-                conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
-                dn_out_buf, S);
+            if (beta_proj_bf16 != nullptr && alpha_proj_bf16 != nullptr) {
+                pf_deltanet_recurrence_tiled<PREFILL_DN_BLOCK_SIZE, PREFILL_DN_BLOCKS_PER_HEAD, true>
+                    <<<DN_HEADS * PREFILL_DN_BLOCKS_PER_HEAD, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
+                    proj_buf, dn_proj_stride,
+                    proj_buf2, DN_QK_PRECOMP_STRIDE,
+                    beta_proj_bf16, alpha_proj_bf16, DN_CTRL_STRIDE,
+                    conv_w, a_log, dt_bias,
+                    dn_states + dn_idx*dn_stride,
+                    conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
+                    dn_out_buf, S);
+            } else {
+                pf_deltanet_recurrence_tiled<PREFILL_DN_BLOCK_SIZE, PREFILL_DN_BLOCKS_PER_HEAD, false>
+                    <<<DN_HEADS * PREFILL_DN_BLOCKS_PER_HEAD, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
+                    proj_buf, dn_proj_stride,
+                    proj_buf2, DN_QK_PRECOMP_STRIDE,
+                    nullptr, nullptr, DN_CTRL_STRIDE,
+                    conv_w, a_log, dt_bias,
+                    dn_states + dn_idx*dn_stride,
+                    conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
+                    dn_out_buf, S);
+            }
             pf_deltanet_finalize<<<S * DN_HEADS, 64, 0, stream>>>(
                 dn_out_buf,
                 proj_buf,

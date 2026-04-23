@@ -226,6 +226,40 @@ Validated result:
 Relative to the previous stable non-TC prompt path (`20567.1 tok/s`), that is
 about `+8.9%` prompt throughput.
 
+## DeltaNet recurrence register-owner rewrite
+
+The next prompt-side gain came from rewriting the hot DeltaNet recurrence
+kernel so the active value lanes keep their 4-tap conv history and conv
+weights in registers instead of staging them through shared memory. The same
+pass also split the recurrence into separate-control vs fused-control variants,
+so the stable prompt-TC path no longer pays a per-token branch to decide
+whether `beta/alpha` come from the BF16 side path or the fused projection.
+
+I also rechecked the launch shape after this rewrite. `64x8` still loses on
+GB10; `128x8` remains the best validated recurrence tile for the current code.
+
+### Prompt-only benchmark
+
+Command:
+
+```bash
+env HF_HOME=/home/sparkz/hf_cache \
+    MEGAKERNEL_BACKEND=nvfp4 \
+    MEGAKERNEL_PREFILL_TC=1 \
+    /home/sparkz/dreamzero/.venv-cu132-src/bin/python \
+    /home/sparkz/lucebox-hub/megakernel/bench_pp_tg.py \
+    --section pp --prompt-tokens 520 --measure-runs 3
+```
+
+Validated result:
+
+- `pp520 = 23354.9 tok/s`
+- `22.3 ms`
+
+Relative to the earlier stable prompt-TC projection pass (`22411.4 tok/s`),
+that is another `+4.2%` on prompt throughput. Relative to the previous stable
+non-TC prompt path (`20567.1 tok/s`), it is about `+13.5%`.
+
 ### Repo headline benchmark
 
 Command:
@@ -240,9 +274,9 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `pp520 = 22696 tok/s`
-- `tg128 = 183 tok/s`
-- combined `520 + 128` latency: about `723.9 ms`
+- `pp520 = 23058 tok/s`
+- `tg128 = 182 tok/s`
+- combined `520 + 128` latency: about `726.3 ms`
 
 ### Decode-only benchmark
 
@@ -349,15 +383,15 @@ Result:
 
 | workload | Luce NVFP4 | llama.cpp BF16 | winner |
 | --- | ---: | ---: | --- |
-| `pp520` | `22696 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
-| `tg128` | `183 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
-| combined `520 + 128` latency | `723.9 ms` | `1012.9 ms` | `Luce NVFP4` |
+| `pp520` | `23058 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
+| `tg128` | `182 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
+| combined `520 + 128` latency | `726.3 ms` | `1012.9 ms` | `Luce NVFP4` |
 
 Relative to the clean refreshed `llama.cpp` run:
 
-- Luce prompt ingest is about `60.4%` faster
-- Luce decode is about `35.5%` faster
-- Luce total `520 + 128` latency is about `28.5%` lower
+- Luce prompt ingest is about `62.9%` faster
+- Luce decode is about `34.7%` faster
+- Luce total `520 + 128` latency is about `28.3%` lower
 
 ## Current conclusion
 
