@@ -7,7 +7,10 @@ import tcgen05_gemm_C  # noqa: F401
 # The kernel has compile-time M, N, K. Just measure at current config for now.
 # Change config in kernel.cu + rebuild to sweep.
 
-from bench import M, N, K
+import sys
+M, N, K = 4096, 4096, 4096
+if len(sys.argv) > 1:
+    M = N = K = int(sys.argv[1])
 
 def bench_tcgen05(A, B, n_iter=1000):
     C = torch.zeros(M, N, dtype=torch.float32, device="cuda")

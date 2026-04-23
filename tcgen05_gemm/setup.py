@@ -14,6 +14,7 @@ setup(
             "cxx": ["-O3"],
             "nvcc": ["-O3", f"-arch={arch}", "--use_fast_math", "-std=c++17"],
         },
+        libraries=["cuda"],   # cuTensorMapEncodeTiled lives in driver API
     )],
     cmdclass={"build_ext": BuildExtension},
 )
