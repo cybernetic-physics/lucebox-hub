@@ -191,6 +191,59 @@ Validated result:
 - `pp520 = 20567.1 tok/s`
 - `25.3 ms`
 
+## Prompt tensor-core projection pass
+
+The next stable prompt-side gain came from moving the prompt projection GEMMs
+onto raw `cuBLASLt` block-scaled NVFP4 tensor cores while keeping the
+numerically sensitive DeltaNet `beta/alpha` control projections in BF16.
+
+Two details matter for the working path:
+
+- the prompt-side `cuBLASLt` FP4 helper now writes BF16 output directly instead
+  of staging FP16 and converting afterward
+- `MEGAKERNEL_PREFILL_TC=1` now enables only the validated prompt projection
+  tensor-core path by default; `MEGAKERNEL_PREFILL_TC_GATE_UP=1` remains
+  experimental and is still not used for the stable headline
+
+### Prompt-only benchmark
+
+Command:
+
+```bash
+env HF_HOME=/home/sparkz/hf_cache \
+    MEGAKERNEL_BACKEND=nvfp4 \
+    MEGAKERNEL_PREFILL_TC=1 \
+    /home/sparkz/dreamzero/.venv-cu132-src/bin/python \
+    /home/sparkz/lucebox-hub/megakernel/bench_pp_tg.py \
+    --section pp --prompt-tokens 520 --measure-runs 3
+```
+
+Validated result:
+
+- `pp520 = 22411.4 tok/s`
+- `23.2 ms`
+
+Relative to the previous stable non-TC prompt path (`20567.1 tok/s`), that is
+about `+8.9%` prompt throughput.
+
+### Repo headline benchmark
+
+Command:
+
+```bash
+env HF_HOME=/home/sparkz/hf_cache \
+    MEGAKERNEL_BACKEND=nvfp4 \
+    MEGAKERNEL_PREFILL_TC=1 \
+    /home/sparkz/dreamzero/.venv-cu132-src/bin/python \
+    /home/sparkz/lucebox-hub/megakernel/final_bench.py --skip-hf
+```
+
+Validated result:
+
+- `pp520 = 22696 tok/s`
+- `tg128 = 183 tok/s`
+- combined `520 + 128` latency: about `723.9 ms`
+
 ### Decode-only benchmark
 
 Command:
@@ -296,15 +349,15 @@ Result:
 
 | workload | Luce NVFP4 | llama.cpp BF16 | winner |
 | --- | ---: | ---: | --- |
-| `pp520` | `19479 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
+| `pp520` | `22696 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
 | `tg128` | `183 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
-| combined `520 + 128` latency | `726.2 ms` | `1012.9 ms` | `Luce NVFP4` |
+| combined `520 + 128` latency | `723.9 ms` | `1012.9 ms` | `Luce NVFP4` |
 
 Relative to the clean refreshed `llama.cpp` run:
 
-- Luce prompt ingest is about `37.6%` faster
+- Luce prompt ingest is about `60.4%` faster
 - Luce decode is about `35.5%` faster
-- Luce total `520 + 128` latency is about `28.3%` lower
+- Luce total `520 + 128` latency is about `28.5%` lower
 
 ## Current conclusion
 
@@ -318,9 +371,10 @@ On the current code:
 
 The next practical optimization target is no longer the LM head. The current
 prompt-side top hotspot is still the tiled DeltaNet recurrence, followed by the
-remaining BF16 projection schedule. The next useful cuts are either:
+remaining prompt-side attention and the still-BF16-only `gate_up` path. The
+next useful cuts are either:
 
 - another rewrite of the DeltaNet prefill recurrence around shared head-level
   state reuse, or
-- moving more prompt-side projection work off repeated BF16 GEMM launches and
-  onto a more persistent CUDA/CUTLASS/CUBLASLt schedule.
+- fixing and re-enabling the prompt-side `gate_up` NVFP4 tensor-core path, or
+- another shared-memory / tiling rewrite of the prefill attention kernel.

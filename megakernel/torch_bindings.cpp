@@ -31,6 +31,10 @@ struct LayerWeights {
 struct PrefillFusedLayerWeights {
     void *proj_weight;
     void *gate_up_weight;
+    void *proj_weight_packed;
+    void *proj_weight_scales;
+    void *gate_up_weight_packed;
+    void *gate_up_weight_scales;
 };
 
 struct LayerWeightsNVFP4 {
@@ -323,7 +327,8 @@ extern "C" void launch_prefill_bf16(
     const void *final_norm_w, const void *lm_head_w,
     void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
     void *hidden, void *residual, void *normalized,
-    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *proj_buf, void *proj_buf2, void *proj_buf_half, void *proj_act_packed, void *proj_act_scales,
+    void *attn_buf, void *mlp_buf,
     void *dn_out_buf, void *beta_buf, void *alpha_buf,
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
@@ -337,7 +342,8 @@ extern "C" void launch_prefill_bf16_nvfp4_lm(
     const void *lm_head_weight_packed, const void *lm_head_scales,
     void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
     void *hidden, void *residual, void *normalized,
-    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *proj_buf, void *proj_buf2, void *proj_buf_half, void *proj_act_packed, void *proj_act_scales,
+    void *attn_buf, void *mlp_buf,
     void *dn_out_buf, void *beta_buf, void *alpha_buf,
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
@@ -353,7 +359,8 @@ void prefill_bf16(
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
     torch::Tensor hidden, torch::Tensor residual, torch::Tensor normalized,
-    torch::Tensor proj_buf, torch::Tensor proj_buf2,
+    torch::Tensor proj_buf, torch::Tensor proj_buf2, torch::Tensor proj_buf_half,
+    torch::Tensor proj_act_packed, torch::Tensor proj_act_scales,
     torch::Tensor attn_buf, torch::Tensor mlp_buf,
     torch::Tensor dn_out_buf, torch::Tensor beta_buf, torch::Tensor alpha_buf,
     torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
@@ -369,7 +376,8 @@ void prefill_bf16(
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         dn_states.data_ptr(), conv_bufs.data_ptr(),
         hidden.data_ptr(), residual.data_ptr(), normalized.data_ptr(),
-        proj_buf.data_ptr(), proj_buf2.data_ptr(),
+        proj_buf.data_ptr(), proj_buf2.data_ptr(), proj_buf_half.data_ptr(),
+        proj_act_packed.data_ptr(), proj_act_scales.data_ptr(),
         attn_buf.data_ptr(), mlp_buf.data_ptr(),
         dn_out_buf.data_ptr(), beta_buf.data_ptr(), alpha_buf.data_ptr(),
         final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
@@ -386,7 +394,8 @@ void prefill_bf16_nvfp4_lm(
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
     torch::Tensor hidden, torch::Tensor residual, torch::Tensor normalized,
-    torch::Tensor proj_buf, torch::Tensor proj_buf2,
+    torch::Tensor proj_buf, torch::Tensor proj_buf2, torch::Tensor proj_buf_half,
+    torch::Tensor proj_act_packed, torch::Tensor proj_act_scales,
     torch::Tensor attn_buf, torch::Tensor mlp_buf,
     torch::Tensor dn_out_buf, torch::Tensor beta_buf, torch::Tensor alpha_buf,
     torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
@@ -405,7 +414,8 @@ void prefill_bf16_nvfp4_lm(
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         dn_states.data_ptr(), conv_bufs.data_ptr(),
         hidden.data_ptr(), residual.data_ptr(), normalized.data_ptr(),
-        proj_buf.data_ptr(), proj_buf2.data_ptr(),
+        proj_buf.data_ptr(), proj_buf2.data_ptr(), proj_buf_half.data_ptr(),
+        proj_act_packed.data_ptr(), proj_act_scales.data_ptr(),
         attn_buf.data_ptr(), mlp_buf.data_ptr(),
         dn_out_buf.data_ptr(), beta_buf.data_ptr(), alpha_buf.data_ptr(),
         final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
@@ -521,7 +531,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor final_norm_weight, Tensor lm_head_weight, "
             "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
             "Tensor hidden, Tensor residual, Tensor normalized, "
-            "Tensor proj_buf, Tensor proj_buf2, Tensor attn_buf, Tensor mlp_buf, "
+            "Tensor proj_buf, Tensor proj_buf2, Tensor proj_buf_half, Tensor proj_act_packed, Tensor proj_act_scales, "
+            "Tensor attn_buf, Tensor mlp_buf, "
             "Tensor dn_out_buf, Tensor beta_buf, Tensor alpha_buf, "
             "Tensor final_normed, Tensor hidden_bf16_out, "
             "Tensor lm_bmv, Tensor lm_bmi) -> ()");
@@ -533,7 +544,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor lm_head_weight_packed, Tensor lm_head_scales, "
             "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
             "Tensor hidden, Tensor residual, Tensor normalized, "
-            "Tensor proj_buf, Tensor proj_buf2, Tensor attn_buf, Tensor mlp_buf, "
+            "Tensor proj_buf, Tensor proj_buf2, Tensor proj_buf_half, Tensor proj_act_packed, Tensor proj_act_scales, "
+            "Tensor attn_buf, Tensor mlp_buf, "
             "Tensor dn_out_buf, Tensor beta_buf, Tensor alpha_buf, "
             "Tensor final_normed, Tensor hidden_bf16_out, "
             "Tensor lm_bmv, Tensor lm_bmi, "
