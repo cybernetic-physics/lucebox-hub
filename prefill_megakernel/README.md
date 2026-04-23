@@ -60,39 +60,71 @@ math issue; both kernels agree on well-conditioned inputs.
 
 ## Walltime on B200
 
-WMMA tensor-core GEMMs (bf16 16×16×16 tiles, f32 accumulation):
+Current: cp.async double-buffered K-pipeline + WMMA tensor cores:
 
 ```
    S    existing (ms)    megakernel (ms)    speedup
-  16             7.89              10.42      0.76x
-  32             5.07              11.61      0.44x
-  64             7.71              13.97      0.55x
- 128            12.16              19.35      0.63x
- 256            21.75              31.62      0.69x
+  16             3.77              10.52      0.43x
+  32             4.95               9.90      0.51x
+  64             7.30              12.37      0.60x
+ 128            12.10              17.64      0.69x
+ 256            21.67              29.56      0.74x
 ```
 
-The first revision of this megakernel used naive warp-per-output-element
-FMA GEMMs and ran at **0.20× of cuBLAS at S=128**. Switching the GEMM
-primitive to `nvcuda::wmma` tiles lifted that to **0.63×** — a ~3× speedup
-at S=128 and ~4× at S=256, purely from the GEMM change.
+Progression across the three committed revisions:
 
-We're still not beating cuBLAS. The remaining ~30–50% gap comes from:
+| S | naive FMA | WMMA only | + cp.async pipeline |
+|---|---|---|---|
+| 128 | 0.20× | 0.63× | **0.69×** |
+| 256 | 0.17× | 0.68× | **0.74×** |
 
-1. **1 block per SM** — WMMA's per-thread register footprint pushed
-   occupancy below 2 blocks/SM, so `__launch_bounds__(512, 1)` and
-   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` clamp the cooperative
-   launch to 148 blocks. cuBLAS can dispatch separate launches with
-   higher per-SM occupancy.
-2. **No shared-memory tile re-use** — each WMMA call loads X and W
-   directly from global. cuBLAS tiles X across multiple N tiles and
-   keeps it in shared.
+~3.7× faster at S=256 vs the first revision. We're now within **26%** of
+cuBLAS at the training use case.
+
+The cp.async pipeline double-buffers the A and B shared-memory tiles so
+the next K-chunk's global→shared loads overlap with the current chunk's
+WMMA compute. `cp.async.ca.shared.global` + `cp.async.commit_group` +
+`cp.async.wait_group 1` lets consumer threads see loaded data as soon as
+it lands without blocking on the stage after. K_TILE=32 gives 2 MMAs per
+load-step, amortizing the sync overhead.
+
+We're still not beating cuBLAS. The remaining ~26–30% gap at S=256
+comes from:
+
+1. **WMMA's MMA throughput on Blackwell is ~50% of cuBLAS's tcgen05.**
+   This is the fundamental one — `mma.sync.aligned.m16n16k16` is
+   synchronous and warp-scoped, whereas cuBLAS on sm_100 uses
+   `tcgen05.mma` with Tensor Memory, which issues 128×256×16 tiles
+   asynchronously. Closing this is a PTX-level rewrite (see below).
+2. **1 block per SM** — WMMA's register footprint caps occupancy below
+   2 blocks/SM, so `__launch_bounds__(512, 1)` + occupancy query clamps
+   the cooperative grid to 148 blocks. cuBLAS has no such constraint.
 3. **DeltaNet recurrence serializes across 16 heads** — the other 132
-   SMs idle during DN phases.
-4. **No WGMMA** — Blackwell-native warp-group MMA is ~2× faster per
-   warp than WMMA. Requires async restructuring.
+   SMs idle during DN phases. Breaking that requires overlapping DN-of-L
+   with GEMMs-of-L+1 and re-sequencing the grid.sync fences.
+4. **Store-through-shared for accumulator conversion** — `store_matrix_sync`
+   → f32 shared slot → lane-wise read+convert+write to bf16 global adds
+   ~5% per GEMM. Writing the fragment directly to global via known
+   PTX fragment layout eliminates the roundtrip.
 
-Those are all orthogonal optimization passes inside the megakernel
-structure — no architectural changes needed.
+### Optimizations that did NOT help this session
+
+For posterity so I don't re-try them blindly:
+
+- **Synchronous shared-memory X-tile caching** with `__syncthreads()`
+  around each K-chunk load: regressed to 0.30–0.66×. The per-chunk
+  barrier cost more than L1 already saved. (Distinct from cp.async —
+  cp.async uses `cp.async.wait_group`, not `__syncthreads()`, so it
+  doesn't pay this cost.)
+- **`__launch_bounds__(512, 2)`** to force 2 blocks/SM: regressed to
+  0.33–0.57×. Register spills outweighed the occupancy win.
+- **2×2 warp tiling** (4 accumulators per warp, 4 MMAs per K-step):
+  regressed to 0.25–0.56×. Macro-tile grid becomes 4× smaller than the
+  warp grid at Qwen 3.5-0.8B × S≤256, dropping SM utilization faster
+  than the load/MMA ratio savings gained.
+- **K_TILE=64 cp.async** (wider K-chunks, fewer pipeline iterations):
+  regressed to 0.31–0.65×. 84 KB shared memory footprint dropped
+  occupancy and the wider pipeline didn't compensate.
 
 ### What actually closes the gap on B200 — research notes
 
