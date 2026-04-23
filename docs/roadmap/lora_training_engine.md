@@ -113,18 +113,38 @@ fwd+bwd+optim. Gate the 3× claim on the last number.
 
 Following the list already in `train_megakernel/README.md`:
 
-1. Activation saving during forward (per-layer normalized inputs, attn
-   outputs, gate·up, down outputs). Mechanical — add pointers to the
-   existing kernel arg pack.
-2. Per-layer reverse kernels:
-   - MLP bwd: down → silu_mul → gate/up bwd
-   - Post-attn RMSNorm bwd
-   - Attention bwd: FlashAttention-style for FA, BPTT for DN
-   - QKV bwd → input RMSNorm bwd
+1. Activation saving during forward ✅ **done** (2026-04-23) — see
+   `trainer/test_activation_save.py`. New op
+   `prefill_bf16_train_step` writes up to four per-layer slabs into
+   caller-provided tensors during the same cuBLAS+graph forward as
+   inference. All-null ⇒ inference path, zero overhead. Saved
+   slabs:
+   - `hidden_in[L, S, HIDDEN]`            pre input-RMSnorm
+   - `normalized_in[L, S, HIDDEN]`        post input-RMSnorm (LoRA-A grad input)
+   - `normalized_post_attn[L, S, HIDDEN]` post post-attn-RMSnorm (MLP-bwd input)
+   - `mlp_inter[L, S, INTER]`             silu(gate)·up (down-bwd input)
+2. Per-layer reverse kernels (status as of 2026-04-23):
+   - MLP bwd: down → silu_mul → gate/up bwd ✅ (SwiGLU bwd + LoRA-linear bwd in `trainer/kernel.cu`)
+   - Post-attn RMSNorm bwd ✅ (`bwd_rmsnorm_kernel`)
+   - CE + LM-head bwd ✅ (`bwd_ce_lm_head_kernel`)
+   - Attention bwd: FlashAttention-style for FA ⏳ **missing**
+   - Attention bwd: BPTT for DN ⏳ **missing**
+   - QKV bwd → input RMSNorm bwd ⏳ needs FA/DN grads to flow in first
 3. Fuse each reverse step's LoRA gradient accumulation (A and B grads
    for the active projection) inside the same phase.
 4. Gradient check against HF transformers + PEFT LoRA on a 16-token
    sample, tolerance 1e-3 bf16-relative.
+
+**Recommended order of attack** (unblocks Phase 4 earliest):
+
+a. Wire existing bwd kernels + a **torch-autograd fallback** for FA
+   and DN into a Python `_backward(saved, lora)` helper. Uses saved
+   activations + cuDNN SDPA for FA, reference torch DN for DN.
+   Lands Phase 4 end-to-end (slow but correct) immediately.
+b. Replace the torch-SDPA fallback with a CUDA FA bwd kernel when
+   Phase 5 bench shows attention-bwd is the bottleneck.
+c. Replace the reference DN bwd with a V-split BPTT kernel matching
+   the forward's V-split recurrence layout.
 
 ### Phase 3 — cuBLAS/CUTLASS wiring  ✅ **done** (2026-04-23)
 
@@ -170,8 +190,25 @@ The `tcgen05_gemm/` sandbox is retired at `experiments/tcgen05_gemm/`.
 
 ### Phase 4 — rl/backend integration (1-2 days)
 
-- Implement `LoraMegakernelTrainer` class in `trainer.py` satisfying
-  `Sampler + Trainer + CheckpointStore`.
+Concrete file layout (to add, keyed to the protocol impl in
+`~/rl/backend/src/tinker_backend/runtimes/lora_trainer.py`):
+
+```
+models/qwen35_0p8b/trainer/
+  rl_trainer.py      ← LoraMegakernelTrainer(Sampler, Trainer, CheckpointStore)
+    class _Session:      # per-model_id state, analogous to _TrainingSession
+      - weights:          dict[str, Tensor]           (Qwen weights, bf16, cuda)
+      - lora_a, lora_b:   dict[str, Tensor]           (26 projections × 2 adapters)
+      - adamw_m, adamw_v: flat fp32 buffers           (one pair per adapter)
+      - step: int
+    def sample(...):     # prefill via prefill_bf16_with_lora, then Decoder.step loop
+    def forward(...):    # prefill_bf16_train_step with saves off; gather logprobs
+    def forward_backward(...): # train_step with saves ON, call _backward helper
+    def optim_step(...): # launch_fused_adamw over the flat A/B buffers
+    def save_checkpoint(...): # PEFT adapter dir
+    def load_weights(...):    # load PEFT adapter dir
+```
+
 - Checkpoint format: PEFT-compatible adapter dir
   (`adapter_config.json` + `adapter_model.safetensors`) per the
   existing `LORA_TRAINING_DECISION.md` — so checkpoints load into
@@ -179,6 +216,9 @@ The `tcgen05_gemm/` sandbox is retired at `experiments/tcgen05_gemm/`.
 - Optimizer state persist: safetensors of the flat m/v buffers.
 - Register in rl/backend's runtime registry; existing
   `LoRATrainer` stays as the CPU-torch fallback for tests.
+- Reuse `model.load_weights` from `models/qwen35_0p8b/model.py` for
+  the frozen base; adapters live in separate contiguous per-projection
+  bf16 buffers so AdamW is one fused kernel over the flat range.
 
 ### Phase 5 — bench + publish (1 day)
 
