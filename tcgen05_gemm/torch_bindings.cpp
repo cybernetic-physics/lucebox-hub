@@ -16,14 +16,17 @@
   }
 
 extern "C" void launch_tcgen05_gemm_one_tile(
-    const void *A, const void *B, void *C, int N_TOTAL, cudaStream_t stream);
+    const void *A, const void *B, void *C,
+    int M_TOTAL, int N_TOTAL, cudaStream_t stream);
 
 void tcgen05_gemm_one_tile(torch::Tensor A, torch::Tensor B, torch::Tensor C) {
     TORCH_CHECK(A.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(B.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(C.scalar_type() == torch::kFloat32);
+    int M_TOTAL = (int)A.size(0);
     int N_TOTAL = (int)B.size(0);
-    launch_tcgen05_gemm_one_tile(A.data_ptr(), B.data_ptr(), C.data_ptr(), N_TOTAL,
+    launch_tcgen05_gemm_one_tile(A.data_ptr(), B.data_ptr(), C.data_ptr(),
+                                  M_TOTAL, N_TOTAL,
                                   c10::cuda::getCurrentCUDAStream().stream());
 }
 

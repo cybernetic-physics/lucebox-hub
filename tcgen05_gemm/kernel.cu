@@ -18,7 +18,7 @@
 
 constexpr int M = 128;
 constexpr int N = 256;
-constexpr int K = 256;          // bf16 elements; multi K-tile layout
+constexpr int K = 1024;         // bf16 elements; multi K-tile layout with streaming
 constexpr int K_TILE = 64;      // bf16 per K-tile (= 128 bytes, one 128B super-block)
 constexpr int K_TILES = K / K_TILE;
 constexpr int MMA_K = 16;       // bf16 K per tcgen05.mma call
@@ -40,25 +40,34 @@ __device__ __forceinline__ uint64_t make_desc(uint32_t smem_addr) {
          | (2ULL << 61);       // 128B swizzle
 }
 
-// Per-block tile dimensions (fixed). Grid dim controls output N tiling.
+// Per-block tile: [M_BLK=128, N_BLK=256]. Grid dim controls M and N tiling.
 //   blockIdx.x: which N-tile this block owns.
-//   Output C[M, N_TOTAL] — M=128 fixed, N_TOTAL = gridDim.x * N.
+//   blockIdx.y: which M-tile this block owns.
+//   A[M_TOTAL, K], B[N_TOTAL, K], C[M_TOTAL, N_TOTAL].
 extern "C" __global__ void tcgen05_gemm_one_tile(
-    const __nv_bfloat16 *__restrict__ A,      // [M=128, K]
-    const __nv_bfloat16 *__restrict__ B_all,  // [N_TOTAL, K]
-    float               *__restrict__ C_all,  // [M, N_TOTAL] fp32
-    int N_TOTAL)
+    const __nv_bfloat16 *__restrict__ A_all,
+    const __nv_bfloat16 *__restrict__ B_all,
+    float               *__restrict__ C_all,
+    int M_TOTAL, int N_TOTAL)
 {
     const int block_n_idx = blockIdx.x;
+    const int block_m_idx = blockIdx.y;
     const int n_offset = block_n_idx * N;
+    const int m_offset = block_m_idx * M;
+    const __nv_bfloat16 *A = A_all + (size_t)m_offset * K;
     const __nv_bfloat16 *B = B_all + (size_t)n_offset * K;
-    float               *C = C_all + (size_t)n_offset;  // will write stride N_TOTAL
-    // K-tile-major layout: K_TILES copies of [M × K_TILE] and [N × K_TILE],
-    // each swizzled per-tile. For K=128 (2 K-tiles): A = 32 KB, B = 64 KB.
+    float               *C = C_all + (size_t)m_offset * N_TOTAL + n_offset;
+    // Double-buffered K-streaming layout: 2 buffers each holding one K-tile
+    // of A (M × K_TILE) and B (N × K_TILE). Total:
+    //   s_A: 2 × 128 × 128 = 32 KB
+    //   s_B: 2 × 256 × 128 = 64 KB
+    //   total dynamic: 96 KB (opt-in past 48 KB default).
+    constexpr int S_A_TILE_BYTES = M * K_TILE * 2;
+    constexpr int S_B_TILE_BYTES = N * K_TILE * 2;
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     __nv_bfloat16 *s_A = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
     __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(
-        smem_raw + K_TILES * M * K_TILE * sizeof(__nv_bfloat16));
+        smem_raw + 2 * S_A_TILE_BYTES);
     __shared__ uint32_t tmem_slot;
     __shared__ uint64_t mma_mbar;
 
@@ -84,62 +93,58 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     __syncthreads();
     const uint32_t taddr = tmem_slot;
 
-    // --------- 3. Load A, B to shared in K-TILE-MAJOR layout with 128B swizzle.
-    // For a row-major source A[M, K] bf16, we rearrange into K_TILES copies of
-    // [M × K_TILE bf16], each copy swizzled by (row & 7). Global bf16 offset
-    // c ∈ [0, K) split as (k_tile = c / K_TILE, local_c = c % K_TILE), then
-    // the swizzled in-tile position is (row * K_TILE + (chunk^(r&7)) << 3).
-    //
-    // Standard 128B swizzle for 8×16B chunks within a 128B row.
+    // --------- 3. K-streaming load helpers ---------
     auto swz_offset = [](int r, int local_c) -> int {
-        int chunk    = local_c >> 3;            // 0..7 chunks of 8 bf16 each
+        int chunk    = local_c >> 3;
         int sw_chunk = chunk ^ (r & 7);
         return (sw_chunk << 3) | (local_c & 7);
     };
 
-    // A: M * K bf16 total = (M * K / 8) loads of 8 bf16 each.
-    {
-        constexpr int A_TOTAL = M * K / 8;   // 8 bf16 per cp.async
-        constexpr int A_ITERS = (A_TOTAL + 511) / 512;
-        for (int it = 0; it < A_ITERS; it++) {
+    // Load ONE K-tile (K_TILE bf16 per row) of A into s_A[buf].
+    // Uses cp.async, does NOT commit_group — caller groups multiple loads.
+    auto load_a_tile = [&](int kt, int buf) {
+        __nv_bfloat16 *A_buf = s_A + buf * (M * K_TILE);
+        constexpr int A_TILE_TOTAL = M * K_TILE / 8;     // # of 16-byte cp.asyncs
+        constexpr int A_TILE_ITERS = (A_TILE_TOTAL + 511) / 512;
+        #pragma unroll
+        for (int it = 0; it < A_TILE_ITERS; it++) {
             int i = tid + it * 512;
-            if (i >= A_TOTAL) break;
-            int r = i / (K / 8);               // row in [0, M)
-            int c_chunk = i % (K / 8);         // chunk in [0, K/8)
-            int c = c_chunk * 8;               // bf16 offset in [0, K)
-            int k_tile = c / K_TILE;
-            int local_c = c % K_TILE;
-            int sw_local_c = swz_offset(r, local_c);
-            __nv_bfloat16 *dst = s_A + k_tile * M * K_TILE + r * K_TILE + sw_local_c;
-            const __nv_bfloat16 *src = A + r * K + c;
-            uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                         :: "r"(smem_addr), "l"(src));
-        }
-    }
-    // B: N * K bf16 total = (N * K / 8) loads.
-    {
-        constexpr int B_TOTAL = N * K / 8;
-        constexpr int B_ITERS = (B_TOTAL + 511) / 512;
-        for (int it = 0; it < B_ITERS; it++) {
-            int i = tid + it * 512;
-            if (i >= B_TOTAL) break;
-            int r = i / (K / 8);
-            int c_chunk = i % (K / 8);
+            if (i >= A_TILE_TOTAL) break;
+            int r = i / (K_TILE / 8);
+            int c_chunk = i % (K_TILE / 8);
             int c = c_chunk * 8;
-            int k_tile = c / K_TILE;
-            int local_c = c % K_TILE;
-            int sw_local_c = swz_offset(r, local_c);
-            __nv_bfloat16 *dst = s_B + k_tile * N * K_TILE + r * K_TILE + sw_local_c;
-            const __nv_bfloat16 *src = B + r * K + c;
+            int sw_c = swz_offset(r, c);
+            __nv_bfloat16 *dst = A_buf + r * K_TILE + sw_c;
+            const __nv_bfloat16 *src = A + r * K + (kt * K_TILE) + c;
             uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                          :: "r"(smem_addr), "l"(src));
         }
-    }
+    };
+    auto load_b_tile = [&](int kt, int buf) {
+        __nv_bfloat16 *B_buf = s_B + buf * (N * K_TILE);
+        constexpr int B_TILE_TOTAL = N * K_TILE / 8;
+        constexpr int B_TILE_ITERS = (B_TILE_TOTAL + 511) / 512;
+        #pragma unroll
+        for (int it = 0; it < B_TILE_ITERS; it++) {
+            int i = tid + it * 512;
+            if (i >= B_TILE_TOTAL) break;
+            int r = i / (K_TILE / 8);
+            int c_chunk = i % (K_TILE / 8);
+            int c = c_chunk * 8;
+            int sw_c = swz_offset(r, c);
+            __nv_bfloat16 *dst = B_buf + r * K_TILE + sw_c;
+            const __nv_bfloat16 *src = B + r * K + (kt * K_TILE) + c;
+            uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_addr), "l"(src));
+        }
+    };
+
+    // Prologue: issue stage-0 load.
+    load_a_tile(0, 0);
+    load_b_tile(0, 0);
     asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n");
-    __syncthreads();
 
     // --------- 4. Issue MMA chain by one thread ---------
     //   i_desc encoding for bf16 → fp32:
@@ -155,38 +160,53 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
       | ((uint32_t)(N >> 3) << 17)
       | ((uint32_t)(M >> 4) << 24);
 
-    if (tid == 0) {
-        uint32_t a_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(s_A));
-        uint32_t b_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
-        uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
+    uint32_t a_smem_base_0 = static_cast<uint32_t>(__cvta_generic_to_shared(s_A));
+    uint32_t b_smem_base_0 = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
 
-        // First MMA: enable_input_d=0  (reset accumulator).
-        {
-            uint64_t a_desc = make_desc(a_smem_base);
-            uint64_t b_desc = make_desc(b_smem_base);
-            asm volatile(
-                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;\n"
-                :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+    int buf = 0;
+    for (int kt = 0; kt < K_TILES; kt++) {
+        int next_kt = kt + 1;
+        int next_buf = buf ^ 1;
+
+        // Issue next-stage load if more K-tiles remain.
+        if (next_kt < K_TILES) {
+            load_a_tile(next_kt, next_buf);
+            load_b_tile(next_kt, next_buf);
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 1;\n");   // wait for current stage
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
         }
-        // Remaining K-steps. K-tile-major: each K_TILE (64 bf16 = 128 bytes)
-        // is one contiguous 128B-swizzled block of M*128 or N*128 bytes.
-        // Within one tile, MMA_K=16 advances are 32 bytes. Between tiles,
-        // jump by M*K_TILE*2 bytes for A and N*K_TILE*2 for B.
-        for (int ks = 1; ks < K_STEPS; ks++) {
-            int k_tile_idx = ks / MMAS_PER_TILE;
-            int k_in_tile  = ks % MMAS_PER_TILE;
-            uint32_t a_smem = a_smem_base
-                + (uint32_t)(k_tile_idx * M * K_TILE * 2)   // bytes to next K-tile of A
-                + (uint32_t)(k_in_tile * MMA_K * 2);         // within tile
-            uint32_t b_smem = b_smem_base
-                + (uint32_t)(k_tile_idx * N * K_TILE * 2)
-                + (uint32_t)(k_in_tile * MMA_K * 2);
-            uint64_t a_desc = make_desc(a_smem);
-            uint64_t b_desc = make_desc(b_smem);
-            asm volatile(
-                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;\n"
-                :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+        __syncthreads();
+
+        // MMA on buf — all MMAS_PER_TILE=4 K-steps within this K-tile.
+        if (tid == 0) {
+            uint32_t a_base = a_smem_base_0 + buf * S_A_TILE_BYTES;
+            uint32_t b_base = b_smem_base_0 + buf * S_B_TILE_BYTES;
+            #pragma unroll
+            for (int k_in_tile = 0; k_in_tile < MMAS_PER_TILE; k_in_tile++) {
+                uint32_t a_smem = a_base + (uint32_t)(k_in_tile * MMA_K * 2);
+                uint32_t b_smem = b_base + (uint32_t)(k_in_tile * MMA_K * 2);
+                uint64_t a_desc = make_desc(a_smem);
+                uint64_t b_desc = make_desc(b_smem);
+                int enable_d = (kt == 0 && k_in_tile == 0) ? 0 : 1;
+                if (enable_d == 0) {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;\n"
+                        :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+                } else {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;\n"
+                        :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+                }
+            }
         }
+        __syncthreads();
+        buf = next_buf;
+    }
+
+    if (tid == 0) {
         asm volatile(
             "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
             :: "r"(bar_smem));
@@ -259,7 +279,8 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
 }
 
 extern "C" void launch_tcgen05_gemm_one_tile(
-    const void *A, const void *B, void *C, int N_TOTAL, cudaStream_t stream)
+    const void *A, const void *B, void *C,
+    int M_TOTAL, int N_TOTAL, cudaStream_t stream)
 {
     static bool cfg = false;
     if (!cfg) {
@@ -267,9 +288,10 @@ extern "C" void launch_tcgen05_gemm_one_tile(
             cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);
         cfg = true;
     }
-    dim3 grid(N_TOTAL / N);
+    dim3 grid(N_TOTAL / N, M_TOTAL / M);
     dim3 block(512);
-    constexpr size_t smem_bytes = (M + N) * K * sizeof(__nv_bfloat16);
+    constexpr size_t smem_bytes = 2 * (M + N) * K_TILE * sizeof(__nv_bfloat16);
     tcgen05_gemm_one_tile<<<grid, block, smem_bytes, stream>>>(
-        (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C, N_TOTAL);
+        (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C,
+        M_TOTAL, N_TOTAL);
 }
