@@ -219,9 +219,9 @@ def run_test_dflash(prompt_path: str, n_gen: int, fast_rollback: bool,
 
     # Parse output
     out = r.stdout
-    m_tps = re.search(r"→\s+(\d+\.\d+)\s+tok/s", out)
-    m_commit = re.search(r"avg commit/step=(\d+\.\d+)", out)
-    m_accept = re.search(r"accepted=(\d+)/(\d+) \((\d+\.\d+)%", out)
+    m_tps = re.search(r"(\d+(?:\.\d+)?)\s+tok/s", out)
+    m_commit = re.search(r"avg commit/step=(\d+(?:\.\d+)?)", out)
+    m_accept = re.search(r"accepted=(\d+)/(\d+) \((\d+(?:\.\d+)?)%", out)
     m_steps = re.search(r"(\d+) draft steps", out)
     if not (m_tps and m_commit and m_accept and m_steps):
         print("STDOUT tail:", out[-2000:])

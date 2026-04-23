@@ -1859,7 +1859,7 @@ int main(int argc, char ** argv) {
                            + tt_accept + tt_restore + tt_replay_build + tt_replay_set + tt_replay_compute + tt_replay_logits);
     std::printf("  ----- sum     %.2f\n", sum_ms);
 
-    std::printf("\n[dflash] generated %d tokens in %.3f s  →  %.2f tok/s\n",
+    std::printf("\n[dflash] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
                 n_generated, gen_s, tps);
     std::printf("[dflash] %d draft steps, accepted=%d/%d (%.1f%% per step), "
                 "avg commit/step=%.2f\n",

@@ -243,7 +243,7 @@ int main(int argc, char ** argv) {
     // Also push the final next token so downstream sees it
     all_tokens.push_back(next);
 
-    std::printf("[gen] %d new tokens in %.3f s  →  %.2f tok/s\n", n_gen, secs, tps);
+    std::printf("[gen] %d new tokens in %.3f s  ->  %.2f tok/s\n", n_gen, secs, tps);
     std::printf("[gen] tokens: ");
     for (int i = 0; i < n_gen; i++) std::printf("%d ", all_tokens[prompt.size() + i]);
     std::printf("\n");
