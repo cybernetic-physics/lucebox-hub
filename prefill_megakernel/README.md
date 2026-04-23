@@ -94,6 +94,73 @@ We're still not beating cuBLAS. The remaining ~30–50% gap comes from:
 Those are all orthogonal optimization passes inside the megakernel
 structure — no architectural changes needed.
 
+### What actually closes the gap on B200 — research notes
+
+Web research turned up one critical correction to my earlier
+"WGMMA is next" claim: **WGMMA is deprecated on sm_100 (Blackwell).**
+The Hopper `wgmma.mma_async` instruction is not the target architecture's
+primary tensor-core path anymore. Blackwell uses `tcgen05.mma` — a
+completely different instruction family — paired with **Tensor Memory
+(TMEM)**, a new 256 KB on-chip memory layer separate from registers and
+shared memory, used as the accumulator home for 5th-generation tensor
+cores.
+
+The primary references for getting this right on B200:
+
+1. [`tcgen05 for dummies`](https://gau-nernst.github.io/tcgen05/) — a
+   full walk-through of the PTX syntax: `tcgen05.alloc`, the i_desc
+   encoding for bf16→fp32 MMA, shared-memory descriptors with 128B
+   swizzling, TMA bulk loads via `cp.async.bulk.tensor.2d`, mbarrier
+   synchronization, `tcgen05.ld` for reading accumulators back out, and
+   `tcgen05.commit`/`tcgen05.wait`. A minimal hand-rolled kernel
+   following this pattern hits **~98% of cuBLAS** on 4096³ GEMMs.
+2. [ThunderKittens on Blackwell](https://hazyresearch.stanford.edu/blog/2025-03-15-tk-blackwell) —
+   the pattern that matters for a persistent megakernel: **producer /
+   consumer warp specialization.** 2 producer warps per consumer
+   warpgroup handle loads; consumer warpgroups exclusively run MMA; MMA
+   completion directly signals the producers to prefetch the next stage.
+   Sustained tensor-core saturation with "only one bubble in the whole
+   tensor pipeline (~140 ns every few hundred microseconds)".
+3. [CUTLASS Blackwell tutorial](https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/)
+   and the NVIDIA CUTLASS examples at `examples/cute/tutorial/hopper/`.
+
+So the concrete path to beat cuBLAS from inside a megakernel is:
+
+1. **Rewrite `gemm_wmma_core` against `tcgen05.mma` + TMA + TMEM.**
+   The unit of work becomes a 128×128 or 128×256 tile instead of a
+   warp-scoped 16×16. Operand layouts switch to 128B-swizzled shared
+   memory.
+2. **Switch to producer / consumer warp specialization within each
+   block.** 2 producer warps issue TMA for the next K-chunk; consumer
+   warpgroups do MMA on the current one. mbarriers chain the two.
+3. **Keep the cooperative-grid megakernel shape**: all 24 layers still
+   in one dispatch; the tcgen05 GEMM drops in as the inner primitive.
+
+This is ~500+ lines of new PTX-level code per GEMM primitive and needs
+Nsight Compute profiling to tune. It's the real remaining work.
+
+### Failed optimization attempts this session
+
+For posterity, so I don't re-try these blindly later:
+
+- **Shared-memory X-tile caching** with `__syncthreads()` between load
+  and MMA: regressed to 0.30–0.66×. The per-K-chunk barrier cost more
+  than L1 already saves; B200's unified 228 KB shared/L1 pool was
+  already catching the intra-block X re-use pattern.
+- **`__launch_bounds__(512, 2)` for 2 blocks/SM:** regressed to
+  0.33–0.57×. Register spills from the forced occupancy outweighed the
+  parallelism win.
+- **2×2 warp tiling** (each warp owns 4 output sub-tiles, 4 independent
+  accumulators): regressed to 0.25–0.56×. The macro-tile grid was
+  4× smaller than the warp grid at Qwen 3.5-0.8B's shape × S ≤ 256,
+  dropping effective SM utilization faster than the load-to-MMA ratio
+  savings gained. 2×2 would only help when `total_macro_tiles ≳
+  warps_grid`, which needs S ≳ 512 for the smallest-N GEMMs.
+
+The committed WMMA baseline (1×1 warp tiles, sync loads) is what
+actually helps today. The optimizations above need a profiler-guided
+approach to not backslide.
+
 ### S % 16 requirement
 
 WMMA tiles are 16 rows wide, so the kernel now requires `S % 16 == 0`.
