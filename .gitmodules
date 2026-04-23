@@ -1,4 +1,4 @@
-[submodule "dflash/deps/llama.cpp"]
-	path = dflash/deps/llama.cpp
+[submodule "models/qwen35_27b/deps/llama.cpp"]
+	path = models/qwen35_27b/deps/llama.cpp
 	url = https://github.com/Luce-Org/llama.cpp.git
 	branch = luce-dflash

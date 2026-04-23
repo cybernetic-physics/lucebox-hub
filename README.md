@@ -27,9 +27,9 @@
 Two projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
 
 <p align="center">
-  <a href="megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
+  <a href="models/qwen35_0p8b/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
   &nbsp;&nbsp;
-  <a href="dflash/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
+  <a href="models/qwen35_27b/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
 </p>
 
 ---
@@ -40,7 +40,7 @@ Two projects today, more coming. Each one is a self-contained release with its o
 
 ```bash
 # 1. clone + enter
-git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/megakernel
+git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/models/qwen35_0p8b
 
 # 2. install (Python 3.10+, CUDA 12+, PyTorch 2.0+). Weights stream from HF on first run.
 pip install -e .
@@ -57,7 +57,7 @@ python final_bench.py
 
 **What makes it work:** 82 blocks, 512 threads, one persistent kernel. No CPU round-trips between layers. Weights streamed straight from HuggingFace. Cooperative grid sync instead of ~100 kernel launches per token. Power ceiling hit before compute ceiling, so DVFS converts tight execution straight into saved watts.
 
-[Full writeup →](megakernel/README.md) · [Benchmarks →](megakernel/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
+[Full writeup →](models/qwen35_0p8b/README.md) · [Benchmarks →](models/qwen35_0p8b/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
 
 ---
 
@@ -73,7 +73,7 @@ python final_bench.py
 
 ```bash
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/models/qwen35_27b
 
 # 2. build the C++/CUDA decoder (~3 min on sm_86, CUDA 12+, CMake 3.18+)
 cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
@@ -108,9 +108,9 @@ What we ported and tuned:
 - DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
 - Q4_0 KV cache + sliding `target_feat` ring to fit 128K context in 24 GB with ~3% AL hit.
 
-[Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
+[Full writeup →](models/qwen35_27b/README.md) · [Benchmarks →](models/qwen35_27b/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
-> **Qwen3.6-27B (experimental):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With the 3.5-trained draft, throughput lands around ~74 tok/s on HumanEval (vs 129.5 on 3.5). Details in [dflash/README.md](dflash/README.md#qwen36-27b-target-experimental).
+> **Qwen3.6-27B (experimental):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With the 3.5-trained draft, throughput lands around ~74 tok/s on HumanEval (vs 129.5 on 3.5). Details in [models/qwen35_27b/README.md](models/qwen35_27b/README.md#qwen36-27b-target-experimental).
 
 ---
 
@@ -137,9 +137,13 @@ dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/lla
 
 ```
 lucebox-hub/
-├── megakernel/    · fused forward pass for Qwen 3.5-0.8B
-├── dflash/        · DFlash speculative decoding port for Qwen 3.5-27B on RTX 3090
-└── assets/        · banners, cards, diagrams
+├── models/
+│   ├── qwen35_0p8b/   · fused megakernel forward pass (BF16 + NVFP4 backends)
+│   └── qwen35_27b/    · DFlash + DDTree speculative decoding (Q4_K_M / BF16)
+├── docs/
+│   ├── roadmap/       · per-(model, arch) plans for in-progress work
+│   └── results/       · per-(model, arch) benchmark reports
+└── assets/            · banners, cards, diagrams
 ```
 
 ---
