@@ -18,7 +18,7 @@
 
 constexpr int M = 128;
 constexpr int N = 256;
-constexpr int K = 64;           // bf16 elements; row width = 128 bytes
+constexpr int K = 64;           // bf16 elements; row width = 128 bytes (one 128B super-block)
 constexpr int K_BYTES = K * 2;  // 128 bytes
 constexpr int MMA_K = 16;       // bf16 K per tcgen05.mma call
 constexpr int K_STEPS = K / MMA_K;   // 4
@@ -81,10 +81,15 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     //   chunk = c >> 3
     //   swizzled_chunk = chunk ^ (r & 7)
     //   write to s_*[r * K + (swizzled_chunk << 3)]
+    // 128B swizzle applies within each 128-byte super-block independently.
+    // In bf16 units: 128 bytes = 64 bf16, 8 chunks of 8 bf16 each.
     auto swz_offset = [](int r, int c_bf16) -> int {
-        int chunk = c_bf16 >> 3;
-        int sw = chunk ^ (r & 7);
-        return sw << 3;
+        int super_idx = c_bf16 >> 6;                 // which 128B super-block
+        int local_c   = c_bf16 & 63;                 // bf16 offset within super
+        int local_chunk = local_c >> 3;              // 8-bf16-wide chunk (0..7)
+        int sw_chunk   = local_chunk ^ (r & 7);      // XOR swizzle
+        int sw_local_c = (sw_chunk << 3) | (local_c & 7);
+        return (super_idx << 6) | sw_local_c;
     };
 
     // A: 128 rows × 8 chunks = 1024 loads.
