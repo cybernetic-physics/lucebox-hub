@@ -49,7 +49,9 @@ def main():
     ]
     print(f'{"M":>5} {"N":>6} {"K":>5}  {"tcgen (μs)":>11}  {"cuBLAS (μs)":>12}  {"ratio":>7}  winner')
     for M, N, K in shapes:
-        if M % 128 != 0 or N % 128 != 0 or K % 64 != 0:
+        # v5 needs M % (CTA_GROUP*BLOCK_M)=256 alignment for the cluster pairing
+        # and N % BLOCK_N=256. K % BLOCK_K=64.
+        if M % 256 != 0 or N % 256 != 0 or K % 64 != 0:
             print(f"  skip {M}x{N}x{K} (alignment)")
             continue
         tc, cb = bench(M, N, K)
