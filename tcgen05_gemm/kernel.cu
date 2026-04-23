@@ -186,12 +186,10 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     //
     // Leaving the original lane=row-stride layout so AT LEAST (0,0) and rows 0,1
     // match, until the layout is pinned down in a followup session.
-    // Best-guess readback. Layout A (lane=row, reg=col stride 1) hits 4287/32768
-    // positions correctly vs torch reference — specifically, reg 0 is correct for
-    // every (row, 8*iter) across all iterations, but regs 1..7 land at
-    // wrong offsets. Exact fragment layout for .32x32b.x8 needs PTX ISA
-    // reference; both tested alternatives (stride-32, quad-layout) were worse
-    // or alignment-errored.
+    // Best known-decent: layout A (lane=row, reg=col consecutive). Hits ~13%
+    // of positions (reg 0 correct at each col iter; regs 1..7 land in the
+    // wrong TMEM col mapping). This is the state to continue debugging from
+    // next session with the PTX ISA spec / CUTLASS TMEM layout source open.
     for (int n_off = 0; n_off < N; n_off += 8) {
         if (warp < 4) {
             int row_offset = warp * 32;
