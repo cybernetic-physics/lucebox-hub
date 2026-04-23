@@ -78,34 +78,75 @@ def alloc_prefill_buffers(max_tokens):
     )
 
 
+def get_prefill_op(decoder):
+    ops = torch.ops.qwen35_megakernel_bf16_C
+    if decoder.backend == "nvfp4":
+        return ops.prefill_bf16_nvfp4_lm
+    return ops.prefill_bf16
+
+
 def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
     decoder.reset()
-    prefill_op(
-        decoder._out_token,
-        ids_t,
-        decoder._embed_weight,
-        decoder._layer_weights_packed,
-        decoder._final_norm_weight,
-        decoder._lm_head_weight,
-        decoder._fa_k_cache,
-        decoder._fa_v_cache,
-        decoder._dn_states,
-        decoder._conv_bufs,
-        buffers["hidden"],
-        buffers["residual"],
-        buffers["normalized"],
-        buffers["proj_buf"],
-        buffers["proj_buf2"],
-        buffers["attn_buf"],
-        buffers["mlp_buf"],
-        buffers["dn_out_buf"],
-        buffers["beta_buf"],
-        buffers["alpha_buf"],
-        buffers["final_normed"],
-        buffers["hidden_bf16_out"],
-        buffers["lm_bmv"],
-        buffers["lm_bmi"],
-    )
+    if decoder.backend == "nvfp4":
+        prefill_op(
+            decoder._out_token,
+            ids_t,
+            decoder._embed_weight,
+            decoder._layer_weights_packed,
+            decoder._final_norm_weight,
+            decoder._lm_head_weight,
+            decoder._lm_head_weight_packed,
+            decoder._lm_head_scales,
+            decoder._fa_k_cache,
+            decoder._fa_v_cache,
+            decoder._dn_states,
+            decoder._conv_bufs,
+            buffers["hidden"],
+            buffers["residual"],
+            buffers["normalized"],
+            buffers["proj_buf"],
+            buffers["proj_buf2"],
+            buffers["attn_buf"],
+            buffers["mlp_buf"],
+            buffers["dn_out_buf"],
+            buffers["beta_buf"],
+            buffers["alpha_buf"],
+            buffers["final_normed"],
+            buffers["hidden_bf16_out"],
+            buffers["lm_bmv"],
+            buffers["lm_bmi"],
+            decoder._lm_hidden_bf16,
+            decoder._lm_hidden_packed,
+            decoder._lm_hidden_scales,
+            decoder._lm_logits_f16,
+        )
+    else:
+        prefill_op(
+            decoder._out_token,
+            ids_t,
+            decoder._embed_weight,
+            decoder._layer_weights_packed,
+            decoder._final_norm_weight,
+            decoder._lm_head_weight,
+            decoder._fa_k_cache,
+            decoder._fa_v_cache,
+            decoder._dn_states,
+            decoder._conv_bufs,
+            buffers["hidden"],
+            buffers["residual"],
+            buffers["normalized"],
+            buffers["proj_buf"],
+            buffers["proj_buf2"],
+            buffers["attn_buf"],
+            buffers["mlp_buf"],
+            buffers["dn_out_buf"],
+            buffers["beta_buf"],
+            buffers["alpha_buf"],
+            buffers["final_normed"],
+            buffers["hidden_bf16_out"],
+            buffers["lm_bmv"],
+            buffers["lm_bmi"],
+        )
     decoder._hidden.copy_(buffers["hidden_bf16_out"])
     decoder._position = prompt_len
     return decoder._out_token.item()
@@ -185,7 +226,7 @@ def run_correctness(args, tokenizer):
     if decoder.backend == "nvfp4":
         print("Correctness mode: prefill/decode handoff smoke test", flush=True)
 
-    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prefill_op = get_prefill_op(decoder)
     prompt_ids = tokenizer.encode("The capital of France is", add_special_tokens=False)
     buffers = alloc_prefill_buffers(max(32, len(prompt_ids)))
 
@@ -224,7 +265,7 @@ def run_pp(args, tokenizer):
         backend=args.backend,
         verbose=args.verbose_loader,
     )
-    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prefill_op = get_prefill_op(decoder)
     prompt_ids = build_exact_prompt_ids(tokenizer, args.prompt_tokens)
     buffers = alloc_prefill_buffers(len(prompt_ids))
     ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
@@ -265,7 +306,7 @@ def run_tg(args, tokenizer):
         backend=args.backend,
         verbose=args.verbose_loader,
     )
-    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    prefill_op = get_prefill_op(decoder)
     prompt_ids = tokenizer.encode("The capital of France is", add_special_tokens=False)
     buffers = alloc_prefill_buffers(max(args.prompt_tokens, 32, len(prompt_ids)))
 
