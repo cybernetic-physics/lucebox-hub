@@ -189,6 +189,17 @@ struct LoraPFSet {
     const void *dn_down_A, *dn_down_B;
 };
 
+// Must mirror SavedActivationsPF in prefill.cu. Each pointer, when
+// non-null, is a flat [NUM_LAYERS, S, DIM] bf16 buffer the forward
+// writes into at the respective per-layer checkpoint. All-null ⇒
+// inference-only, zero overhead.
+struct SavedActivationsPF {
+    void *hidden_in;
+    void *normalized_in;
+    void *normalized_post_attn;
+    void *mlp_inter;
+};
+
 extern "C" void launch_prefill_bf16(
     const int *token_ids, int seq_len, int *output_token,
     const void *embed_weight, const LayerWeights *layers,
@@ -200,6 +211,7 @@ extern "C" void launch_prefill_bf16(
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
     LoraPFSet lora, int lora_rank, float lora_scaling, void *lora_h_ws,
+    SavedActivationsPF saved,
     cudaStream_t stream);
 
 extern "C" void launch_prefill_bf16_mega(
@@ -243,6 +255,7 @@ void prefill_bf16(
         final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
         lora, 0, 0.0f, nullptr,
+        SavedActivationsPF{},
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -313,6 +326,90 @@ void prefill_bf16_with_lora(
         final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
         lora, (int)lora_rank, (float)lora_scaling, lora_h_ws.data_ptr(),
+        SavedActivationsPF{},
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
+// ===== prefill_bf16_train_step =====
+// Same as prefill_bf16_with_lora but also writes per-layer activation
+// slabs that the backward kernels consume. Pass empty tensors for any
+// save-slot you don't need — empty → nullptr → that save is skipped.
+//
+// Expected shapes (bf16, cuda):
+//   hidden_in_save          : [NUM_LAYERS, S, HIDDEN]
+//   normalized_in_save      : [NUM_LAYERS, S, HIDDEN]
+//   normalized_post_attn_sv : [NUM_LAYERS, S, HIDDEN]
+//   mlp_inter_save          : [NUM_LAYERS, S, INTER]
+void prefill_bf16_train_step(
+    torch::Tensor output_token, torch::Tensor token_ids,
+    torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
+    torch::Tensor final_norm_weight, torch::Tensor lm_head_weight,
+    torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
+    torch::Tensor dn_states, torch::Tensor conv_bufs,
+    torch::Tensor hidden, torch::Tensor residual, torch::Tensor normalized,
+    torch::Tensor proj_buf, torch::Tensor proj_buf2,
+    torch::Tensor attn_buf, torch::Tensor mlp_buf,
+    torch::Tensor dn_out_buf, torch::Tensor beta_buf, torch::Tensor alpha_buf,
+    torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
+    torch::Tensor lm_bmv, torch::Tensor lm_bmi,
+    // LoRA A/B tensors (26 total)
+    torch::Tensor fa_q_A,    torch::Tensor fa_q_B,
+    torch::Tensor fa_k_A,    torch::Tensor fa_k_B,
+    torch::Tensor fa_v_A,    torch::Tensor fa_v_B,
+    torch::Tensor fa_o_A,    torch::Tensor fa_o_B,
+    torch::Tensor fa_gate_A, torch::Tensor fa_gate_B,
+    torch::Tensor fa_up_A,   torch::Tensor fa_up_B,
+    torch::Tensor fa_down_A, torch::Tensor fa_down_B,
+    torch::Tensor dn_qkv_A,  torch::Tensor dn_qkv_B,
+    torch::Tensor dn_z_A,    torch::Tensor dn_z_B,
+    torch::Tensor dn_out_A,  torch::Tensor dn_out_B,
+    torch::Tensor dn_gate_A, torch::Tensor dn_gate_B,
+    torch::Tensor dn_up_A,   torch::Tensor dn_up_B,
+    torch::Tensor dn_down_A, torch::Tensor dn_down_B,
+    int64_t lora_rank, double lora_scaling, torch::Tensor lora_h_ws,
+    // Activation-save slabs (empty tensor ⇒ disable that save)
+    torch::Tensor hidden_in_save,
+    torch::Tensor normalized_in_save,
+    torch::Tensor normalized_post_attn_save,
+    torch::Tensor mlp_inter_save)
+{
+    LoraPFSet lora{
+        opt_ptr(fa_q_A),    opt_ptr(fa_q_B),
+        opt_ptr(fa_k_A),    opt_ptr(fa_k_B),
+        opt_ptr(fa_v_A),    opt_ptr(fa_v_B),
+        opt_ptr(fa_o_A),    opt_ptr(fa_o_B),
+        opt_ptr(fa_gate_A), opt_ptr(fa_gate_B),
+        opt_ptr(fa_up_A),   opt_ptr(fa_up_B),
+        opt_ptr(fa_down_A), opt_ptr(fa_down_B),
+        opt_ptr(dn_qkv_A),  opt_ptr(dn_qkv_B),
+        opt_ptr(dn_z_A),    opt_ptr(dn_z_B),
+        opt_ptr(dn_out_A),  opt_ptr(dn_out_B),
+        opt_ptr(dn_gate_A), opt_ptr(dn_gate_B),
+        opt_ptr(dn_up_A),   opt_ptr(dn_up_B),
+        opt_ptr(dn_down_A), opt_ptr(dn_down_B),
+    };
+    SavedActivationsPF saved{
+        const_cast<void*>(opt_ptr(hidden_in_save)),
+        const_cast<void*>(opt_ptr(normalized_in_save)),
+        const_cast<void*>(opt_ptr(normalized_post_attn_save)),
+        const_cast<void*>(opt_ptr(mlp_inter_save)),
+    };
+    launch_prefill_bf16(
+        (const int*)token_ids.data_ptr(), token_ids.size(0),
+        (int*)output_token.data_ptr(),
+        embed_weight.data_ptr(),
+        reinterpret_cast<const LayerWeights*>(layer_weights_packed.data_ptr()),
+        final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+        fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
+        dn_states.data_ptr(), conv_bufs.data_ptr(),
+        hidden.data_ptr(), residual.data_ptr(), normalized.data_ptr(),
+        proj_buf.data_ptr(), proj_buf2.data_ptr(),
+        attn_buf.data_ptr(), mlp_buf.data_ptr(),
+        dn_out_buf.data_ptr(), beta_buf.data_ptr(), alpha_buf.data_ptr(),
+        final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
+        lm_bmv.data_ptr(), lm_bmi.data_ptr(),
+        lora, (int)lora_rank, (float)lora_scaling, lora_h_ws.data_ptr(),
+        saved,
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -408,6 +505,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor dn_down_A, Tensor dn_down_B, "
             "int lora_rank, float lora_scaling, Tensor lora_h_ws) -> ()");
     ops.impl("prefill_bf16_with_lora", torch::kCUDA, &prefill_bf16_with_lora);
+
+    ops.def("prefill_bf16_train_step(Tensor output_token, Tensor token_ids, "
+            "Tensor embed_weight, Tensor layer_weights_packed, "
+            "Tensor final_norm_weight, Tensor lm_head_weight, "
+            "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
+            "Tensor hidden, Tensor residual, Tensor normalized, "
+            "Tensor proj_buf, Tensor proj_buf2, Tensor attn_buf, Tensor mlp_buf, "
+            "Tensor dn_out_buf, Tensor beta_buf, Tensor alpha_buf, "
+            "Tensor final_normed, Tensor hidden_bf16_out, "
+            "Tensor lm_bmv, Tensor lm_bmi, "
+            "Tensor fa_q_A, Tensor fa_q_B, "
+            "Tensor fa_k_A, Tensor fa_k_B, "
+            "Tensor fa_v_A, Tensor fa_v_B, "
+            "Tensor fa_o_A, Tensor fa_o_B, "
+            "Tensor fa_gate_A, Tensor fa_gate_B, "
+            "Tensor fa_up_A, Tensor fa_up_B, "
+            "Tensor fa_down_A, Tensor fa_down_B, "
+            "Tensor dn_qkv_A, Tensor dn_qkv_B, "
+            "Tensor dn_z_A, Tensor dn_z_B, "
+            "Tensor dn_out_A, Tensor dn_out_B, "
+            "Tensor dn_gate_A, Tensor dn_gate_B, "
+            "Tensor dn_up_A, Tensor dn_up_B, "
+            "Tensor dn_down_A, Tensor dn_down_B, "
+            "int lora_rank, float lora_scaling, Tensor lora_h_ws, "
+            "Tensor hidden_in_save, Tensor normalized_in_save, "
+            "Tensor normalized_post_attn_save, Tensor mlp_inter_save) -> ()");
+    ops.impl("prefill_bf16_train_step", torch::kCUDA, &prefill_bf16_train_step);
 
     ops.def("prefill_bf16_mega(Tensor output_token, Tensor token_ids, "
             "Tensor embed_weight, Tensor layer_weights_packed, "

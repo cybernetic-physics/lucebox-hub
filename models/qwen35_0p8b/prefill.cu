@@ -936,6 +936,34 @@ static inline void apply_lora_linear(cublasHandle_t h,
                         S, N, lora_rank, lora_scaling, 1.0f);
 }
 
+// ===== Saved activations for training backward =====
+//
+// During training we need to recover per-layer intermediate activations
+// when running backward. Each pointer here, when non-null, is a flat
+// [NUM_LAYERS, S, DIM] bf16 buffer that the forward writes to at the
+// corresponding checkpoint. All null ⇒ inference-only, zero overhead.
+//
+// hidden_in[L]           ← input to layer L (= output of layer L-1)
+// normalized_in[L]       ← output of input RMSnorm of layer L
+// normalized_post_attn[L]← output of post-attn RMSnorm of layer L
+// mlp_inter[L]           ← output of silu(gate)*up of layer L
+//
+// DIM = HIDDEN for the first three, INTER for mlp_inter.
+struct SavedActivationsPF {
+    __nv_bfloat16 *hidden_in;
+    __nv_bfloat16 *normalized_in;
+    __nv_bfloat16 *normalized_post_attn;
+    __nv_bfloat16 *mlp_inter;
+};
+
+static inline void save_bf16_slab(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
+                                  int layer_idx, int S, int dim, cudaStream_t stream) {
+    if (dst == nullptr) return;
+    size_t bytes = (size_t)S * dim * sizeof(__nv_bfloat16);
+    cudaMemcpyAsync(dst + (size_t)layer_idx * S * dim, src, bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+}
+
 // ===== Prefill body (capturable). All device work lives here so we can
 //       wrap it in cudaStreamBeginCapture and replay via cudaGraphLaunch. =====
 // Helper: per-projection LoRA offset into a per-type-layer-major
@@ -970,6 +998,8 @@ static void prefill_bf16_body(
     // LoRA (optional — null pointers + rank==0 → inference-only path)
     LoraPFSet lora,
     int lora_rank, float lora_scaling, __nv_bfloat16 *lora_h_ws,
+    // Saved activations for backward (optional — all-null → inference-only)
+    SavedActivationsPF saved,
     cudaStream_t stream)
 {
     int bk = (S*HIDDEN+255)/256;
@@ -991,8 +1021,14 @@ static void prefill_bf16_body(
         const PFLayerWeights &lw = hl[li];
         int lt = LAYER_TYPE[li];
 
+        // Save pre-norm hidden for input-RMSnorm bwd.
+        save_bf16_slab(saved.hidden_in, hidden, li, S, HIDDEN, stream);
+
         const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)lw.ptrs[0];
         pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+
+        // Save post-input-RMSnorm for QKV/DN-QKV bwd (LoRA A grad input).
+        save_bf16_slab(saved.normalized_in, normalized, li, S, HIDDEN, stream);
 
         if (lt == 0) {
             // DeltaNet
@@ -1072,12 +1108,14 @@ static void prefill_bf16_body(
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            save_bf16_slab(saved.normalized_post_attn, normalized, li, S, HIDDEN, stream);
             cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
             APPLY_LORA(lora.dn_gate_A, lora.dn_gate_B, normalized, proj_buf, HIDDEN, INTER, dn_idx);
             cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
             APPLY_LORA(lora.dn_up_A, lora.dn_up_B, normalized, proj_buf2, HIDDEN, INTER, dn_idx);
             int mlp_bk = (S*INTER+255)/256;
             pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            save_bf16_slab(saved.mlp_inter, mlp_buf, li, S, INTER, stream);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
             APPLY_LORA(lora.dn_down_A, lora.dn_down_B, mlp_buf, proj_buf, INTER, HIDDEN, dn_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
@@ -1117,12 +1155,14 @@ static void prefill_bf16_body(
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            save_bf16_slab(saved.normalized_post_attn, normalized, li, S, HIDDEN, stream);
             cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
             APPLY_LORA(lora.fa_gate_A, lora.fa_gate_B, normalized, proj_buf, HIDDEN, INTER, fa_idx);
             cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
             APPLY_LORA(lora.fa_up_A, lora.fa_up_B, normalized, proj_buf2, HIDDEN, INTER, fa_idx);
             int mlp_bk = (S*INTER+255)/256;
             pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            save_bf16_slab(saved.mlp_inter, mlp_buf, li, S, INTER, stream);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
             APPLY_LORA(lora.fa_down_A, lora.fa_down_B, mlp_buf, proj_buf, INTER, HIDDEN, fa_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
@@ -1174,6 +1214,9 @@ struct PrefillGraphKey {
     int lora_rank;
     float lora_scaling;
     const void *lora_h_ws;
+    // Saved-activation slabs: distinct training vs inference vs grad-check
+    // invocations get distinct cached graphs.
+    SavedActivationsPF saved;
 };
 
 struct PrefillGraphEntry {
@@ -1210,6 +1253,8 @@ extern "C" void launch_prefill_bf16(
     // LoRA (optional — null ptrs + rank==0 means "inference only", fast path)
     LoraPFSet lora, int lora_rank, float lora_scaling,
     __nv_bfloat16 *lora_h_ws,
+    // Saved activations for training backward (optional — all-null = off)
+    SavedActivationsPF saved,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -1263,6 +1308,7 @@ extern "C" void launch_prefill_bf16(
     key.lora_rank = lora_rank;
     key.lora_scaling = lora_scaling;
     key.lora_h_ws = lora_h_ws;
+    key.saved = saved;
 
     PrefillGraphEntry *hit = nullptr;
     if (!disable_graph) {
@@ -1313,7 +1359,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
         if (hit) hit->eager_runs++;
         return;
     }
@@ -1336,7 +1382,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
         return;
     }
 
@@ -1366,7 +1412,7 @@ extern "C" void launch_prefill_bf16(
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, capture_stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, capture_stream);
     {
         cudaGraph_t graph = nullptr;
         err = cudaStreamEndCapture(capture_stream, &graph);
@@ -1414,7 +1460,7 @@ fallback_eager:
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
     if (hit) {
         hit->eager_runs++;  // stay in warmup until capture finally works
     }
