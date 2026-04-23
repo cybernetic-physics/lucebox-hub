@@ -214,51 +214,87 @@ to match HF eager after decode is run on the post-prefill state.
 
 ### Performance on B200
 
-| Prefill path (pp520)                             | pp520 (tok/s) | ms   |
-|--------------------------------------------------|:-------------:|:----:|
-| Megakernel BF16 (cuBLAS + launches, this branch) |    15,859     | 32.7 |
-| **Prefill megakernel (this commit)**             |     9,404     | 55.3 |
-| llama.cpp BF16 (CUDA, ngl=99)                    |    26,781     | 19.4 |
+| Prefill path (pp520)                                        | pp520 (tok/s) | ms   |
+|-------------------------------------------------------------|:-------------:|:----:|
+| Megakernel BF16 (cuBLAS + launches, graph-captured)         |    15,859     | 32.7 |
+| **Prefill megakernel, pipelined cp.async + WMMA (current)** |     8,880     | 58.6 |
+| Prefill megakernel, no-pipeline WMMA (earlier attempt)      |     9,404     | 55.3 |
+| llama.cpp BF16 (CUDA, ngl=99)                               |    26,781     | 19.4 |
 
-The true-megakernel path is **slower** than the cuBLAS-assisted path here,
-by ~0.59×. Two reasons, both about the GEMM:
+The true-megakernel path is still **slower** than the cuBLAS-assisted
+path here, by ~0.56×. After implementing the pipelined GEMM below the
+gap is the same as before — the pipeline correctly overlaps loads with
+compute, but the underlying WMMA compute is not tuned enough.
 
-1. **WMMA C++ API is not cuBLAS.** At S=544, N in {1024, 2048, 3584, 6144},
-   K in {1024, 3584}, cuBLAS picks a hand-tuned kernel per shape. Our WMMA
-   loop is the textbook "load fragment, mma, loop over k" — correct but
-   doesn't use cp.async bulk copies, swizzled shared-memory staging, or a
-   producer/consumer double-buffer. That's ~8–14× less tensor-core
-   efficiency than cuBLAS at these shapes.
-2. **Per-tile setup dominates at small M.** BTM=32 tiles make sense for
-   S≈520 (keeps 17 m-tiles), but every tile pays a fragment-fill + store +
-   bf16-cast that amortises badly when each warp produces only one 16×16
-   output.
+### What's in the current GEMM (`phase_matmul_bf16`)
 
-What didn't help (tried, measured no gain): staging A into shared memory
-(32–112 KB per block) with WMMA reading fragments from shared; widening the
-block tile to [16, 256] for more A-reuse per load.
+`megakernel/prefill_megakernel.cu`, inside the persistent kernel. Full
+CUTLASS-style producer/consumer pipeline on stock `mma.sync`-based WMMA:
 
-### What would actually beat cuBLAS in the megakernel
+- **Block tile** `[BTM=32, BTN=128]`, warp grid 2×8, each warp produces
+  `[16, 16]` via one WMMA `m16n16k16` accumulator.
+- **K-chunk** `BTK=64`. For K=1024 that's 16 chunks, for K=3584 it's 56.
+- **Double-buffered shared staging**:
+  ```
+  sA[2][BTM][BTK]   =  8 KB
+  sB[2][BTN][BTK]   = 32 KB
+  sC[BTM][BTN]      = 16 KB    (f32 accumulator → bf16 epilogue)
+  ```
+  56 KB dynamic shared per block; shared limit raised via
+  `cudaFuncAttributeMaxDynamicSharedMemorySize` to 104 KB before launch.
+- **cp.async.cg** (L1-bypass, global → shared, 16 bytes per issue) for
+  both A and B chunks. 256 threads load the A tile (2 KB worth of `cp.async`
+  calls); all 512 threads do 2 passes for the B tile.
+- **Pipeline**: first chunk prefetched before the k-loop;
+  at iteration *ck* we issue chunk *ck+1* (`cp.async.commit_group`), then
+  `cp.async.wait_group<1>` keeps one outstanding group so the GPU overlaps
+  the next chunk's global fetch with the current chunk's MMA.
+- **Epilogue**: WMMA accumulators written to an `f32` shared tile, then
+  all 512 threads cooperate on the `f32 → bf16` cast + bounds-checked
+  global store.
 
-A CUTLASS-grade GEMM inside the persistent kernel:
+Helpers implemented inline: `cp_async_16`, `cp_async_commit`,
+`cp_async_wait_group<N>`. The PTX is:
 
-- **Async bulk load** (`cp.async.bulk` / `cp.async.cg`) for both A and B
-  tiles into swizzled shared memory, with a ping-pong buffer so the next
-  k-chunk loads while the current one is in MMA.
-- **`ldmatrix.sync.aligned.x4`** for fragment loads from shared memory —
-  gives the expected 4× load-bandwidth on tensor-core paths vs WMMA's
-  `load_matrix_sync`.
-- **Pipelined `mma.sync` with 2- or 3-stage buffering** so the tensor core
-  pipeline stays saturated across the k loop.
-- **Epilogue fusion**: combine `tile_f32 → bf16 → residual add / silu_mul`
-  into the mma epilogue so we never round-trip through global for the
-  activation.
+```
+asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+             :: "r"(smem_int), "l"(src_gmem));
+asm volatile("cp.async.commit_group;\n");
+asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+```
 
-That's a ~500-line GEMM engine, analogous to `CollectiveMma` in CUTLASS's
-sm_100 kernels. Mentally sketched, not written. The megakernel architecture
-is the scaffold that work would land in: the phase structure, the grid
-sync, the launch config, and the DeltaNet recurrence reuse all stay
-identical — only `phase_matmul_bf16` changes.
+### Why it still doesn't beat cuBLAS
+
+cuBLAS at these shapes picks a shape-specialised SASS kernel from its
+internal heuristic cache. Three capabilities we don't yet match:
+
+1. **`tcgen05.mma` (sm_100) / `wgmma` (sm_90a) warp-group MMA.** Blackwell
+   datacenter TC gen5 issues one MMA per *warp-group* (4 warps × 32 lanes
+   = 128 threads), with a 64×128×16 tile in bf16. Our `mma.sync.aligned.m16n16k16`
+   is a single-warp path — correct, but delivers roughly a third of the
+   tensor-core throughput on sm_100 at the same register footprint.
+2. **Swizzled shared-memory layouts + `ldmatrix.sync.aligned.x4`.** WMMA
+   `load_matrix_sync` is a plain stride load; cuBLAS uses swizzled
+   address permutations so 4-way `ldmatrix` avoids bank conflicts and hits
+   the full shared-memory bandwidth.
+3. **Epilogue fusion.** cuBLAS at this size fuses the bf16 cast and often
+   the residual add into the MMA epilogue. We still round-trip through an
+   f32 shared tile between the MMA and the bf16 store.
+
+Implementing (1) on sm_100 is a substantial undertaking (different MMA
+intrinsic family, different fragment layouts, TMA-driven A/B loads via
+`cp.async.bulk.tensor`, tensor-memory descriptors). (2) and (3) are
+incremental polish on top.
+
+### Where the megakernel still wins
+
+The scaffold is the right shape — single persistent dispatch, all 24
+layers, every phase inside grid syncs. Decoder-side, the megakernel
+already beats llama.cpp on tg128 (711 vs 437, 1.63×). On prefill the
+same architecture will beat llama.cpp once `phase_matmul_bf16` is
+rewritten with (1)(2)(3) above; the rest of the prefill body (rmsnorm,
+DN recurrence, RoPE, causal attn, silu_mul, LM head, residual adds)
+already lives in the megakernel and will not need to be touched.
 
 ### The recurrence is still the other half
 

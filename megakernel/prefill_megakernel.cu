@@ -71,16 +71,20 @@ constexpr int MEGA_WARPS = MEGA_BLOCK_SIZE / 32;
 constexpr int WM = 16;
 constexpr int WN = 16;
 constexpr int WK = 16;
-// Block tile [32, 128] with 2×8 warp grid. Each warp produces a [16, 16]
-// output via WMMA; A and B are read from global directly each k-step
-// (L1/L2 absorbs the redundancy). This layout is where "correctness is
-// easy" ≈ "perf is OK" on B200; beating cuBLAS at these sizes needs a
-// proper cp.async + ldmatrix + double-buffered MMA pipeline.
+// Block tile [32, 128] with 2×8 warp grid; each warp produces a [16, 16]
+// output. K is processed in BTK=64 chunks, double-buffered in shared
+// memory via cp.async so the next chunk streams in while we MMA on the
+// current one. This keeps parallelism high for small-N matmuls (down,
+// out, z projections) while letting the async loader hide global latency.
 constexpr int BTM = 32;
 constexpr int BTN = 128;
+constexpr int BTK = 64;                // k-chunk size (double buffered)
+constexpr int N_PER_WARP = 1;          // 16-col WMMA tile per warp
 constexpr int WARPS_M = 2;
 constexpr int WARPS_N = 8;
 static_assert(WARPS_M * WARPS_N == MEGA_WARPS, "warp grid must match block");
+static_assert(WARPS_N * WN * N_PER_WARP == BTN, "warp N coverage mismatch");
+static_assert(WARPS_M * WM == BTM, "warp M coverage mismatch");
 
 constexpr int LM_BLOCKS_MEGA = 1024;
 
@@ -90,6 +94,28 @@ __device__ __forceinline__ float mega_warp_sum(float v) {
     return v;
 }
 __device__ __forceinline__ float mega_silu(float x) { return x / (1.0f + expf(-x)); }
+
+// cp.async.cg: copy 16 bytes global → shared, bypassing L1 (goes through L2).
+// The copy is asynchronous; producer threads must issue cp.async.commit_group
+// and consumers must cp.async.wait_group before reading shared.
+__device__ __forceinline__ void cp_async_16(void *dst_smem, const void *src_gmem) {
+    unsigned int smem_int = __cvta_generic_to_shared(dst_smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_int), "l"(src_gmem));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n");
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n");
+}
 
 // ===== Phase: Embedding =====
 // hidden[s*H + i] = embed[ids[s]*H + i]
@@ -147,11 +173,38 @@ __device__ void phase_rmsnorm(const __nv_bfloat16 *input, const __nv_bfloat16 *w
 // Requires M and N multiples of BTM and BTN respectively, K multiple of WK.
 // Each block owns a [BTM, BTN] output tile; warps within a block tile
 // [WARPS_M, WARPS_N]×[WM, WN].
+// ===== Pipelined double-buffered BF16 GEMM =====
+//
+// C[M, N] = A[M, K] × W[N, K]^T  (W stored row-major as [N, K]).
+//
+// Per block:
+//   Block tile   : [BTM=32, BTN=256]
+//   Warp grid    : 2 × 8
+//   Per-warp out : [16, 32] via 2× WMMA m16n16k16 accumulators
+//   K-chunk      : BTK=64 (double-buffered with cp.async)
+//
+// Shared memory layout (dynamic):
+//   sA[2][BTM][BTK]  : double-buffered A staging         (2*32*64*2 =  8 KB)
+//   sB[2][BTN][BTK]  : double-buffered B staging         (2*256*64*2= 64 KB)
+//   sC[BTM][BTN]     : f32 output accumulator staging    (32*256*4 = 32 KB)
+// Total: 104 KB dynamic shared per block (B200 carveout = 228 KB, ok).
+//
+// Threads-per-tile work:
+//   - A chunk is BTM*BTK = 32*64 = 2048 bf16 = 4 KB per buffer.
+//     Each thread copies 8 bf16 (16 B) per cp.async, so 2048/8 = 256 copies
+//     across 512 threads = ½ pass. Threads >= 256 skip the A load.
+//   - B chunk is BTN*BTK = 256*64 = 16384 bf16 = 32 KB per buffer.
+//     512 threads × 8 bf16 = 4096 bf16 per pass → 4 passes.
+
 __device__ void phase_matmul_bf16(const __nv_bfloat16 *A, const __nv_bfloat16 *W,
                                   __nv_bfloat16 *C, int M, int N, int K) {
-    __shared__ float tile_f32[BTM * BTN];
+    extern __shared__ __align__(16) char smem_raw[];
+    __nv_bfloat16 *sA = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
+    __nv_bfloat16 *sB = sA + 2 * BTM * BTK;
+    float *tile_f32 = reinterpret_cast<float *>(sB + 2 * BTN * BTK);
 
-    int warp_id = threadIdx.x / 32;
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
     int wm = warp_id / WARPS_N;
     int wn = warp_id % WARPS_N;
 
@@ -159,36 +212,126 @@ __device__ void phase_matmul_bf16(const __nv_bfloat16 *A, const __nv_bfloat16 *W
     int num_n_tiles = (N + BTN - 1) / BTN;
     int total_tiles = num_m_tiles * num_n_tiles;
 
+    // K must be a multiple of BTK for the pipeline to work cleanly.
+    // All our Ks (1024, 2048, 3584) satisfy K % 64 == 0.
+    int num_k_chunks = K / BTK;
+
+    // Lambda: asynchronously stage one (BM, BTK) tile of A or B from global
+    // into the `buf`-th shared buffer, using cp.async.cg (bypasses L1).
+    auto issue_a_chunk = [&] (int buf, int m_start, int k_start) {
+        const __nv_bfloat16 *src_base = A + m_start * K + k_start;
+        __nv_bfloat16 *dst_base = sA + buf * BTM * BTK;
+        // 2048 bf16 elements = 256 cp.async calls at 8 bf16 each.
+        // Use 256 threads (half the block). Each thread does 1 call.
+        if (tid < 256) {
+            int r = tid >> 3;            // 0..31 rows
+            int c = (tid & 7) * 8;        // col start within BTK
+            cp_async_16(dst_base + r * BTK + c,
+                         src_base + r * K + c);
+        }
+    };
+
+    auto issue_b_chunk = [&] (int buf, int n_start, int k_start) {
+        // W is [N, K] row-major; our tile is rows [n_start, n_start+BTN)
+        // and cols [k_start, k_start+BTK). In shared we lay it out as
+        // [BTN, BTK] so WMMA col_major loads get the correct N-fragment.
+        const __nv_bfloat16 *src_base = W + n_start * K + k_start;
+        __nv_bfloat16 *dst_base = sB + buf * BTN * BTK;
+        // BTN * BTK / 8 = 128*64/8 = 1024 cp.async calls; 512 threads × 2.
+        #pragma unroll
+        for (int it = 0; it < 2; it++) {
+            int idx = tid + it * blockDim.x;
+            int r = idx >> 3;         // 0..127 rows
+            int c = (idx & 7) * 8;     // col start within BTK
+            if (r < BTN) {
+                cp_async_16(dst_base + r * BTK + c,
+                             src_base + r * K + c);
+            }
+        }
+    };
+
     for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
         int mt = tile / num_n_tiles;
         int nt = tile % num_n_tiles;
         int m_start = mt * BTM;
         int n_start = nt * BTN;
+        bool m_in_bounds = (m_start < M);
+        bool n_in_bounds = (n_start < N);
 
-        int row = m_start + wm * WM;
-        int col = n_start + wn * WN;
+        // Per-warp accumulators: 2 × [16×16] f32 WMMA fragments.
+        wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag[N_PER_WARP];
+        #pragma unroll
+        for (int n = 0; n < N_PER_WARP; n++) wmma::fill_fragment(c_frag[n], 0.0f);
 
-        wmma::fragment<wmma::matrix_a, WM, WN, WK, __nv_bfloat16, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WM, WN, WK, __nv_bfloat16, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, WM, WN, WK, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
+        // Prefetch chunk 0 into buffer 0.
+        if (m_in_bounds && n_in_bounds) {
+            issue_a_chunk(0, m_start, 0);
+            issue_b_chunk(0, n_start, 0);
+        }
+        cp_async_commit();
 
-        if (row < M && col < N) {
-            for (int k = 0; k < K; k += WK) {
-                wmma::load_matrix_sync(a_frag, A + row * K + k, K);
-                wmma::load_matrix_sync(b_frag, W + col * K + k, K);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        int warp_row_in_block = wm * WM;
+        int warp_col_in_block = wn * WN * N_PER_WARP;
+
+        for (int ck = 0; ck < num_k_chunks; ck++) {
+            int cur = ck & 1;
+            int nxt = cur ^ 1;
+
+            // Prefetch next chunk
+            if (ck + 1 < num_k_chunks) {
+                if (m_in_bounds && n_in_bounds) {
+                    issue_a_chunk(nxt, m_start, (ck + 1) * BTK);
+                    issue_b_chunk(nxt, n_start, (ck + 1) * BTK);
+                }
+                cp_async_commit();
+                cp_async_wait_group<1>();
+            } else {
+                cp_async_wait_group<0>();
             }
-            wmma::store_matrix_sync(tile_f32 + wm * WM * BTN + wn * WN,
-                                    c_frag, BTN, wmma::mem_row_major);
+            __syncthreads();
+
+            if (m_in_bounds && n_in_bounds) {
+                const __nv_bfloat16 *sA_buf = sA + cur * BTM * BTK;
+                const __nv_bfloat16 *sB_buf = sB + cur * BTN * BTK;
+
+                // MMA over this chunk: BTK/WK = 4 k-steps, each with 1 A load
+                // + N_PER_WARP B loads + N_PER_WARP MMAs.
+                #pragma unroll
+                for (int ki = 0; ki < BTK; ki += WK) {
+                    wmma::fragment<wmma::matrix_a, WM, WN, WK, __nv_bfloat16, wmma::row_major> a_frag;
+                    wmma::load_matrix_sync(a_frag, sA_buf + warp_row_in_block * BTK + ki, BTK);
+
+                    #pragma unroll
+                    for (int n = 0; n < N_PER_WARP; n++) {
+                        int col_in_block = warp_col_in_block + n * WN;
+                        wmma::fragment<wmma::matrix_b, WM, WN, WK, __nv_bfloat16, wmma::col_major> b_frag;
+                        wmma::load_matrix_sync(b_frag, sB_buf + col_in_block * BTK + ki, BTK);
+                        wmma::mma_sync(c_frag[n], a_frag, b_frag, c_frag[n]);
+                    }
+                }
+            }
+        }
+
+        // Epilogue: store each accumulator to its slot in the f32 tile.
+        if (m_in_bounds && n_in_bounds) {
+            #pragma unroll
+            for (int n = 0; n < N_PER_WARP; n++) {
+                int col_in_block = warp_col_in_block + n * WN;
+                wmma::store_matrix_sync(
+                    tile_f32 + warp_row_in_block * BTN + col_in_block,
+                    c_frag[n], BTN, wmma::mem_row_major);
+            }
         }
         __syncthreads();
 
-        for (int i = threadIdx.x; i < BTM * BTN; i += blockDim.x) {
-            int mi = i / BTN, ni = i % BTN;
-            int gm = m_start + mi, gn = n_start + ni;
-            if (gm < M && gn < N) {
-                C[gm * N + gn] = __float2bfloat16(tile_f32[i]);
+        // f32 → bf16 cast and write to global, respecting M/N bounds.
+        if (m_in_bounds && n_in_bounds) {
+            for (int i = threadIdx.x; i < BTM * BTN; i += blockDim.x) {
+                int mi = i / BTN, ni = i % BTN;
+                int gm = m_start + mi, gn = n_start + ni;
+                if (gm < M && gn < N) {
+                    C[gm * N + gn] = __float2bfloat16(tile_f32[i]);
+                }
             }
         }
         __syncthreads();
@@ -828,6 +971,17 @@ prefill_megakernel(
 }
 
 // ===== Launcher =====
+// Dynamic shared memory = double-buffered A+B staging + f32 output tile.
+//   sA: 2 × BTM × BTK × 2 B  =  8 KB
+//   sB: 2 × BTN × BTK × 2 B  = 64 KB
+//   sC: BTM × BTN × 4 B      = 32 KB
+//   total                    = 104 KB
+// B200 per-block dynamic shared max is 227 KB (228 KB carveout - driver).
+constexpr int MEGA_SHMEM_BYTES =
+    2 * BTM * BTK * 2   // sA
+  + 2 * BTN * BTK * 2   // sB
+  + BTM * BTN * 4;      // sC
+
 static int mega_launch_blocks() {
     if (const char *override_blocks = std::getenv("MEGAKERNEL_PREFILL_MEGA_BLOCKS")) {
         int v = std::atoi(override_blocks);
@@ -837,9 +991,13 @@ static int mega_launch_blocks() {
     cudaGetDevice(&device);
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, device);
+    // Raise per-block dynamic shared limit (sm_100 default caps lower).
+    cudaFuncSetAttribute(prefill_megakernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         MEGA_SHMEM_BYTES);
     int active = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active, prefill_megakernel, MEGA_BLOCK_SIZE, 0);
+        &active, prefill_megakernel, MEGA_BLOCK_SIZE, MEGA_SHMEM_BYTES);
     return std::max(1, active * prop.multiProcessorCount);
 }
 
@@ -896,5 +1054,5 @@ extern "C" void launch_prefill_bf16_mega(
         (void *)prefill_megakernel,
         dim3(cached_blocks),
         dim3(MEGA_BLOCK_SIZE),
-        args, 0, stream);
+        args, MEGA_SHMEM_BYTES, stream);
 }
