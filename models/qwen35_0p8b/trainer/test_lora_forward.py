@@ -12,8 +12,8 @@ import struct
 import sys
 import torch
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/prefill_megakernel")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/train_megakernel")
+sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/prefill_megakernel")
+sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
 
 import prefill_megakernel_C  # noqa: F401
 import train_megakernel_C    # noqa: F401

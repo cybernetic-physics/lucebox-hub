@@ -12,8 +12,8 @@ import time
 
 import torch
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/megakernel")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/prefill_megakernel")
+sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
+sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/prefill_megakernel")
 
 import qwen35_megakernel_bf16_C  # noqa: F401
 from model import VOCAB, PrefillMegakernel
