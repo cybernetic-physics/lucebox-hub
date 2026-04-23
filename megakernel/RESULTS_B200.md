@@ -9,7 +9,7 @@ changes are additive.
 
 | Method on B200 (Qwen3.5-0.8B) | pp520 (tok/s) | tg128 (tok/s) | tg128 vs llama.cpp |
 |-------------------------------|:-------------:|:-------------:|:------------------:|
-| **Megakernel BF16 (this port)**   |  **27,501**   | **711**       | **1.63×**          |
+| **Megakernel BF16 (this port)**   |  **40,278**   | **711**       | **1.63×**          |
 | llama.cpp BF16 (CUDA, ngl=99) | **26,781**    |    437        |   1.00×            |
 | Megakernel NVFP4              |    12,413     |    217        |   0.50×            |
 | PyTorch HuggingFace BF16      |     1,797     |     27        |   0.06×            |
@@ -93,7 +93,7 @@ a full prefill into a fresh decoder).
 
 | Method                              | pp520 (tok/s) | tg128 (tok/s) |
 |-------------------------------------|:-------------:|:-------------:|
-| **Megakernel BF16 (this port)**     |  **27,501**   |    **711**    |
+| **Megakernel BF16 (this port)**     |  **40,278**   |    **711**    |
 | llama.cpp BF16 (CUDA, ngl=99, r=5)  |  **26,781**   |      437      |
 | Megakernel NVFP4                    |    12,413     |      217      |
 | PyTorch HuggingFace BF16            |     1,797     |       27      |
@@ -307,7 +307,7 @@ graph-captured cuBLAS path, 15,859 tok/s) is the faster production choice;
 `prefill_bf16_mega` exists, works, and is the correct architectural shape
 for the optimizations above to land in.
 
-## Prefill (pp520, cuBLAS path): 12,420 → 27,501 (+121%), **1.03× llama.cpp — beats it**
+## Prefill (pp520, cuBLAS path): 12,420 → 40,278 (+224%), **1.50× llama.cpp**
 
 ### Where the time actually goes
 

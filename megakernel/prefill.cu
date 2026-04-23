@@ -93,6 +93,252 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
 }
 
+// ===== DeltaNet per-step prep kernel =====
+//
+// Before the V-split recurrence runs its per-step loop, precompute the
+// post-silu post-L2normalize q/k, post-silu v, sigmoid(beta) and
+// decay = exp(-exp(a_log)*softplus(alpha+dt_bias)) for all (t, head)
+// pairs in parallel. All of these are O(1) per-step operations that
+// don't depend on the recurrence state — pulling them out of the hot
+// loop turns the recurrence into pure V-local arithmetic with no per-
+// step __syncthreads (the qkv_proj / beta / decay slices each thread
+// needs are independent across threads).
+//
+// We write post-silu/post-norm values in-place over qkv_proj, and
+// sigmoid(beta) / decay in-place over beta_buf / alpha_buf.
+// conv_buf's final-4-taps update is done by pf_dn_conv_buf_update
+// afterwards to avoid in-kernel read/write races on conv_buf.
+//
+// Grid: (S, DN_HEADS). Block: 128 threads (4 warps). Each block handles
+// one (t, h) — computes conv for the 384 per-head channels (3 per
+// thread), normalizes q and k, and writes processed beta/decay.
+__global__ void pf_dn_prep(
+    __nv_bfloat16 *qkv_proj,                // IN raw / OUT post-conv-silu-norm
+    const __nv_bfloat16 *conv_w,
+    const float *conv_buf,                   // IN only (history from prior prefill)
+    const __nv_bfloat16 *a_log,
+    const __nv_bfloat16 *dt_bias,
+    float *beta_buf,                          // IN raw / OUT sigmoid(raw)
+    float *alpha_buf,                         // IN raw / OUT decay
+    int S)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= S || h >= DN_HEADS) return;
+
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    constexpr int QKV_CH = 2 * DN_KEY + DN_VAL;     // 384 per-head channels
+    constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
+
+    // Conv: each thread handles up to ceil(384/128) = 3 channels.
+    for (int c = tid; c < QKV_CH; c += blockDim.x) {
+        int gch;
+        if (c < DN_KEY) gch = h * DN_KEY + c;
+        else if (c < 2 * DN_KEY) gch = DN_QK_SIZE + h * DN_KEY + (c - DN_KEY);
+        else gch = 2 * DN_QK_SIZE + h * DN_VAL + (c - 2 * DN_KEY);
+
+        // Read 4 conv taps. For pos < 0 fall back to conv_buf (prior-prefill
+        // history). conv_buf[gch*4 + (pos+4)] when pos in [-3, -1] maps to
+        // conv_buf[1], [2], [3] which are x[-3], x[-2], x[-1] respectively.
+        float x[4];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int pos = t - 3 + k;
+            if (pos >= 0) {
+                x[k] = __bfloat162float(qkv_proj[pos * DN_CONV_CH + gch]);
+            } else {
+                x[k] = conv_buf[gch * DN_CONV_K + (pos + 4)];
+            }
+        }
+        float co = 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            co += x[k] * __bfloat162float(conv_w[gch * DN_CONV_K + k]);
+        }
+        float silu_out = pf_silu(co);
+
+        if (c < DN_KEY)           s_q[c] = silu_out;
+        else if (c < 2 * DN_KEY)  s_k[c - DN_KEY] = silu_out;
+        else                       s_v[c - 2 * DN_KEY] = silu_out;
+    }
+    __syncthreads();
+
+    // Normalize q (warp 0), normalize k (warp 1), beta/decay (warp 2 lane 0).
+    // All disjoint shared-memory targets; one sync fences them all.
+    if (wid == 0) {
+        float sq = 0;
+        for (int i = lid; i < DN_KEY; i += 32) sq += s_q[i] * s_q[i];
+        sq = pf_warp_sum(sq);
+        float n = rsqrtf(sq + 1e-6f) * Q_SCALE;
+        n = __shfl_sync(0xffffffff, n, 0);
+        for (int i = lid; i < DN_KEY; i += 32) s_q[i] *= n;
+    } else if (wid == 1) {
+        float sq = 0;
+        for (int i = lid; i < DN_KEY; i += 32) sq += s_k[i] * s_k[i];
+        sq = pf_warp_sum(sq);
+        float n = rsqrtf(sq + 1e-6f);
+        n = __shfl_sync(0xffffffff, n, 0);
+        for (int i = lid; i < DN_KEY; i += 32) s_k[i] *= n;
+    } else if (wid == 2 && lid == 0) {
+        float raw_beta = beta_buf[t * DN_HEADS + h];
+        float raw_alpha = alpha_buf[t * DN_HEADS + h];
+        beta_buf[t * DN_HEADS + h] = 1.0f / (1.0f + expf(-raw_beta));
+        float x_val = raw_alpha + __bfloat162float(dt_bias[h]);
+        float sp = (x_val > 20.0f) ? x_val : logf(1.0f + expf(x_val));
+        alpha_buf[t * DN_HEADS + h] = expf(-expf(__bfloat162float(a_log[h])) * sp);
+    }
+    __syncthreads();
+
+    // Write post-silu/post-norm values back to qkv_proj.
+    for (int c = tid; c < QKV_CH; c += blockDim.x) {
+        int gch;
+        float val;
+        if (c < DN_KEY) {
+            gch = h * DN_KEY + c;
+            val = s_q[c];
+        } else if (c < 2 * DN_KEY) {
+            gch = DN_QK_SIZE + h * DN_KEY + (c - DN_KEY);
+            val = s_k[c - DN_KEY];
+        } else {
+            gch = 2 * DN_QK_SIZE + h * DN_VAL + (c - 2 * DN_KEY);
+            val = s_v[c - 2 * DN_KEY];
+        }
+        qkv_proj[t * DN_CONV_CH + gch] = __float2bfloat16(val);
+    }
+}
+
+// After pf_dn_prep: update conv_buf with the last 4 raw qkv_proj positions.
+// This kernel reads from a separate buffer because pf_dn_prep overwrote
+// qkv_proj. We pass the raw buffer here. Actually we use conv_buf_save
+// allocated externally. Alternative: call this kernel BEFORE pf_dn_prep.
+//
+// We launch it BEFORE pf_dn_prep while qkv_proj still holds raw values.
+__global__ void pf_dn_conv_buf_update(
+    const __nv_bfloat16 *qkv_proj_raw,       // raw qkv_proj, pre-pre-pass
+    float *conv_buf,
+    int S)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= DN_CONV_CH) return;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int t_pos = S - 4 + i;
+        float v;
+        if (t_pos >= 0) {
+            v = __bfloat162float(qkv_proj_raw[t_pos * DN_CONV_CH + tid]);
+        } else {
+            // S < 4 (unusual): inherit from prior history appropriately.
+            v = conv_buf[tid * DN_CONV_K + (t_pos + 4)];
+        }
+        conv_buf[tid * DN_CONV_K + i] = v;
+    }
+}
+
+// ===== V-split DeltaNet recurrence (post-prep version) =====
+//
+// Reads PRE-PROCESSED qkv_proj (post-silu, post-L2norm) and PRE-PROCESSED
+// beta_buf (sigmoid'd) and alpha_buf (= decay). Does pure recurrence: no
+// conv, no normalize, no beta/decay compute in the hot loop. Each thread
+// reads its own RPL-sized q/k slice from global directly into registers —
+// no shared-memory staging, no per-step __syncthreads.
+//
+// Expected reduction vs the in-kernel-prep vsplit: removes ~50 % of
+// per-step compute AND both per-step __syncthreads.
+__global__ void __launch_bounds__(512, 1)
+pf_deltanet_recurrence_vsplit_prepped(
+    const __nv_bfloat16 *qkv_proj_prepped,   // from pf_dn_prep: post-silu, post-norm
+    const float *beta_buf_prepped,            // sigmoid(raw beta)
+    const float *decay_buf_prepped,           // = exp(-exp(a_log) * softplus(...))
+    float *state,
+    __nv_bfloat16 *output,                    // [S, DN_V_SIZE] bf16
+    int S, int num_v_splits)
+{
+    int block_id = blockIdx.x;
+    int h = block_id / num_v_splits;
+    int v_split = block_id % num_v_splits;
+    if (h >= DN_HEADS) return;
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
+    int NWARPS = blockDim.x / 32;
+
+    int v_slice_size = DN_VAL / num_v_splits;
+    int v_start = v_split * v_slice_size;
+    int CPW_V   = v_slice_size / NWARPS;
+
+    float *my_state = state + h * DN_KEY * DN_VAL;
+
+    constexpr int RPL = DN_KEY / 32;
+    float sreg[8 * RPL];
+    #pragma unroll
+    for (int i = 0; i < 8 * RPL; i++) sreg[i] = 0.0f;
+
+    // Load state slice.
+    for (int jj = 0; jj < CPW_V; jj++) {
+        int j_global = v_start + wid * CPW_V + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++) {
+            sreg[jj*RPL+ii] = my_state[j_global * DN_KEY + lid + ii*32];
+        }
+    }
+
+    // Global pointers for this head's q/k/v base offsets in qkv_proj.
+    int q_base = h * DN_KEY;
+    int k_base = DN_QK_SIZE + h * DN_KEY;
+    int v_base_gch = 2 * DN_QK_SIZE + h * DN_VAL;
+
+    for (int t = 0; t < S; t++) {
+        const __nv_bfloat16 *q_row = qkv_proj_prepped + t * DN_CONV_CH + q_base;
+        const __nv_bfloat16 *k_row = qkv_proj_prepped + t * DN_CONV_CH + k_base;
+        const __nv_bfloat16 *v_row = qkv_proj_prepped + t * DN_CONV_CH + v_base_gch;
+
+        // Each lane loads its 4-element slice of q and k from global.
+        float sk_cache[RPL], sq_cache[RPL];
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++) {
+            sk_cache[ii] = __bfloat162float(k_row[lid + ii*32]);
+            sq_cache[ii] = __bfloat162float(q_row[lid + ii*32]);
+        }
+
+        float beta  = beta_buf_prepped [t * DN_HEADS + h];
+        float decay = decay_buf_prepped[t * DN_HEADS + h];
+
+        __nv_bfloat16 *out_t_h = output + t * DN_V_SIZE + h * DN_VAL;
+
+        #pragma unroll
+        for (int jj = 0; jj < CPW_V; jj++) {
+            int j_local = wid * CPW_V + jj;
+            int j_global = v_start + j_local;
+            float v_val = __bfloat162float(v_row[j_global]);
+
+            float kv = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * sk_cache[ii];
+            kv = pf_warp_sum(kv);
+            kv = __shfl_sync(0xffffffff, kv, 0);
+            float delta = (v_val - decay * kv) * beta;
+            float attn = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) {
+                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + sk_cache[ii] * delta;
+                attn += sreg[jj*RPL+ii] * sq_cache[ii];
+            }
+            attn = pf_warp_sum(attn);
+            if (lid == 0) out_t_h[j_global] = __float2bfloat16(attn);
+        }
+        // No __syncthreads — every thread's reads are its own regs/global.
+    }
+
+    // State write-back.
+    for (int jj = 0; jj < CPW_V; jj++) {
+        int j_global = v_start + wid * CPW_V + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++) {
+            my_state[j_global * DN_KEY + lid + ii*32] = sreg[jj*RPL+ii];
+        }
+    }
+}
+
 // ===== V-split DeltaNet recurrence =====
 //
 // Key observation: the per-step work in the recurrence is almost entirely
@@ -129,7 +375,7 @@ pf_deltanet_recurrence_vsplit(
     int v_split = block_id % num_v_splits;
     if (h >= DN_HEADS) return;
     int tid = threadIdx.x, wid = tid/32, lid = tid%32;
-    constexpr int NWARPS = 16;
+    int NWARPS = blockDim.x / 32;               // runtime-variable; supports 128/256/512 threads
     constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
     constexpr int QKV_CH = 2 * DN_KEY + DN_VAL;
 
@@ -137,8 +383,6 @@ pf_deltanet_recurrence_vsplit(
     int v_start = v_split * v_slice_size;
     int v_end   = v_start + v_slice_size;
     int CPW_V   = v_slice_size / NWARPS;        // j's per warp in this slice
-    // When num_v_splits=1, CPW_V=8 and we degenerate to the old full-V path.
-    // When num_v_splits=4, CPW_V=2.
 
     float a_log_val = __bfloat162float(a_log[h]);
     float dt_b = __bfloat162float(dt_bias[h]);
@@ -694,18 +938,46 @@ static void prefill_bf16_body(
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
-            // V-split recurrence (num_v_splits=4 → 64 blocks on 148 SMs).
-            // Writes raw attn to dn_out_buf; gnorm + silu-mul applied next.
-            int num_v_splits = 4;
+            // Update conv_buf with last 4 RAW qkv_proj positions for next
+            // prefill call continuity — must run BEFORE pf_dn_prep overwrites
+            // qkv_proj with post-silu/post-norm values.
+            {
+                int conv_update_blocks = (DN_CONV_CH + 127) / 128;
+                pf_dn_conv_buf_update<<<conv_update_blocks, 128, 0, stream>>>(
+                    proj_buf, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
+            }
+
+            // Pre-pass: compute conv+silu+L2norm(q,k) for all (t, h) in
+            // parallel, compute sigmoid(beta) and decay, overwrite the
+            // respective scratch buffers in place. Grid (S, DN_HEADS).
+            {
+                dim3 grid(S, DN_HEADS);
+                pf_dn_prep<<<grid, 128, 0, stream>>>(
+                    proj_buf, conv_w,
+                    conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
+                    a_log, dt_bias, beta_buf, alpha_buf, S);
+            }
+
+            // V-split recurrence: each block owns a V-slice of one head's
+            // recurrence state and runs the full S sequential steps on it.
+            // Now reads pre-processed q/k/v/beta/decay — NO conv, normalize,
+            // beta/decay or per-step __syncthreads in the recurrence.
+            int num_v_splits = 8;
+            int dn_block_size = 512;
             if (const char *env = std::getenv("MEGAKERNEL_DN_V_SPLITS")) {
                 int v = std::atoi(env);
                 if (v == 1 || v == 2 || v == 4 || v == 8) num_v_splits = v;
             }
-            pf_deltanet_recurrence_vsplit<<<DN_HEADS * num_v_splits, 512, 0, stream>>>(
+            if (const char *env = std::getenv("MEGAKERNEL_DN_BLOCK_SIZE")) {
+                int b = std::atoi(env);
+                if (b == 128 || b == 256 || b == 512) dn_block_size = b;
+            }
+            int v_slice = DN_V_SIZE / num_v_splits;
+            int nwarps_want = dn_block_size / 32;
+            while (v_slice < nwarps_want) { dn_block_size >>= 1; nwarps_want = dn_block_size / 32; }
+            pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
                 proj_buf, beta_buf, alpha_buf,
-                conv_w, a_log, dt_bias,
                 dn_states + dn_idx*dn_stride,
-                conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
                 dn_out_buf, S, num_v_splits);
             // Gnorm + silu-mul with z, applied across full V per (t, head).
             pf_deltanet_gnorm<<<S * DN_HEADS, 128, 0, stream>>>(
