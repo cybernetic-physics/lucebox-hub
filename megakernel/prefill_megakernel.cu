@@ -531,24 +531,32 @@ __device__ void phase_deltanet_recurrence(
         }
         __syncthreads();
 
-        // Gated RMSNorm
+        // Gated RMSNorm.
+        //
+        // After writing per-warp partials to s_gnorm[wid] and syncing, EVERY
+        // thread reads all 16 warp partials and computes rstd locally — no
+        // second "warp 0 reduces then everyone syncs to pick up rstd" round
+        // trip through shared memory. Saves one __syncthreads per step
+        // (×520 steps ×18 layers = ~9k syncs removed per prefill).
         float sq2 = 0;
         for (int i = tid; i < DN_VAL; i += blockDim.x) { float v = s_out[i]; sq2 += v * v; }
         sq2 = mega_warp_sum(sq2);
         if (lid == 0) s_gnorm[wid] = sq2;
         __syncthreads();
-        if (wid == 0) {
-            float v = (lid < NWARPS) ? s_gnorm[lid] : 0;
-            v = mega_warp_sum(v);
-            if (lid == 0) s_gnorm[0] = rsqrtf(v / DN_VAL + RMS_EPS);
-        }
-        __syncthreads();
-        float rstd = s_gnorm[0];
+
+        float total = 0;
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) total += s_gnorm[w];
+        float rstd = rsqrtf(total / DN_VAL + RMS_EPS);
+
         for (int i = tid; i < DN_VAL; i += blockDim.x) {
             float n = s_out[i] * rstd * s_norm_w[i];
             out_h[i] = __float2bfloat16(n * mega_silu(s_z[i]));
         }
-        __syncthreads();
+        // No end-of-iter sync: each thread's writes to shared in the next
+        // iteration's conv+z phase target its own slot (stride = blockDim.x)
+        // and the first cross-warp read is fenced by the existing sync
+        // inside that phase.
     }
 
     // State writeback

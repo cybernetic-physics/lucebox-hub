@@ -9,7 +9,7 @@ changes are additive.
 
 | Method on B200 (Qwen3.5-0.8B) | pp520 (tok/s) | tg128 (tok/s) | tg128 vs llama.cpp |
 |-------------------------------|:-------------:|:-------------:|:------------------:|
-| **Megakernel BF16 (this port)**   |    15,859     | **711**       | **1.63×**          |
+| **Megakernel BF16 (this port)**   |    16,770     | **711**       | **1.63×**          |
 | llama.cpp BF16 (CUDA, ngl=99) | **26,781**    |    437        |   1.00×            |
 | Megakernel NVFP4              |    12,413     |    217        |   0.50×            |
 | PyTorch HuggingFace BF16      |     1,797     |     27        |   0.06×            |
@@ -93,7 +93,7 @@ a full prefill into a fresh decoder).
 
 | Method                              | pp520 (tok/s) | tg128 (tok/s) |
 |-------------------------------------|:-------------:|:-------------:|
-| **Megakernel BF16 (this port)**     |    15,859     |    **711**    |
+| **Megakernel BF16 (this port)**     |    16,770     |    **711**    |
 | llama.cpp BF16 (CUDA, ngl=99, r=5)  |  **26,781**   |      437      |
 | Megakernel NVFP4                    |    12,413     |      217      |
 | PyTorch HuggingFace BF16            |     1,797     |       27      |
@@ -307,7 +307,7 @@ graph-captured cuBLAS path, 15,859 tok/s) is the faster production choice;
 `prefill_bf16_mega` exists, works, and is the correct architectural shape
 for the optimizations above to land in.
 
-## Prefill (pp520, cuBLAS path): 12,420 → 15,859 (+28%), still 0.59× llama.cpp
+## Prefill (pp520, cuBLAS path): 12,420 → 16,770 (+35%), 0.63× llama.cpp
 
 ### Where the time actually goes
 
@@ -351,9 +351,22 @@ steps, and the naive implementation launches 16 blocks (one per head) on a
     - caches `norm_w` in shared once and routes the recurrence output
       through `s_out` (fp32 shared) so the gated RMSNorm tail skips a bf16
       round-trip through global memory.
+3. **Cut two `__syncthreads` from the per-step hot loop.**
+    - The gated-RMSNorm rstd compute now runs on every thread (each reads
+      all 16 per-warp partials from shared, adds, rsqrts) instead of the
+      old "warp 0 reduces → shared[0] = rstd → everyone syncs to pick
+      up rstd" round trip. Saves one sync per step.
+    - The end-of-iteration sync is removed: the next iteration's conv+z
+      prefetch touches s_conv / s_q / s_k / s_v / s_z strictly on each
+      thread's own slot (stride = blockDim.x), and the first cross-warp
+      read (phase B normalize reading s_q) is already fenced by the
+      existing sync *inside* that phase. Saves one sync per step.
 
-   Net effect: recurrence self time 36.3 → 27.7 ms (−24%), and prefill
-   wall time 42 → 33 ms.
+   Per-prefill effect: 520 steps × 18 layers × 2 syncs ≈ **18 k
+   `__syncthreads`** removed, +5.7 % on pp520 wall time.
+
+   Net recurrence rewrite: 36.3 → ~26 ms (from 88 % → ~72 % of prefill
+   wall time). Prefill wall 42 → 31 ms.
 
 ### What's needed to actually beat llama.cpp on prefill
 
