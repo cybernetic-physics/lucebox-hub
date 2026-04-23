@@ -7,6 +7,10 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 constexpr int HIDDEN = 1024;
 constexpr int INTER = 3584;
 constexpr int VOCAB = 248320;
@@ -90,6 +94,18 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
 }
 
 // ===== Standalone DeltaNet recurrence (state-in-registers, bf16 I/O, f32 state) =====
+//
+// Prefill recurrence: 16 heads, one CUDA block per head, state held in
+// per-thread registers (16 warps × 32 lanes × 32 floats = 16384 = 128×128).
+// Before the B200 port this kernel burned the majority of prefill wall time
+// because the per-head conv1d shift lived in *global memory* and did
+// 3 global-read + 3 global-write + 4 global-read per channel per step.
+//
+// B200 version: keep the whole conv1d ring-buffer (2×DN_KEY + DN_VAL
+// channels × 4 taps = 1536 f32 = 6 KB) and the per-step weight taps in
+// shared memory, and fuse the 3 per-group conv loops into a single
+// 384-thread pass that uses all 3 of q/k/v channels at once instead of
+// serialising the block through three barely-populated waves.
 __global__ void __launch_bounds__(512, 1)
 pf_deltanet_recurrence(
     const __nv_bfloat16 *qkv_proj, const __nv_bfloat16 *z_proj,
@@ -102,6 +118,7 @@ pf_deltanet_recurrence(
     int tid = threadIdx.x, wid = tid/32, lid = tid%32;
     constexpr int NWARPS = 16;
     constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+    constexpr int QKV_CH = 2 * DN_KEY + DN_VAL;  // channels per head: 384
 
     float a_log_val = __bfloat162float(a_log[h]);
     float dt_b = __bfloat162float(dt_bias[h]);
@@ -109,8 +126,22 @@ pf_deltanet_recurrence(
     __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
     __shared__ float s_beta, s_decay;
     __shared__ float s_gnorm[NWARPS];
+    // Conv1d ring-buffer: [QKV_CH][DN_CONV_K] flattened. 6 KB per block.
+    __shared__ float s_conv[QKV_CH * DN_CONV_K];
+    // Per-head conv weights cached in shared memory (per-head slice of conv_w).
+    // One-time load amortised across all S time steps.
+    __shared__ float s_conv_w[QKV_CH * DN_CONV_K];
+    // Cached per-head z projection row for the current t (reused in gated norm).
+    __shared__ float s_z[DN_VAL];
+    // Per-step recurrence output, reused by the tail gated-RMSNorm so we
+    // avoid 3 global round-trips through out_h on every step.
+    __shared__ float s_out[DN_VAL];
+    // Per-head norm_w cached in shared — constant across all S steps.
+    __shared__ float s_norm_w[DN_VAL];
 
     float *my_state = state + h * DN_KEY * DN_VAL;
+    float *my_conv = conv_buf + /*head offset computed below per channel*/ 0;
+    (void)my_conv;
 
     // Load state into registers
     constexpr int CPW = DN_VAL / NWARPS;  // 8
@@ -123,31 +154,56 @@ pf_deltanet_recurrence(
             sreg[jj*RPL+ii] = my_state[j*DN_KEY + lid+ii*32];
     }
 
+    // Map a per-head local channel c in [0, QKV_CH) to the global
+    // conv_buf / conv_w / qkv_proj channel index.
+    auto ch_global = [&] (int c) -> int {
+        if (c < DN_KEY) return h * DN_KEY + c;
+        if (c < 2 * DN_KEY) return DN_QK_SIZE + h * DN_KEY + (c - DN_KEY);
+        return 2 * DN_QK_SIZE + h * DN_VAL + (c - 2 * DN_KEY);
+    };
+
+    // One-time: load conv state, conv weights, and norm_w for this head
+    // into shared memory.
+    for (int c = tid; c < QKV_CH; c += blockDim.x) {
+        int gch = ch_global(c);
+        const float *src_state = conv_buf + gch * DN_CONV_K;
+        const __nv_bfloat16 *src_w = conv_w + gch * DN_CONV_K;
+        float *dst_state = s_conv + c * DN_CONV_K;
+        float *dst_w = s_conv_w + c * DN_CONV_K;
+        #pragma unroll
+        for (int k = 0; k < DN_CONV_K; k++) {
+            dst_state[k] = src_state[k];
+            dst_w[k] = __bfloat162float(src_w[k]);
+        }
+    }
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        s_norm_w[i] = __bfloat162float(norm_w[i]);
+    }
+    __syncthreads();
+
     for (int t = 0; t < S; t++) {
-        // Conv1d + SiLU (read bf16 proj, write f32 to shared)
-        for (int c = tid; c < DN_KEY; c += 512) {
-            int ch = h*DN_KEY + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_q[c]=pf_silu(co);
+        // Single fused conv1d + SiLU pass over all 384 per-head channels.
+        // Each thread handles at most ceil(384/512) = 1 channel.
+        for (int c = tid; c < QKV_CH; c += blockDim.x) {
+            int gch = ch_global(c);
+            float *cs = s_conv + c * DN_CONV_K;
+            const float *cw = s_conv_w + c * DN_CONV_K;
+            float new_x = __bfloat162float(qkv_proj[t * DN_CONV_CH + gch]);
+            // Shift: [x_{t-3}, x_{t-2}, x_{t-1}, x_t] in-place, then write new_x.
+            float h0 = cs[1], h1 = cs[2], h2 = cs[3];
+            cs[0] = h0; cs[1] = h1; cs[2] = h2; cs[3] = new_x;
+            float co = h0 * cw[0] + h1 * cw[1] + h2 * cw[2] + new_x * cw[3];
+            float silu_out = pf_silu(co);
+            if (c < DN_KEY)           s_q[c] = silu_out;
+            else if (c < 2 * DN_KEY)  s_k[c - DN_KEY] = silu_out;
+            else                       s_v[c - 2 * DN_KEY] = silu_out;
         }
-        for (int c = tid; c < DN_KEY; c += 512) {
-            int ch = DN_QK_SIZE + h*DN_KEY + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_k[c]=pf_silu(co);
-        }
-        for (int c = tid; c < DN_VAL; c += 512) {
-            int ch = 2*DN_QK_SIZE + h*DN_VAL + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_v[c]=pf_silu(co);
+        // Prefetch z-row in parallel with conv — they go to disjoint arrays.
+        {
+            const __nv_bfloat16 *z_h_bf = z_proj + t * DN_V_SIZE + h * DN_VAL;
+            for (int i = tid; i < DN_VAL; i += blockDim.x) {
+                s_z[i] = __bfloat162float(z_h_bf[i]);
+            }
         }
         __syncthreads();
 
@@ -161,7 +217,9 @@ pf_deltanet_recurrence(
         float beta = s_beta, decay = s_decay;
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
 
-        // State-in-registers recurrence
+        // State-in-registers recurrence. Write fp32 result to s_out so the
+        // gated-RMSNorm tail can read it without a bf16 round-trip through
+        // global memory.
         for (int jj = 0; jj < CPW; jj++) {
             int j = wid * CPW + jj;
             float kv = 0;
@@ -174,19 +232,19 @@ pf_deltanet_recurrence(
                 attn += sreg[jj*RPL+ii] * s_q[lid+ii*32];
             }
             attn = pf_warp_sum(attn);
-            if (lid == 0) out_h[j] = __float2bfloat16(attn);
+            if (lid == 0) s_out[j] = attn;
         }
         __syncthreads();
 
-        // Gated RMSNorm → bf16 output
-        const __nv_bfloat16 *z_h = z_proj + t*DN_V_SIZE + h*DN_VAL;
-        float sq2=0;for(int i=tid;i<DN_VAL;i+=512){float v=__bfloat162float(out_h[i]);sq2+=v*v;}
-        sq2=pf_warp_sum(sq2);if(lid==0)s_gnorm[wid]=sq2;__syncthreads();
-        if(wid==0){float v=(lid<NWARPS)?s_gnorm[lid]:0;v=pf_warp_sum(v);if(lid==0)s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS);}
-        __syncthreads();float rstd=s_gnorm[0];
+        // Gated RMSNorm → bf16 output. z-row and norm_w already live in
+        // shared; s_out is fp32 so we skip the bf16 round-trip.
+        float sq2=0; for(int i=tid;i<DN_VAL;i+=512){ float v=s_out[i]; sq2+=v*v; }
+        sq2=pf_warp_sum(sq2); if(lid==0) s_gnorm[wid]=sq2; __syncthreads();
+        if(wid==0){ float v=(lid<NWARPS)?s_gnorm[lid]:0; v=pf_warp_sum(v); if(lid==0) s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS); }
+        __syncthreads(); float rstd=s_gnorm[0];
         for(int i=tid;i<DN_VAL;i+=512){
-            float n=__bfloat162float(out_h[i])*rstd*__bfloat162float(norm_w[i]);
-            out_h[i]=__float2bfloat16(n*pf_silu(__bfloat162float(z_h[i])));
+            float n = s_out[i] * rstd * s_norm_w[i];
+            out_h[i] = __float2bfloat16(n * pf_silu(s_z[i]));
         }
         __syncthreads();
     }
@@ -196,6 +254,20 @@ pf_deltanet_recurrence(
         int j = wid * CPW + jj;
         for (int ii = 0; ii < RPL; ii++)
             my_state[j*DN_KEY + lid+ii*32] = sreg[jj*RPL+ii];
+    }
+
+    // Write conv ring-buffer back to global so the next prefill call picks
+    // up the trailing 4 taps. Only the shifted entries need to persist; we
+    // push the whole thing.
+    __syncthreads();
+    for (int c = tid; c < QKV_CH; c += blockDim.x) {
+        int gch = ch_global(c);
+        float *dst_state = conv_buf + gch * DN_CONV_K;
+        const float *src_state = s_conv + c * DN_CONV_K;
+        #pragma unroll
+        for (int k = 0; k < DN_CONV_K; k++) {
+            dst_state[k] = src_state[k];
+        }
     }
 }
 
@@ -328,14 +400,16 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-// ===== Main orchestrator =====
-extern "C" void launch_prefill_bf16(
-    const int *token_ids, int seq_len, int *output_token,
-    const __nv_bfloat16 *embed_weight, const PFLayerWeights *layers,
+// ===== Prefill body (capturable). All device work lives here so we can
+//       wrap it in cudaStreamBeginCapture and replay via cudaGraphLaunch. =====
+static void prefill_bf16_body(
+    cublasHandle_t cublas,
+    const PFLayerWeights *hl,              // host-side mirror of layers[]
+    const int *token_ids, int S, int *output_token,
+    const __nv_bfloat16 *embed_weight,
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
     float *dn_states, float *conv_bufs,
-    // Scratch (ALL bf16 except state/conv which are f32)
     __nv_bfloat16 *hidden, __nv_bfloat16 *residual, __nv_bfloat16 *normalized,
     __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
@@ -345,17 +419,7 @@ extern "C" void launch_prefill_bf16(
     float *lm_bmv, int *lm_bmi,
     cudaStream_t stream)
 {
-    static cublasHandle_t cublas = nullptr;
-    if (!cublas) cublasCreate(&cublas);
-    cublasSetStream(cublas, stream);
-
-    static PFLayerWeights hl[NUM_LAYERS];
-    static bool copied = false;
-    if (!copied) { cudaMemcpy(hl, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost); copied = true; }
-
-    int S = seq_len;
     int bk = (S*HIDDEN+255)/256;
-
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
 
     int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
@@ -459,4 +523,274 @@ extern "C" void launch_prefill_bf16(
     int lm_blocks = 512;
     pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
     pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+}
+
+// ===== Graph cache. Each entry is a compiled cudaGraphExec for one
+//       specific (seq_len, all-pointer) tuple. The first call with a given
+//       tuple captures + instantiates. Subsequent calls just cudaGraphLaunch.
+//       final_bench.py reuses the same Decoder + buffers across all 8 prefill
+//       runs, so after the first one we pay ~no per-call overhead. =====
+struct PrefillGraphKey {
+    int seq_len;
+    const int *token_ids;
+    int *output_token;
+    const void *embed_weight;
+    const PFLayerWeights *layers;
+    const void *final_norm_w;
+    const void *lm_head_w;
+    const void *fa_k_cache;
+    const void *fa_v_cache;
+    const void *dn_states;
+    const void *conv_bufs;
+    const void *hidden;
+    const void *residual;
+    const void *normalized;
+    const void *proj_buf;
+    const void *proj_buf2;
+    const void *attn_buf;
+    const void *mlp_buf;
+    const void *dn_out_buf;
+    const void *beta_buf;
+    const void *alpha_buf;
+    const void *final_normed;
+    const void *hidden_bf16_out;
+    const void *lm_bmv;
+    const void *lm_bmi;
+};
+
+struct PrefillGraphEntry {
+    PrefillGraphKey key;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    int eager_runs;                 // eager runs before first capture attempt
+    PFLayerWeights hl[NUM_LAYERS];  // host-side mirror captured with this graph
+};
+
+static constexpr int MAX_PREFILL_GRAPHS = 4;
+static PrefillGraphEntry g_prefill_graph_cache[MAX_PREFILL_GRAPHS];
+static int g_prefill_graph_count = 0;
+
+static bool keys_equal(const PrefillGraphKey &a, const PrefillGraphKey &b) {
+    return std::memcmp(&a, &b, sizeof(PrefillGraphKey)) == 0;
+}
+
+// ===== Main orchestrator =====
+extern "C" void launch_prefill_bf16(
+    const int *token_ids, int seq_len, int *output_token,
+    const __nv_bfloat16 *embed_weight, const PFLayerWeights *layers,
+    const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
+    __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
+    float *dn_states, float *conv_bufs,
+    // Scratch (ALL bf16 except state/conv which are f32)
+    __nv_bfloat16 *hidden, __nv_bfloat16 *residual, __nv_bfloat16 *normalized,
+    __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
+    __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
+    __nv_bfloat16 *dn_out_buf,
+    float *beta_buf, float *alpha_buf,
+    __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
+    float *lm_bmv, int *lm_bmi,
+    cudaStream_t stream)
+{
+    static cublasHandle_t cublas = nullptr;
+    static void *cublas_workspace = nullptr;
+    static cudaStream_t capture_stream = nullptr;
+    static constexpr size_t CUBLAS_WORKSPACE_BYTES = 32ull * 1024 * 1024;  // 32 MB, fits sm_100 recommended
+    if (!cublas) {
+        cublasCreate(&cublas);
+        cublasSetMathMode(cublas, CUBLAS_DEFAULT_MATH);
+        // Pre-allocate a workspace so cuBLAS doesn't try to allocate on
+        // stream during graph capture. Without this, the first GEMM under
+        // capture triggers cudaErrorInvalidValue.
+        cudaMalloc(&cublas_workspace, CUBLAS_WORKSPACE_BYTES);
+        cublasSetWorkspace(cublas, cublas_workspace, CUBLAS_WORKSPACE_BYTES);
+        // Private non-default stream for capture. PyTorch's
+        // getCurrentCUDAStream() may hand us the legacy default stream, and
+        // cudaStreamBeginCapture is not permitted on the default stream.
+        cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking);
+    }
+    cublasSetStream(cublas, stream);
+
+    bool disable_graph = std::getenv("MEGAKERNEL_PREFILL_NOGRAPH") != nullptr;
+
+    PrefillGraphKey key{};
+    key.seq_len = seq_len;
+    key.token_ids = token_ids;
+    key.output_token = output_token;
+    key.embed_weight = embed_weight;
+    key.layers = layers;
+    key.final_norm_w = final_norm_w;
+    key.lm_head_w = lm_head_w;
+    key.fa_k_cache = fa_k_cache;
+    key.fa_v_cache = fa_v_cache;
+    key.dn_states = dn_states;
+    key.conv_bufs = conv_bufs;
+    key.hidden = hidden;
+    key.residual = residual;
+    key.normalized = normalized;
+    key.proj_buf = proj_buf;
+    key.proj_buf2 = proj_buf2;
+    key.attn_buf = attn_buf;
+    key.mlp_buf = mlp_buf;
+    key.dn_out_buf = dn_out_buf;
+    key.beta_buf = beta_buf;
+    key.alpha_buf = alpha_buf;
+    key.final_normed = final_normed;
+    key.hidden_bf16_out = hidden_bf16_out;
+    key.lm_bmv = lm_bmv;
+    key.lm_bmi = lm_bmi;
+
+    PrefillGraphEntry *hit = nullptr;
+    if (!disable_graph) {
+        for (int i = 0; i < g_prefill_graph_count; i++) {
+            if (keys_equal(g_prefill_graph_cache[i].key, key)) {
+                hit = &g_prefill_graph_cache[i];
+                break;
+            }
+        }
+    }
+
+    if (hit && hit->exec) {
+        // Launch cached graph on the dedicated capture stream, with event
+        // plumbing so the caller stream waits on the replay result.
+        cudaEvent_t hit_evt;
+        cudaEventCreateWithFlags(&hit_evt, cudaEventDisableTiming);
+        cudaEventRecord(hit_evt, stream);
+        cudaStreamWaitEvent(capture_stream, hit_evt, 0);
+        cudaGraphLaunch(hit->exec, capture_stream);
+        cudaEventRecord(hit_evt, capture_stream);
+        cudaStreamWaitEvent(stream, hit_evt, 0);
+        cudaEventDestroy(hit_evt);
+        return;
+    }
+
+    // Host-side mirror of weight pointer table. Needed before capture so we
+    // can refer to per-layer pointers from the host during kernel enqueues.
+    PFLayerWeights hl_local[NUM_LAYERS];
+    cudaMemcpy(hl_local, layers, NUM_LAYERS * sizeof(PFLayerWeights),
+               cudaMemcpyDeviceToHost);
+
+    // First eager warmup pass for a new key: lets cuBLAS do any workspace
+    // allocation / heuristic selection outside of stream capture. We do it
+    // once per key, then capture on the second call.
+    int eager_warmups = 1;
+    if (const char *env = std::getenv("MEGAKERNEL_PREFILL_WARMUPS")) {
+        int v = std::atoi(env);
+        if (v >= 0) eager_warmups = v;
+    }
+
+    if (disable_graph || (hit && hit->eager_runs < eager_warmups)) {
+        prefill_bf16_body(
+            cublas, hl_local,
+            token_ids, seq_len, output_token,
+            embed_weight, final_norm_w, lm_head_w,
+            fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+            hidden, residual, normalized,
+            proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
+            beta_buf, alpha_buf,
+            final_normed, hidden_bf16_out,
+            lm_bmv, lm_bmi, stream);
+        if (hit) hit->eager_runs++;
+        return;
+    }
+    if (!hit) {
+        // Record the key and run one eager pass before attempting capture.
+        if (g_prefill_graph_count < MAX_PREFILL_GRAPHS) {
+            PrefillGraphEntry &entry = g_prefill_graph_cache[g_prefill_graph_count++];
+            entry.key = key;
+            entry.graph = nullptr;
+            entry.exec = nullptr;
+            entry.eager_runs = 1;
+            std::memcpy(entry.hl, hl_local, sizeof(hl_local));
+        }
+        prefill_bf16_body(
+            cublas, hl_local,
+            token_ids, seq_len, output_token,
+            embed_weight, final_norm_w, lm_head_w,
+            fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+            hidden, residual, normalized,
+            proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
+            beta_buf, alpha_buf,
+            final_normed, hidden_bf16_out,
+            lm_bmv, lm_bmi, stream);
+        return;
+    }
+
+    // hit exists with eager_runs >= eager_warmups: capture into a graph.
+    // Capture on our private stream (PyTorch's current stream may be the
+    // legacy default stream, which cannot be captured). Sync the caller
+    // stream into the capture stream before, and back to it after launch.
+    bool verbose = std::getenv("MEGAKERNEL_PREFILL_GRAPH_DEBUG") != nullptr;
+    cudaEvent_t join_evt;
+    cudaEventCreateWithFlags(&join_evt, cudaEventDisableTiming);
+    cudaEventRecord(join_evt, stream);
+    cudaStreamWaitEvent(capture_stream, join_evt, 0);
+    cublasSetStream(cublas, capture_stream);
+    cudaError_t err;
+    err = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeRelaxed);
+    if (err != cudaSuccess) {
+        if (verbose) fprintf(stderr, "[prefill-graph] BeginCapture failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();  // clear
+        goto fallback_eager;
+    }
+    prefill_bf16_body(
+        cublas, hl_local,
+        token_ids, seq_len, output_token,
+        embed_weight, final_norm_w, lm_head_w,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden, residual, normalized,
+        proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
+        beta_buf, alpha_buf,
+        final_normed, hidden_bf16_out,
+        lm_bmv, lm_bmi, capture_stream);
+    {
+        cudaGraph_t graph = nullptr;
+        err = cudaStreamEndCapture(capture_stream, &graph);
+        if (err != cudaSuccess) {
+            if (verbose) fprintf(stderr, "[prefill-graph] EndCapture failed: %s\n", cudaGetErrorString(err));
+            cudaGetLastError();
+            if (graph) cudaGraphDestroy(graph);
+            // Stream is now in an unknown state; rerun eagerly to recover.
+            goto fallback_eager;
+        }
+        cudaGraphExec_t exec = nullptr;
+        err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+        if (err != cudaSuccess) {
+            if (verbose) fprintf(stderr, "[prefill-graph] Instantiate failed: %s\n", cudaGetErrorString(err));
+            cudaGetLastError();
+            cudaGraphDestroy(graph);
+            goto fallback_eager;
+        }
+        // hit is non-null here (we branched through the warmup path first).
+        hit->graph = graph;
+        hit->exec = exec;
+        std::memcpy(hit->hl, hl_local, sizeof(hl_local));
+        // Launch on the capture stream, then plumb the result back to the
+        // caller's stream so subsequent PyTorch ops see the dependency.
+        err = cudaGraphLaunch(exec, capture_stream);
+        if (err != cudaSuccess && verbose) {
+            fprintf(stderr, "[prefill-graph] GraphLaunch failed: %s\n", cudaGetErrorString(err));
+        }
+        cudaEventRecord(join_evt, capture_stream);
+        cudaStreamWaitEvent(stream, join_evt, 0);
+        cublasSetStream(cublas, stream);
+        cudaEventDestroy(join_evt);
+        return;
+    }
+
+fallback_eager:
+    cublasSetStream(cublas, stream);
+    cudaEventDestroy(join_evt);
+    prefill_bf16_body(
+        cublas, hl_local,
+        token_ids, seq_len, output_token,
+        embed_weight, final_norm_w, lm_head_w,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden, residual, normalized,
+        proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
+        beta_buf, alpha_buf,
+        final_normed, hidden_bf16_out,
+        lm_bmv, lm_bmi, stream);
+    if (hit) {
+        hit->eager_runs++;  // stay in warmup until capture finally works
+    }
 }

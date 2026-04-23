@@ -9,14 +9,16 @@ changes are additive.
 
 | Method on B200 (Qwen3.5-0.8B) | pp520 (tok/s) | tg128 (tok/s) | tg128 vs llama.cpp |
 |-------------------------------|:-------------:|:-------------:|:------------------:|
-| **Megakernel BF16 (this port)**   | 12,420        | **711**       | **1.63×**          |
+| **Megakernel BF16 (this port)**   |    15,859     | **711**       | **1.63×**          |
 | llama.cpp BF16 (CUDA, ngl=99) | **26,781**    |    437        |   1.00×            |
-| Megakernel NVFP4              | 12,413        |    217        |   0.50×            |
-| PyTorch HuggingFace BF16      |  2,100        |     30        |   0.07×            |
+| Megakernel NVFP4              |    12,413     |    217        |   0.50×            |
+| PyTorch HuggingFace BF16      |     1,797     |     27        |   0.06×            |
 
 Decode (tg128) on the BF16 megakernel beats llama.cpp by **1.63×** and HF by
-**23.5×**. Prefill is still behind llama.cpp (0.46×) — see the prefill section.
-Completion strings are bit-exact between megakernel BF16 and HF eager.
+**26×**. Prefill went from 12,420 → 15,859 t/s (+28%) after graph-capture and
+a DeltaNet recurrence rewrite; still behind llama.cpp at 0.59×, with a clear
+next step (chunked associative scan). Completion strings are bit-exact between
+megakernel BF16 and HF eager.
 
 ## Hardware
 
@@ -28,9 +30,19 @@ Completion strings are bit-exact between megakernel BF16 and HF eager.
 
 ## What had to change for B200 (sm_100)
 
-The NVFP4 kernel (`kernel_gb10_nvfp4.cu`) compiles for B200 unchanged — it
-already uses `cudaLaunchCooperativeKernel` + `cg::this_grid().sync()`, and its
-NVFP4 dot products are LUT-based with no arch-specific tensor-core intrinsics.
+Three changes, in order of impact:
+
+1. **BF16 decode barrier** (`kernel.cu`): hand-rolled grid barrier deadlocked
+   on sm_100, unblocked by moving to `cudaLaunchCooperativeKernel` +
+   `cg::this_grid().sync()`. Unlocks the entire BF16 decode path.
+2. **BF16 prefill recurrence** (`prefill.cu`): move conv1d state to shared
+   memory; add CUDA graph capture for the whole prefill body. +28% pp520.
+3. **NVFP4 kernel** (`kernel_gb10_nvfp4.cu`): compiles for B200 unchanged.
+   Already uses `cudaLaunchCooperativeKernel` + `cg::this_grid().sync()`,
+   and its NVFP4 dot products are LUT-based with no arch-specific
+   tensor-core intrinsics.
+
+### BF16 decode barrier (root cause + fix)
 
 The BF16 kernel (`kernel.cu`) needed one surgical change: its hand-rolled
 grid barrier was making no forward progress on B200. Root cause:
@@ -81,10 +93,10 @@ a full prefill into a fresh decoder).
 
 | Method                              | pp520 (tok/s) | tg128 (tok/s) |
 |-------------------------------------|:-------------:|:-------------:|
-| **Megakernel BF16 (this port)**     |    12,420     |    **711**    |
+| **Megakernel BF16 (this port)**     |    15,859     |    **711**    |
 | llama.cpp BF16 (CUDA, ngl=99, r=5)  |  **26,781**   |      437      |
 | Megakernel NVFP4                    |    12,413     |      217      |
-| PyTorch HuggingFace BF16            |     2,100     |       30      |
+| PyTorch HuggingFace BF16            |     1,797     |       27      |
 
 llama.cpp: `ggml-org/llama.cpp@6217b49`, built with
 `-DCMAKE_CUDA_ARCHITECTURES=100`, benchmarked via
@@ -94,9 +106,16 @@ llama.cpp: `ggml-org/llama.cpp@6217b49`, built with
 
 | Megakernel BF16 vs … | speedup |
 |:---------------------|:-------:|
-| PyTorch HuggingFace  | **23.5×** |
+| PyTorch HuggingFace  | **26×** |
 | Megakernel NVFP4     |  3.28×  |
 | llama.cpp BF16 CUDA  | **1.63×** |
+
+### Speedups on prefill (pp520)
+
+| Megakernel BF16 vs … | speedup |
+|:---------------------|:-------:|
+| PyTorch HuggingFace  | **8.8×** |
+| llama.cpp BF16 CUDA  |  0.59×  |
 
 ### Cross-check numbers
 
@@ -156,31 +175,83 @@ not tensor-core bound. The ~100 kernel launches per token llama.cpp does still
 cost wall-clock on B200, and the megakernel's single persistent dispatch
 absorbs that cost on both chips.
 
-## Prefill (pp520): still behind llama.cpp, 0.46×
+## Prefill (pp520): 12,420 → 15,859 (+28%), still 0.59× llama.cpp
 
-The B200 BF16 prefill path (`prefill.cu`) is cuBLAS `cublasGemmEx` +
-`COMPUTE_32F` per-layer plus ~10 small custom kernels per layer (rmsnorm,
-silu_mul, residual, rope, causal attention, recurrence). 24 layers × ~15
-kernel launches ≈ 360 launches for a 520-token prefill, each cuBLAS call
-picking a default algo. On B200 the small-K (K=1024, N=1024 or 3584) GEMMs
-don't saturate tensor cores, and the launch burst dominates over the compute.
-llama.cpp gets ~2× the prefill throughput because it pipes everything through
-ggml + cudaGraphs with FlashAttention-style fused kernels.
+### Where the time actually goes
 
-Paths to close the gap (none done yet):
+Profiled with `torch.profiler` on a single pp520 call (post-fixes). CUDA
+kernel self-time breakdown:
 
-1. **cuBLASLt + heuristic cache.** Replace `cublasGemmEx` with `cublasLtMatmul`,
-   pick a good algo per shape once and cache the plan. On small-K, this
-   commonly buys 1.3–1.6× on Blackwell.
-2. **Graph capture the prefill.** Wrap the 24-layer prefill in a
-   `cudaStreamBeginCapture` → `cudaGraphInstantiate` → `cudaGraphLaunch` once
-   per `max_seq_len` bucket. Eliminates launch latency, which is the dominant
-   cost at 520 tokens.
-3. **Fuse rmsnorm + matmul + bias/residual into a single custom kernel.**
-   Same trick the decode path uses, applied to prefill. Most of the payoff
-   comes from items 1 + 2, though.
+| Kernel                     | self time | share |
+|----------------------------|:---------:|:-----:|
+| `pf_deltanet_recurrence`   | 27.7 ms   | 85.1% |
+| `pf_causal_attn`           |  2.8 ms   |  8.7% |
+| cuBLAS matmuls (all)       |  1.4 ms   |  4.4% |
+| rmsnorm / silu / residual  |  0.6 ms   |  1.8% |
+| Total                      | 32.6 ms   | 100%  |
 
-For the target "faster than llama.cpp at decode," those are future work.
+**The recurrence is the whole ballgame.** cuBLAS GEMMs are 4% of wall time —
+the usual prefill bottleneck (matmul) is not the bottleneck here. DeltaNet's
+linear-attention scan dominates because it is 18 layers × 520 sequential time
+steps, and the naive implementation launches 16 blocks (one per head) on a
+148-SM GPU, using ~3% of compute.
+
+### What changed on B200 so far
+
+1. **Graph capture the prefill.** Wrap the whole 24-layer body in
+   `cudaStreamBeginCapture` → `cudaGraphInstantiate` → `cudaGraphLaunch`,
+   keyed on `(seq_len, all scratch/weight pointers)`. First eager warm-up
+   lets cuBLAS allocate its workspace outside capture; subsequent calls pay
+   graph-launch cost only. We also pre-allocate a 32 MB cuBLAS workspace via
+   `cublasSetWorkspace` and create a dedicated non-default stream for
+   capture (PyTorch's `getCurrentCUDAStream()` may return the legacy default
+   stream, which cannot be captured). Worth ~3% on its own at S=520;
+   eliminates launch latency as a term, which matters more at smaller S.
+2. **Rewrite `pf_deltanet_recurrence`'s inner loop.** The old version kept
+   the conv1d ring-buffer in global memory and performed a 3-write + 4-read
+   shift per channel on every time step. The B200 version:
+    - loads the per-head 384-channel × 4-tap conv state into
+      shared memory once at kernel entry (6 KB), shifts in-place each step,
+      writes back once at kernel exit.
+    - loads the per-head conv weights into shared once (another 6 KB).
+    - fuses the three q/k/v conv passes into a single 384-way parallel pass
+      that uses all 512 threads, instead of three barely-populated waves.
+    - caches `norm_w` in shared once and routes the recurrence output
+      through `s_out` (fp32 shared) so the gated RMSNorm tail skips a bf16
+      round-trip through global memory.
+
+   Net effect: recurrence self time 36.3 → 27.7 ms (−24%), and prefill
+   wall time 42 → 33 ms.
+
+### What's needed to actually beat llama.cpp on prefill
+
+The remaining 28 ms is 85% inside the DeltaNet recurrence. Its per-step
+compute budget is ~500 ns in theory (512 threads × ~128 FMAs + a few warp
+reductions) but we're measuring ~3 µs/step — the gap is `__syncthreads`
+count (5+ per step) + the inherent sequential dependency on the
+[`DN_KEY`×`DN_VAL`] recurrent state.
+
+The right next step is a **chunked associative-scan rewrite** of the
+recurrence. DeltaNet is a first-order linear recurrence with a state update
+of the form `s_{t+1} = A_t · s_t + b_t`, which is associative-scan-friendly:
+chunk the sequence into blocks of 32, compute the per-chunk prefix in
+parallel, then fuse chunk boundaries with a tree-reduction. This is how
+Mamba-style models hit near-peak throughput on large GPUs. On B200 it
+should take the recurrence from 28 ms to ~5 ms and push pp520 past
+llama.cpp. It is a non-trivial kernel (~500 lines) and is left as the next
+todo rather than something to rush in; the writeup already calls out
+`kernel_gb10_nvfp4.cu` semantics are unchanged so this work can proceed in
+a separate file without risking GB10.
+
+Three smaller items that would close further ground if done alongside:
+
+- **cuBLASLt + plan cache** instead of `cublasGemmEx` default algo. Small-K
+  (K=1024) GEMMs leave ~1.3× on the table on Blackwell.
+- **Fuse rmsnorm + next-layer matmul** into a single persistent kernel
+  (similar to what the decode megakernel already does). Takes another ~0.6
+  ms off per prefill.
+- **Process multiple heads per block** in the recurrence to raise utilization
+  from 16 SMs to 128+. Only makes sense with the associative-scan rewrite.
 
 ## Reproduce
 
