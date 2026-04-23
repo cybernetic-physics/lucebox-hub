@@ -36,17 +36,30 @@ __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4;
 }
 
+// Attempt 2: per CUTLASS sm_100 source (include/cute/arch/mma_sm100_desc.hpp),
+// the 64-bit descriptor layout for tcgen05.mma SMEM operands is:
+//   [ 0:13] start address (>> 4)
+//   [14:15] reserved
+//   [16:29] LBO (>> 4)
+//   [30:31] reserved
+//   [32:45] SBO (>> 4)
+//   [46]    leading-dim byte swap (LBO-major flag)
+//   [47:48] reserved
+//   [49:51] matrix base offset
+//   [52:60] reserved
+//   [61:63] swizzle mode  (0 = none, 1 = 32B, 2 = 64B, 3 = 128B)
 __device__ __forceinline__ uint64_t make_desc_a(uint32_t smem_addr, int LBO, int SBO) {
-    // Swizzle mode 0, leading-dim byte 0.
-    return desc_encode(smem_addr)
+    return desc_encode((uint64_t)smem_addr)
          | (desc_encode((uint64_t)LBO) << 16)
-         | (desc_encode((uint64_t)SBO) << 32);
+         | (desc_encode((uint64_t)SBO) << 32)
+         | (1ULL << 46);  // leading-dim major
 }
 
 __device__ __forceinline__ uint64_t make_desc_b(uint32_t smem_addr, int LBO, int SBO) {
-    return desc_encode(smem_addr)
+    return desc_encode((uint64_t)smem_addr)
          | (desc_encode((uint64_t)LBO) << 16)
-         | (desc_encode((uint64_t)SBO) << 32);
+         | (desc_encode((uint64_t)SBO) << 32)
+         | (1ULL << 46);
 }
 
 // --------- Kernel ---------
@@ -131,9 +144,13 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     if (tid == 0) {
         uint32_t a_smem = static_cast<uint32_t>(__cvta_generic_to_shared(s_A));
         uint32_t b_smem = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
-        // SBO = K * 2 bytes (stride between rows). LBO irrelevant for single-tile.
-        uint64_t a_desc = make_desc_a(a_smem, K * 2, 0);
-        uint64_t b_desc = make_desc_b(b_smem, K * 2, 0);
+        // For unswizzled bf16 kind::f16 MMA with M=128, K=16:
+        //   8×16B box is 8 rows × 8 bf16 elements = 128 bytes
+        //   K-boxes: 2 (covers K=16), stride = 128 bytes (SBO)
+        //   M-boxes: 16 (covers M=128), stride between them = K-boxes*128 = 256 B (LBO)
+        // Row-major storage gives different offsets though — assuming box-major shared.
+        uint64_t a_desc = make_desc_a(a_smem, /*LBO=*/ 256, /*SBO=*/ 128);
+        uint64_t b_desc = make_desc_b(b_smem, /*LBO=*/ 256, /*SBO=*/ 128);
 
         uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
 
