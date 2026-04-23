@@ -57,17 +57,20 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     const __nv_bfloat16 *A = A_all + (size_t)m_offset * K;
     const __nv_bfloat16 *B = B_all + (size_t)n_offset * K;
     float               *C = C_all + (size_t)m_offset * N_TOTAL + n_offset;
-    // Double-buffered K-streaming layout: 2 buffers each holding one K-tile
-    // of A (M × K_TILE) and B (N × K_TILE). Total:
-    //   s_A: 2 × 128 × 128 = 32 KB
-    //   s_B: 2 × 256 × 128 = 64 KB
-    //   total dynamic: 96 KB (opt-in past 48 KB default).
+    // TRIPLE-buffered K-streaming so cp.async for tile kt+2 can overlap with
+    // MMA on tile kt. With 2 buffers the MMA's async shared-mem reads race
+    // against cp.async overwrites; with 3 buffers there's always a buffer
+    // gap between "being MMA'd" and "being written".
+    //   s_A: 3 × M × K_TILE bf16  = 3 × 128 × 128 = 48 KB
+    //   s_B: 3 × N × K_TILE bf16  = 3 × 256 × 128 = 96 KB
+    //   total dynamic: 144 KB (opt-in via cudaFuncSetAttribute).
     constexpr int S_A_TILE_BYTES = M * K_TILE * 2;
     constexpr int S_B_TILE_BYTES = N * K_TILE * 2;
+    constexpr int NBUF = 4;
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     __nv_bfloat16 *s_A = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
     __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(
-        smem_raw + 2 * S_A_TILE_BYTES);
+        smem_raw + NBUF * S_A_TILE_BYTES);
     __shared__ uint32_t tmem_slot;
     __shared__ uint64_t mma_mbar;
 
@@ -141,10 +144,15 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
         }
     };
 
-    // Prologue: issue stage-0 load.
+    // Prologue: issue stage-0 AND stage-1 loads (up to 2 ahead).
     load_a_tile(0, 0);
     load_b_tile(0, 0);
     asm volatile("cp.async.commit_group;\n");
+    if (K_TILES > 1) {
+        load_a_tile(1, 1);
+        load_b_tile(1, 1);
+        asm volatile("cp.async.commit_group;\n");
+    }
 
     // --------- 4. Issue MMA chain by one thread ---------
     //   i_desc encoding for bf16 → fp32:
@@ -164,23 +172,32 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     uint32_t b_smem_base_0 = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
     uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
 
-    int buf = 0;
+    // Main loop: triple-buffered. buf = kt % 3. On each iter:
+    //   1. Wait for tile kt to finish loading (via cp.async.wait_group).
+    //   2. Issue prefetch for tile kt+2 (if exists) into (kt+2) % 3.
+    //   3. MMA thread 0 issues 4 MMAs on buf = kt%3. This is async; MMAs
+    //      continue during next iter's cp.async.
+    //   4. __syncthreads once per iter so cp.async threads in iter kt+1 see
+    //      consistent shared-mem state with MMA thread's descriptor reads.
     for (int kt = 0; kt < K_TILES; kt++) {
-        int next_kt = kt + 1;
-        int next_buf = buf ^ 1;
+        int buf = kt % NBUF;
+        int prefetch_kt = kt + 2;
+        int prefetch_buf = prefetch_kt % NBUF;
 
-        // Issue next-stage load if more K-tiles remain.
-        if (next_kt < K_TILES) {
-            load_a_tile(next_kt, next_buf);
-            load_b_tile(next_kt, next_buf);
+        // Wait for tile kt to be ready. We have up to 2 loads in flight
+        // (tile kt+1 already queued, maybe tile kt+2 about to queue).
+        if (prefetch_kt < K_TILES) {
+            load_a_tile(prefetch_kt, prefetch_buf);
+            load_b_tile(prefetch_kt, prefetch_buf);
             asm volatile("cp.async.commit_group;\n");
-            asm volatile("cp.async.wait_group 1;\n");   // wait for current stage
+            asm volatile("cp.async.wait_group 2;\n");
+        } else if (kt + 1 < K_TILES) {
+            asm volatile("cp.async.wait_group 1;\n");
         } else {
             asm volatile("cp.async.wait_group 0;\n");
         }
         __syncthreads();
 
-        // MMA on buf — all MMAS_PER_TILE=4 K-steps within this K-tile.
         if (tid == 0) {
             uint32_t a_base = a_smem_base_0 + buf * S_A_TILE_BYTES;
             uint32_t b_base = b_smem_base_0 + buf * S_B_TILE_BYTES;
@@ -202,8 +219,8 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
                 }
             }
         }
-        __syncthreads();
-        buf = next_buf;
+        // No post-MMA __syncthreads: MMAs are async and will read buf
+        // BEFORE next-next iter's cp.async overwrites it (3-buffer gap).
     }
 
     if (tid == 0) {
@@ -290,7 +307,7 @@ extern "C" void launch_tcgen05_gemm_one_tile(
     }
     dim3 grid(N_TOTAL / N, M_TOTAL / M);
     dim3 block(512);
-    constexpr size_t smem_bytes = 2 * (M + N) * K_TILE * sizeof(__nv_bfloat16);
+    constexpr size_t smem_bytes = 4 * (M + N) * K_TILE * sizeof(__nv_bfloat16);
     tcgen05_gemm_one_tile<<<grid, block, smem_bytes, stream>>>(
         (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C,
         M_TOTAL, N_TOTAL);
