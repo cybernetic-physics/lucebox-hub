@@ -175,7 +175,103 @@ not tensor-core bound. The ~100 kernel launches per token llama.cpp does still
 cost wall-clock on B200, and the megakernel's single persistent dispatch
 absorbs that cost on both chips.
 
-## Prefill (pp520): 12,420 → 15,859 (+28%), still 0.59× llama.cpp
+## Prefill megakernel (new): a true single-dispatch persistent kernel
+
+`prefill_megakernel.cu` / op `prefill_bf16_mega`. One
+`cudaLaunchCooperativeKernel` dispatch, 148 persistent blocks, all 24 layers,
+all S tokens, with `cg::this_grid().sync()` between phases. Same megakernel
+shape as decode: no cuBLAS, no per-layer relaunch, no host round-trips. See
+`final_bench.py --prefill-mode mega`.
+
+Structure inside the kernel:
+
+```
+phase_embed  →  sync
+for layer in 0..23:
+    phase_rmsnorm  →  sync
+    phase_matmul_bf16 (× QKV/Z or Q/K/V)  →  sync
+    phase_deltanet_recurrence  or  (phase_qk_norm_rope → sync → phase_causal_attn)
+    →  sync
+    phase_matmul_bf16 (output proj)  →  sync  →  phase_add_residual  →  sync
+    phase_rmsnorm (post-attn)  →  sync
+    phase_matmul_bf16 (gate, up)  →  sync  →  phase_silu_mul  →  sync
+    phase_matmul_bf16 (down)  →  sync  →  phase_add_residual  →  sync
+phase_final_norm  →  sync  →  phase_lm_head  →  sync  →  phase_lm_reduce
+```
+
+Matmul uses WMMA (`mma.sync.aligned.m16n8k16` under the hood) with bf16
+operands and f32 accumulator. Block tile is [32, 128] with a 2×8 warp grid;
+work is distributed across blocks by cyclic tile assignment. The DeltaNet
+recurrence keeps its 16-block-per-layer structure (serial over t, same
+optimized inner loop as the non-mega path) but now runs inside the
+persistent kernel so there's no per-layer relaunch.
+
+### Correctness
+
+First-token output matches the cuBLAS-based prefill bit-exactly on the pp520
+test prompt (`token=13` in both paths). Full-sequence completions continue
+to match HF eager after decode is run on the post-prefill state.
+
+### Performance on B200
+
+| Prefill path (pp520)                             | pp520 (tok/s) | ms   |
+|--------------------------------------------------|:-------------:|:----:|
+| Megakernel BF16 (cuBLAS + launches, this branch) |    15,859     | 32.7 |
+| **Prefill megakernel (this commit)**             |     9,404     | 55.3 |
+| llama.cpp BF16 (CUDA, ngl=99)                    |    26,781     | 19.4 |
+
+The true-megakernel path is **slower** than the cuBLAS-assisted path here,
+by ~0.59×. Two reasons, both about the GEMM:
+
+1. **WMMA C++ API is not cuBLAS.** At S=544, N in {1024, 2048, 3584, 6144},
+   K in {1024, 3584}, cuBLAS picks a hand-tuned kernel per shape. Our WMMA
+   loop is the textbook "load fragment, mma, loop over k" — correct but
+   doesn't use cp.async bulk copies, swizzled shared-memory staging, or a
+   producer/consumer double-buffer. That's ~8–14× less tensor-core
+   efficiency than cuBLAS at these shapes.
+2. **Per-tile setup dominates at small M.** BTM=32 tiles make sense for
+   S≈520 (keeps 17 m-tiles), but every tile pays a fragment-fill + store +
+   bf16-cast that amortises badly when each warp produces only one 16×16
+   output.
+
+What didn't help (tried, measured no gain): staging A into shared memory
+(32–112 KB per block) with WMMA reading fragments from shared; widening the
+block tile to [16, 256] for more A-reuse per load.
+
+### What would actually beat cuBLAS in the megakernel
+
+A CUTLASS-grade GEMM inside the persistent kernel:
+
+- **Async bulk load** (`cp.async.bulk` / `cp.async.cg`) for both A and B
+  tiles into swizzled shared memory, with a ping-pong buffer so the next
+  k-chunk loads while the current one is in MMA.
+- **`ldmatrix.sync.aligned.x4`** for fragment loads from shared memory —
+  gives the expected 4× load-bandwidth on tensor-core paths vs WMMA's
+  `load_matrix_sync`.
+- **Pipelined `mma.sync` with 2- or 3-stage buffering** so the tensor core
+  pipeline stays saturated across the k loop.
+- **Epilogue fusion**: combine `tile_f32 → bf16 → residual add / silu_mul`
+  into the mma epilogue so we never round-trip through global for the
+  activation.
+
+That's a ~500-line GEMM engine, analogous to `CollectiveMma` in CUTLASS's
+sm_100 kernels. Mentally sketched, not written. The megakernel architecture
+is the scaffold that work would land in: the phase structure, the grid
+sync, the launch config, and the DeltaNet recurrence reuse all stay
+identical — only `phase_matmul_bf16` changes.
+
+### The recurrence is still the other half
+
+Even with a perfect GEMM, DeltaNet recurrence remains the bigger chunk
+(85% of the cuBLAS-path wall time, ~28 ms). That needs a chunked
+associative-scan rewrite (Mamba-style) to go from 28 ms → ~5 ms on B200.
+Both items together (GEMM ≈ cuBLAS + scan-based recurrence) should push
+pp520 past llama.cpp on B200. Until either is done, `prefill_bf16` (the
+graph-captured cuBLAS path, 15,859 tok/s) is the faster production choice;
+`prefill_bf16_mega` exists, works, and is the correct architectural shape
+for the optimizations above to land in.
+
+## Prefill (pp520, cuBLAS path): 12,420 → 15,859 (+28%), still 0.59× llama.cpp
 
 ### Where the time actually goes
 

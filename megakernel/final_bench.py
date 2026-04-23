@@ -39,6 +39,11 @@ def parse_args():
     parser.add_argument("--hf-pp-runs", type=int, default=3)
     parser.add_argument("--skip-hf", action="store_true")
     parser.add_argument("--verbose-loader", action="store_true")
+    parser.add_argument("--prefill-mode", default="eager",
+                        choices=("eager", "mega"),
+                        help="'eager' = cuBLAS+launches prefill (prefill_bf16); "
+                             "'mega' = single-dispatch persistent megakernel "
+                             "(prefill_bf16_mega)")
     return parser.parse_args()
 
 
@@ -112,10 +117,26 @@ def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
 
 
 def benchmark_megakernel(decoder, tokenizer, prompt_ids, args):
-    prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+    # When --prefill-mode=mega we use the persistent cooperative megakernel
+    # (prefill_bf16_mega). It requires seq_len padded up to a multiple of 32
+    # so WMMA block-tiles land on aligned memory; we pad the id tensor and
+    # scratch buffers accordingly and keep the reported token count at the
+    # unpadded prompt_len.
+    use_mega = getattr(args, "prefill_mode", "eager") == "mega"
+    if use_mega:
+        prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16_mega
+    else:
+        prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
     prompt_len = len(prompt_ids)
-    ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
-    buffers = alloc_prefill_buffers(prompt_len)
+    if use_mega:
+        padded_len = ((prompt_len + 31) // 32) * 32
+        ids_t = torch.zeros(padded_len, dtype=torch.int32, device="cuda")
+        ids_t[:prompt_len] = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+        ids_t = ids_t[:prompt_len]  # pass actual length; kernel reads only 0..prompt_len
+        buffers = alloc_prefill_buffers(padded_len)
+    else:
+        ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+        buffers = alloc_prefill_buffers(prompt_len)
 
     print(f"Backend: {decoder.backend_label}", flush=True)
     print(
