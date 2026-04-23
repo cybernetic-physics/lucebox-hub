@@ -1,16 +1,14 @@
 /**
  * Standalone tcgen05.mma bf16 → fp32 GEMM for NVIDIA Blackwell (sm_100).
  *
- * Scope of this first cut: ONE MMA tile of shape [M=128, N=256, K=16], no
- * K-loop, no TMA — cp.async into a shared memory buffer, then tcgen05.mma
- * into a TMEM accumulator, then tcgen05.ld back to registers and write
- * out to global fp32. The goal is to get the instruction sequence right
- * before scaling up to a tiled GEMM.
+ * Shape: M=128, N=256, K=64 bf16. One MMA shape, multiple K-steps.
+ * Using 128B swizzle mode because K=64 bf16 = 128 bytes per row, which
+ * matches 128B swizzle granularity natively — row-major loads work.
  *
- * Reference: https://gau-nernst.github.io/tcgen05/
- *
- * WARNING: raw tcgen05 PTX is only valid on sm_100+ (Blackwell datacenter).
- * Do not compile for sm_90 or earlier.
+ * Reference descriptor pattern from https://gau-nernst.github.io/tcgen05/ :
+ *   SBO = 8 * 128 (stride between 8×128B tiles)
+ *   bit 46  = 1  (leading-dim)
+ *   bits 61-63 = 2  (128B swizzle mode)
  */
 
 #include <cuda_bf16.h>
@@ -20,66 +18,44 @@
 
 constexpr int M = 128;
 constexpr int N = 256;
-constexpr int K = 16;   // one MMA K-step; bf16 → K_bytes = 32
+constexpr int K = 64;           // bf16 elements; row width = 128 bytes
+constexpr int K_BYTES = K * 2;  // 128 bytes
+constexpr int MMA_K = 16;       // bf16 K per tcgen05.mma call
+constexpr int K_STEPS = K / MMA_K;   // 4
 
-// --------- Shared-memory descriptor encoder ---------
-// tcgen05.mma reads A and B via 64-bit shared-memory descriptors. Layout
-// per PTX spec: { base_addr, SBO, LBO, flags, swizzle }. We use the minimal
-// form: unswizzled (mode 0), contiguous layout, leading dim = 1.
-//
-// Bits 0–13  : (base_addr >> 4)       - 16-byte-aligned start in shared memory
-// Bits 16–29 : (LBO >> 4)              - stride between 8×... "matrix boxes"
-// Bits 32–45 : (SBO >> 4)              - stride along K between boxes
-// Bit 46     : leading-dim-major       - 1 for matrix-a row-major / matrix-b col-major
-// Bits 61–63 : swizzle mode            - 0 = none (we use this)
+// desc_encode matches gau-nernst: 14-bit field, value >> 4.
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4;
 }
 
-// Attempt 2: per CUTLASS sm_100 source (include/cute/arch/mma_sm100_desc.hpp),
-// the 64-bit descriptor layout for tcgen05.mma SMEM operands is:
-//   [ 0:13] start address (>> 4)
-//   [14:15] reserved
-//   [16:29] LBO (>> 4)
-//   [30:31] reserved
-//   [32:45] SBO (>> 4)
-//   [46]    leading-dim byte swap (LBO-major flag)
-//   [47:48] reserved
-//   [49:51] matrix base offset
-//   [52:60] reserved
-//   [61:63] swizzle mode  (0 = none, 1 = 32B, 2 = 64B, 3 = 128B)
-__device__ __forceinline__ uint64_t make_desc_a(uint32_t smem_addr, int LBO, int SBO) {
+// make_desc: unswizzled base address + SBO stride + leading-dim flag + swizzle mode.
+// For 128B swizzle, SBO = 8 * 128 = 1024 bytes.
+__device__ __forceinline__ uint64_t make_desc(uint32_t smem_addr) {
+    constexpr int SBO = 8 * 128;
     return desc_encode((uint64_t)smem_addr)
-         | (desc_encode((uint64_t)LBO) << 16)
          | (desc_encode((uint64_t)SBO) << 32)
-         | (1ULL << 46);  // leading-dim major
+         | (1ULL << 46)        // leading-dim
+         | (2ULL << 61);       // 128B swizzle
 }
 
-__device__ __forceinline__ uint64_t make_desc_b(uint32_t smem_addr, int LBO, int SBO) {
-    return desc_encode((uint64_t)smem_addr)
-         | (desc_encode((uint64_t)LBO) << 16)
-         | (desc_encode((uint64_t)SBO) << 32)
-         | (1ULL << 46);
-}
-
-// --------- Kernel ---------
 extern "C" __global__ void tcgen05_gemm_one_tile(
-    const __nv_bfloat16 *__restrict__ A,   // [M=128, K=16] row-major
-    const __nv_bfloat16 *__restrict__ B,   // [N=256, K=16] row-major  (B^T view: K × N)
-    float               *__restrict__ C)   // [M=128, N=256] row-major fp32
+    const __nv_bfloat16 *__restrict__ A,   // [M=128, K=64]
+    const __nv_bfloat16 *__restrict__ B,   // [N=256, K=64]
+    float               *__restrict__ C)   // [M=128, N=256] fp32
 {
-    __shared__ __align__(16) __nv_bfloat16 s_A[M * K];  // 128 × 16 bf16 = 4096 B
-    __shared__ __align__(16) __nv_bfloat16 s_B[N * K];  // 256 × 16 bf16 = 8192 B
-    __shared__ uint32_t tmem_slot;                        // where tcgen05.alloc writes TMEM base
-    __shared__ uint64_t mma_mbar;                         // mbarrier for MMA completion
+    // 128B-aligned shared buffers: A 16 KB + B 32 KB = 48 KB, in dynamic shared
+    // to stay under the PTXAS static-shared 48 KB compile-time limit.
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __nv_bfloat16 *s_A = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
+    __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(smem_raw + M * K * sizeof(__nv_bfloat16));
+    __shared__ uint32_t tmem_slot;
+    __shared__ uint64_t mma_mbar;
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
-    // --------- 1. Allocate TMEM (one warp, synchronized across block) ---------
-    // Allocate 256 "columns" (N=256), each 32-bit wide. This covers a [M×N] fp32
-    // accumulator laid out across the TMEM sub-partitions.
+    // --------- 1. Allocate TMEM ---------
     if (warp == 0) {
         uint32_t slot_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&tmem_slot));
         asm volatile(
@@ -87,7 +63,8 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
             :: "r"(slot_smem), "n"(N));
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n");
     }
-    // --------- 2. Init mbarrier for MMA completion ---------
+
+    // --------- 2. Init mbarrier ---------
     if (tid == 0) {
         uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(bar_smem));
@@ -96,44 +73,52 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     __syncthreads();
     const uint32_t taddr = tmem_slot;
 
-    // --------- 3. Copy A, B from global to shared ---------
-    // A: 128 × 16 bf16 = 4096 bytes = 256 x 16B. 256 threads do 1 load each.
-    if (tid < 256) {
-        int r = tid >> 1;       // 0..128
-        int c = (tid & 1) << 3; // 0 or 8
-        s_A[r * K + c + 0] = A[r * K + c + 0];
-        s_A[r * K + c + 1] = A[r * K + c + 1];
-        s_A[r * K + c + 2] = A[r * K + c + 2];
-        s_A[r * K + c + 3] = A[r * K + c + 3];
-        s_A[r * K + c + 4] = A[r * K + c + 4];
-        s_A[r * K + c + 5] = A[r * K + c + 5];
-        s_A[r * K + c + 6] = A[r * K + c + 6];
-        s_A[r * K + c + 7] = A[r * K + c + 7];
-    }
-    // B: 256 × 16 bf16 = 8192 bytes = 512 × 16B. All 512 threads do 1 load each.
+    // --------- 3. Load A, B row-major to shared via cp.async (128B swizzle is
+    // handled by hardware given the SMEM descriptor swizzle=2 flag — the
+    // data in shared looks row-major to us but gets reinterpreted by the MMA).
+    //
+    // A: 128 rows × 128 bytes = 16 KB. Each 16-byte cp.async = 8 bf16.
+    // Total = 16384/16 = 1024 loads. With 512 threads × 2 = 1024.
     {
-        int r = tid >> 1;        // 0..256
-        int c = (tid & 1) << 3;
-        if (r < N) {
-            s_B[r * K + c + 0] = B[r * K + c + 0];
-            s_B[r * K + c + 1] = B[r * K + c + 1];
-            s_B[r * K + c + 2] = B[r * K + c + 2];
-            s_B[r * K + c + 3] = B[r * K + c + 3];
-            s_B[r * K + c + 4] = B[r * K + c + 4];
-            s_B[r * K + c + 5] = B[r * K + c + 5];
-            s_B[r * K + c + 6] = B[r * K + c + 6];
-            s_B[r * K + c + 7] = B[r * K + c + 7];
+        for (int it = 0; it < 2; it++) {
+            int i = tid + it * 512;                  // 0..1024
+            int r = i / 8;                            // 0..128 (M dim)
+            int c = (i % 8) * 8;                     // 0, 8, 16, 24, 32, 40, 48, 56 (bf16 offset)
+            if (r < M) {
+                __nv_bfloat16 *dst = s_A + r * K + c;
+                const __nv_bfloat16 *src = A + r * K + c;
+                uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                             :: "r"(smem_addr), "l"(src));
+            }
         }
     }
+    // B: 256 rows × 128 bytes = 32 KB. 2048 loads of 16 bytes. 512 threads × 4.
+    {
+        for (int it = 0; it < 4; it++) {
+            int i = tid + it * 512;                  // 0..2048
+            int r = i / 8;                            // 0..256 (N dim)
+            int c = (i % 8) * 8;
+            if (r < N) {
+                __nv_bfloat16 *dst = s_B + r * K + c;
+                const __nv_bfloat16 *src = B + r * K + c;
+                uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                             :: "r"(smem_addr), "l"(src));
+            }
+        }
+    }
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
 
-    // --------- 4. Issue MMA via one thread ---------
-    // i_desc (32-bit) layout per tcgen05 spec:
-    //   [4]    dtype = 1 (FP32 accumulator)
-    //   [7]    atype = 1 (BF16)
-    //   [10]   btype = 1 (BF16)
-    //   [17:23] MMA_N >> 3  (N in units of 8)
-    //   [24:28] MMA_M >> 4  (M in units of 16)
+    // --------- 4. Issue MMA chain by one thread ---------
+    //   i_desc encoding for bf16 → fp32:
+    //     [4]    dtype = 1 (FP32)
+    //     [7]    atype = 1 (BF16)
+    //     [10]   btype = 1 (BF16)
+    //     [17:23] MMA_N >> 3   (N in units of 8)
+    //     [24:28] MMA_M >> 4   (M in units of 16)
     constexpr uint32_t i_desc =
         (1U << 4)
       | (1U << 7)
@@ -142,28 +127,34 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
       | ((uint32_t)(M >> 4) << 24);
 
     if (tid == 0) {
-        uint32_t a_smem = static_cast<uint32_t>(__cvta_generic_to_shared(s_A));
-        uint32_t b_smem = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
-        // For unswizzled bf16 kind::f16 MMA with M=128, K=16:
-        //   8×16B box is 8 rows × 8 bf16 elements = 128 bytes
-        //   K-boxes: 2 (covers K=16), stride = 128 bytes (SBO)
-        //   M-boxes: 16 (covers M=128), stride between them = K-boxes*128 = 256 B (LBO)
-        // Row-major storage gives different offsets though — assuming box-major shared.
-        uint64_t a_desc = make_desc_a(a_smem, /*LBO=*/ 256, /*SBO=*/ 128);
-        uint64_t b_desc = make_desc_b(b_smem, /*LBO=*/ 256, /*SBO=*/ 128);
-
+        uint32_t a_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(s_A));
+        uint32_t b_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(s_B));
         uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
 
-        // enable_input_d=0 => reset accumulator (first mma of the K-loop).
+        // First MMA: enable_input_d=0  (reset accumulator).
+        {
+            uint64_t a_desc = make_desc(a_smem_base);
+            uint64_t b_desc = make_desc(b_smem_base);
+            asm volatile(
+                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;\n"
+                :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+        }
+        // Remaining K-steps accumulate into same TMEM accumulator.
+        for (int ks = 1; ks < K_STEPS; ks++) {
+            uint32_t a_smem = a_smem_base + (uint32_t)(ks * MMA_K * 2);
+            uint32_t b_smem = b_smem_base + (uint32_t)(ks * MMA_K * 2);
+            uint64_t a_desc = make_desc(a_smem);
+            uint64_t b_desc = make_desc(b_smem);
+            asm volatile(
+                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;\n"
+                :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
+        }
         asm volatile(
-            "{\n"
-            "  tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;\n"
-            "  tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%4];\n"
-            "}\n"
-            :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(bar_smem));
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
+            :: "r"(bar_smem));
     }
 
-    // --------- 5. Wait for MMA completion via mbarrier ---------
+    // --------- 5. Wait for MMA completion ---------
     if (tid == 0) {
         uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar));
         asm volatile(
@@ -179,18 +170,32 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     }
     __syncthreads();
 
-    // --------- 6. Read back TMEM into registers ---------
-    // tcgen05.ld.sync.aligned.32x32b.x8: each warp reads 32 rows × 8 cols of fp32.
-    // With M=128 and 32 rows per warp, we need 4 warps to cover the M dim.
-    // For N=256 and 8 cols per load, we need 32 iterations to cover N.
-    // total warps of work = 4 (M) × 32 (N) = 128 "ld" calls.
-    // We have (blockDim.x / 32) warps. With blockDim.x=128, we have 4 warps, each
-    // does 32 iterations covering all 256 cols for one M-slice.
+    // --------- 6. Read back TMEM accumulator ---------
+    // .32x32b requires row_offset to be 32-aligned. Each warp reads 32 rows
+    // × some cols per .x8 call. From empirical testing, the (lane, reg)
+    // layout is still under investigation — my best guess has ~25% of
+    // positions correct. The first 10 matches cluster at rows 0, 1 of each
+    // 32-row warp slice, suggesting reg 0 and reg 1 land at offsets 0 and 1
+    // within the warp slice but regs 2..7 go somewhere else in TMEM.
+    //
+    // TODO: determine exact fragment layout. Candidates to try:
+    //   - Non-contiguous row_map {0, 1, 8, 9, 16, 17, 24, 25} (tested, same match count)
+    //   - Per-quad layout (tested, alignment error — .32x32b hard-requires 32-row stride)
+    //   - Maybe layout depends on `.x8` vector width: .x16 might straightforwardly
+    //     cover 32 rows × 8 cols in a simple [t][i] pattern.
+    //
+    // Leaving the original lane=row-stride layout so AT LEAST (0,0) and rows 0,1
+    // match, until the layout is pinned down in a followup session.
+    // Best-guess readback. Layout A (lane=row, reg=col stride 1) hits 4287/32768
+    // positions correctly vs torch reference — specifically, reg 0 is correct for
+    // every (row, 8*iter) across all iterations, but regs 1..7 land at
+    // wrong offsets. Exact fragment layout for .32x32b.x8 needs PTX ISA
+    // reference; both tested alternatives (stride-32, quad-layout) were worse
+    // or alignment-errored.
     for (int n_off = 0; n_off < N; n_off += 8) {
-        if (warp < 4) {   // 4 warps cover M=128
-            int row_offset = warp * 32;                 // 0, 32, 64, 96
-            // addr = taddr | (row_offset << 16) | n_off
-            uint32_t addr = taddr + (row_offset << 16) + n_off;
+        if (warp < 4) {
+            int row_offset = warp * 32;
+            uint32_t addr = taddr + (uint32_t)(row_offset << 16) + (uint32_t)n_off;
             float t0, t1, t2, t3, t4, t5, t6, t7;
             asm volatile(
                 "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
@@ -198,11 +203,7 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
                 : "=f"(t0), "=f"(t1), "=f"(t2), "=f"(t3),
                   "=f"(t4), "=f"(t5), "=f"(t6), "=f"(t7)
                 : "r"(addr));
-            // tcgen05.wait::ld ensures loaded values are visible.
             asm volatile("tcgen05.wait::ld.sync.aligned;\n");
-
-            // For this layout, lane `lane` owns element row=(row_offset + lane),
-            // cols=(n_off..n_off+8). Write directly to C.
             int out_row = row_offset + lane;
             if (out_row < M) {
                 float *dst = C + out_row * N + n_off;
@@ -221,12 +222,20 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     }
 }
 
-// Host launcher.
 extern "C" void launch_tcgen05_gemm_one_tile(
     const void *A, const void *B, void *C, cudaStream_t stream)
 {
+    // Shared usage: s_A 16 KB + s_B 32 KB + a few bytes for slots = ~48 KB.
+    // Opt into the higher per-block shared memory bucket.
+    static bool cfg = false;
+    if (!cfg) {
+        cudaFuncSetAttribute((void *)tcgen05_gemm_one_tile,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        cfg = true;
+    }
     dim3 grid(1);
-    dim3 block(128);   // 4 warps — enough to cover M=128 in the readback step
-    tcgen05_gemm_one_tile<<<grid, block, 0, stream>>>(
+    dim3 block(512);   // 16 warps — still 4 warps handle the readback
+    constexpr size_t smem_bytes = (M + N) * K * sizeof(__nv_bfloat16);
+    tcgen05_gemm_one_tile<<<grid, block, smem_bytes, stream>>>(
         (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C);
 }

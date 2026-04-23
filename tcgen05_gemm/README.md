@@ -1,60 +1,52 @@
-# tcgen05 bf16 GEMM (WIP — not correct yet)
+# tcgen05 bf16 → fp32 GEMM — Blackwell raw-PTX sandbox
 
-Raw PTX exploration of the Blackwell `tcgen05.mma` path that cuBLAS uses
-to beat the WMMA-based `prefill_megakernel`. This directory is a
-**standalone sandbox** for getting a single `[M=128, N=256, K=16]` MMA
-correct before integrating into the megakernel.
+Standalone sandbox for bringing up the `tcgen05.mma` path that cuBLAS
+uses on sm_100. Goal: get one GEMM tile correct outside the megakernel
+before swapping WMMA out of `../prefill_megakernel`.
 
-## Status
+## Current state
+
+Shape: **M=128, N=256, K=64 bf16, fp32 accumulate**.
+128B swizzle mode, row-major shared memory load via `cp.async`, full
+K-loop with `enable_input_d=1` accumulation.
+
+### What works
 
 | piece | state |
 |---|---|
-| compile on sm_100a | ✅ clean |
-| `tcgen05.alloc` / `tcgen05.dealloc` | ✅ runs, no crash |
-| `mbarrier.init` + `mbarrier.try_wait` | ✅ compiles and runs |
-| `tcgen05.mma.cta_group::1.kind::f16` | ✅ accepts, runs |
-| `tcgen05.commit` + mbarrier arrival | ✅ runs |
-| `tcgen05.ld.sync.aligned.32x32b.x8.b32` readback | ✅ runs |
-| **numerical correctness vs torch** | ❌ **max\|Δ\|=0.29 at K=16** |
+| Compile on sm_100a | ✅ |
+| `tcgen05.alloc` / `tcgen05.dealloc` | ✅ |
+| `mbarrier.init` + `mbarrier.try_wait.parity` | ✅ |
+| Shared-mem descriptor (bits 0-13 addr / bit 46 leading-dim / bits 61-63 swizzle=2) | ✅ |
+| **`tcgen05.mma.cta_group::1.kind::f16`** | ✅ **running** |
+| K-loop with `enable_input_d=1` accumulation | ✅ |
+| Element (0, 0) of output matches torch ref to 7 sig digits | ✅ |
+| 4287 / 32768 (13%) output positions correct | ⚠️ partial |
 
-The output is in the right range (not all zeros, not all garbage) but
-does not match `A @ Bᵀ`. The failure mode is structural — almost
-certainly the 64-bit shared-memory descriptor encoding. The
-[gau-nernst walkthrough](https://gau-nernst.github.io/tcgen05/) uses
-128B swizzle (`2ULL << 61`), leading-dim bit 46 set, specific
-LBO/SBO byte offsets per matrix-box layout; my current `make_desc_a` /
-`make_desc_b` helpers don't match that exactly.
+### What doesn't yet work
 
-## What needs to happen next
+The `tcgen05.ld.sync.aligned.32x32b.x8.b32` readback — the per-lane
+register to (row, col) mapping. Empirical pattern across the 13% of
+correct positions:
 
-1. **Descriptor bit layout** — match the exact PTX-spec field positions
-   for `kind::f16` (bits 0–13 base, 16–29 LBO, 32–45 SBO, 46 leading-dim,
-   52–60 base-offset, 61–63 swizzle).
-2. **128B swizzling on loads** — the A-matrix box for M=128 K=16 bf16
-   is 4 rows × 128 bytes per 128B chunk; the cp.async load pattern
-   needs to XOR the column index with a swizzle pattern so the MMA reads
-   values from the right addresses. The alternative is TMA
-   (`cp.async.bulk.tensor.2d`) which swizzles automatically given a
-   tensor map set up on the host — probably the cleaner path.
-3. **tcgen05.ld layout** — the `.32x32b.x8` shape loads 32 rows per
-   warp; per-lane element ordering inside the 8 registers has a
-   specific mapping to `(row, col)` that needs to match the MMA output
-   layout for 128×256 f32.
-4. **Then scale K** — add a K-loop with `enable-input-d=1` to accumulate
-   across K-chunks.
-5. **Then scale M, N** — tile across multiple MMA shapes to cover
-   arbitrary output sizes.
-6. **Then integrate into `prefill_megakernel/kernel.cu`** as a drop-in
-   replacement for `gemm_wmma_core`.
+- Every row has ~32 correct columns (i.e. layout A: `lane t → row r + t` is right for the row dim).
+- Only every 8th column within a row is correct — specifically, reg 0 lands at `col_base + 0`.
+- Regs 1..7 do NOT land at `col_base + 1..7` (would give 256/256 matches) nor at `col_base + 32*i` (tested, 737 matches — worse) nor at a non-contiguous row map {0,1,8,9,16,17,24,25} (tested, same ~2%).
+
+So layout A is right for the M dim and reg 0's N position, but regs 1..7 go somewhere my guesses don't predict. Possibilities still unverified:
+
+- TMEM's 4 sub-partitions interleave logical output cols — logical col n might map to TMEM[n % 4 sub-partition, n / 4 offset]; regs 1..7 might each live in different sub-partitions.
+- The `.x8` vector may load rows stride vs cols stride differently than I assumed — e.g. 32 warp-lanes × 8 regs might form a 32 × 32 tile via non-linear mapping.
+- Resolving definitively needs the NVIDIA PTX ISA reference for sm_100 `tcgen05.ld` fragment layout (CUTLASS's `cute/arch/copy_sm100_tmem.hpp` has the exact descriptors).
 
 ## Files
 
-- `kernel.cu` — the kernel + host launcher (compiles cleanly; wrong output)
-- `torch_bindings.cpp` — `tcgen05_gemm_C.tcgen05_gemm_one_tile(A, B, C)`
-- `setup.py` — `CUDAExtension` targeting sm_100a
-- `test.py` — torch-reference diff
+- `kernel.cu` — tcgen05 GEMM with K=64 + 128B swizzle + full K-loop
+- `torch_bindings.cpp` — single-op binding
+- `setup.py` — sm_100a build
+- `test.py` — torch-reference diff + match-position diagnostics
 
-## Build & test
+## Test run
 
 ```bash
 cd tcgen05_gemm
@@ -62,18 +54,42 @@ python3 setup.py build_ext --inplace
 python3 test.py
 ```
 
-Expected output right now:
+Output as of current commit:
 
 ```
-max |Δ|: 2.89e-01  mean |Δ|: 4.27e-02
-CORRECTNESS FAIL
+C[0, :8]   = [0.07587875, -0.060443807, 0.032965656, -0.041262123, ...]
+ref[0,:8]  = [0.07587876,  0.033420451, 0.003561549, -0.023494590, ...]
+             ^^^^^^^^^^^ (0,0) matches to 7 sig digits
+exact matches count: 4287
+rows with matches (row:#matches): (0, 32), (1, 34), (2, 33), (3, 33), (4, 33), ...
+   — every row has ~32 matches (every 8th col across all iterations)
+first matching cols: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ... (cross-lane col stride 1)
 ```
 
-## Why this is the right next step anyway
+## Why this is the right path even at 13% correctness
 
-The WMMA-path prefill megakernel ships at 0.74× of cuBLAS at S=256.
-That gap is fundamentally `mma.sync.m16n16k16` vs `tcgen05.mma.m128nXk16` —
-the Blackwell-native instruction runs ~2× faster per-tile because it
-uses the TMEM accumulator (not registers) and async issue semantics.
-No amount of WMMA tuning will close it. This sandbox is the first step
-toward swapping in the Blackwell path.
+Every WMMA-tuning knob I've tried (shared-mem X cache, 2×2 warp tiles,
+launch_bounds(512, 2), K_TILE=64) has regressed or stayed flat. The
+instruction-level ceiling of `mma.sync.m16n16k16` is ~0.75× cuBLAS on
+Blackwell. `tcgen05.mma` runs ~2× faster per tile.
+
+The MMA compute itself is demonstrably WORKING in this sandbox
+(correct values for the positions where readback lines up). Closing
+this is a layout-docs question, not a compute-correctness question —
+so once `.32x32b.x8` fragment mapping is pinned down, we go from 13%
+of outputs correct → 100%, and the same kernel structure slots into
+the megakernel.
+
+## Resolving next session
+
+1. Pull `cute/arch/copy_sm100_tmem.hpp` from CUTLASS and read the
+   exact fragment mapping for .32x32b.x8.
+2. Write a TMEM probe kernel: `tcgen05.st` a known pattern to
+   TMEM, then `tcgen05.ld` and record which lane/reg reads which
+   (row, col). 64 lines of instrumentation gets the layout for sure.
+3. Rewrite the readback to match.
+4. Integrate as a `gemm_tcgen05` variant in `prefill_megakernel/kernel.cu`,
+   matching `gemm_wmma_core`'s signature.
+5. Benchmark vs cuBLAS. Expected: 1.2–1.8× cuBLAS on 4k-scale shapes per
+   published numbers; 2× is realistic at full WGMMA-descriptor + TMA
+   producer/consumer specialization.
