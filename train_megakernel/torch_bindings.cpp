@@ -139,6 +139,18 @@ extern "C" void launch_bwd_rmsnorm(
     const void *x, const void *w, const float *dy, float *dx,
     int S, int H, float eps, cudaStream_t stream);
 
+extern "C" void launch_bwd_swiglu(
+    const void *gate, const void *up, const float *dy,
+    float *dgate, float *dup, int N, cudaStream_t stream);
+
+extern "C" void launch_bwd_lora_linear(
+    const void *x, const void *A, const void *B,
+    const float *grad_y,
+    float *grad_x, float *grad_A, float *grad_B,
+    float *workspace_lora_h, float *workspace_grad_lora_h,
+    int S, int K_in, int K_out, int R, float scaling,
+    cudaStream_t stream);
+
 void fused_adamw_step(
     torch::Tensor params,
     torch::Tensor m, torch::Tensor v,
@@ -213,6 +225,51 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
                 x.data_ptr(), w.data_ptr(),
                 (const float *)dy.data_ptr(), (float *)dx.data_ptr(),
                 (int)S, (int)H, (float)eps,
+                c10::cuda::getCurrentCUDAStream().stream());
+        });
+
+    ops.def("bwd_swiglu(Tensor gate, Tensor up, Tensor dy, "
+            "Tensor(a!) dgate, Tensor(b!) dup, int N) -> ()");
+    ops.impl("bwd_swiglu", torch::kCUDA, +[](
+        torch::Tensor gate, torch::Tensor up, torch::Tensor dy,
+        torch::Tensor dgate, torch::Tensor dup, int64_t N) {
+            TORCH_CHECK(gate.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(up.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(dy.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(dgate.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(dup.scalar_type() == torch::kFloat32);
+            launch_bwd_swiglu(
+                gate.data_ptr(), up.data_ptr(),
+                (const float *)dy.data_ptr(),
+                (float *)dgate.data_ptr(), (float *)dup.data_ptr(),
+                (int)N,
+                c10::cuda::getCurrentCUDAStream().stream());
+        });
+
+    ops.def("bwd_lora_linear(Tensor x, Tensor A, Tensor B, Tensor grad_y, "
+            "Tensor(a!) grad_x, Tensor(b!) grad_A, Tensor(c!) grad_B, "
+            "Tensor(d!) ws_lora_h, Tensor(e!) ws_grad_lora_h, "
+            "int S, int K_in, int K_out, int R, float scaling) -> ()");
+    ops.impl("bwd_lora_linear", torch::kCUDA, +[](
+        torch::Tensor x, torch::Tensor A, torch::Tensor B,
+        torch::Tensor grad_y,
+        torch::Tensor grad_x, torch::Tensor grad_A, torch::Tensor grad_B,
+        torch::Tensor ws_lora_h, torch::Tensor ws_grad_lora_h,
+        int64_t S, int64_t K_in, int64_t K_out, int64_t R, double scaling) {
+            TORCH_CHECK(x.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(A.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(B.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(grad_x.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(grad_A.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(grad_B.scalar_type() == torch::kFloat32);
+            launch_bwd_lora_linear(
+                x.data_ptr(), A.data_ptr(), B.data_ptr(),
+                (const float *)grad_y.data_ptr(),
+                (float *)grad_x.data_ptr(), (float *)grad_A.data_ptr(),
+                (float *)grad_B.data_ptr(),
+                (float *)ws_lora_h.data_ptr(), (float *)ws_grad_lora_h.data_ptr(),
+                (int)S, (int)K_in, (int)K_out, (int)R, (float)scaling,
                 c10::cuda::getCurrentCUDAStream().stream());
         });
 }

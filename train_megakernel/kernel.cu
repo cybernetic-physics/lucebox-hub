@@ -1560,3 +1560,266 @@ extern "C" void launch_bwd_rmsnorm(
     bwd_rmsnorm_kernel<<<S, block_size, smem_bytes, stream>>>(
         (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)w, dy, dx, S, H, eps);
 }
+
+// ============================================================================
+// Backward: SwiGLU (silu(gate) * up) element-wise.
+//   dL/dgate = dL/dy * up * silu'(gate)
+//     silu(x)  = x * σ(x)
+//     silu'(x) = σ(x) * (1 + x * (1 - σ(x)))
+//   dL/dup = dL/dy * silu(gate)
+// ============================================================================
+
+extern "C" __global__ void bwd_swiglu_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    const float *__restrict__ dy,
+    float *__restrict__ dgate,
+    float *__restrict__ dup,
+    int N)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int i = tid; i < N; i += stride) {
+        float g = __bfloat162float(gate[i]);
+        float u = __bfloat162float(up[i]);
+        float sg = 1.0f / (1.0f + __expf(-g));
+        float silu_g = g * sg;
+        float silu_prime = sg * (1.0f + g * (1.0f - sg));
+        float d = dy[i];
+        dgate[i] = d * u * silu_prime;
+        dup[i]   = d * silu_g;
+    }
+}
+
+extern "C" void launch_bwd_swiglu(
+    const void *gate, const void *up, const float *dy,
+    float *dgate, float *dup, int N, cudaStream_t stream)
+{
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    if (grid > 65535) grid = 65535;
+    bwd_swiglu_kernel<<<grid, block, 0, stream>>>(
+        (const __nv_bfloat16 *)gate, (const __nv_bfloat16 *)up, dy, dgate, dup, N);
+}
+
+// ============================================================================
+// Backward: LoRA-adapted linear y = x @ Wᵀ + scaling·(x @ A) @ B.
+//
+// For frozen W (LoRA training), we skip dW. We emit:
+//   grad_A[K_in, R] = scaling · xᵀ @ (grad_y @ Bᵀ)       [K_in, S] @ [S, R]
+//   grad_B[R, K_out] = scaling · (x @ A)ᵀ @ grad_y        [R, S] @ [S, K_out]
+//   grad_x[S, K_in] += scaling · (grad_y @ Bᵀ) @ Aᵀ        [S, R] @ [R, K_in]
+//   grad_x[S, K_in] += grad_y @ W                          [S, K_out] @ [K_out, K_in]
+//
+// Intermediate lora_h[S, R] = x @ A is recomputed here (cheap at R=16).
+// Intermediate grad_lora_h[S, R] = grad_y @ Bᵀ computed once and used twice.
+//
+// All kernels use element-per-thread (K_in/K_out/S are the looped dims);
+// at typical Qwen 3.5-0.8B scales (R=16, K_in≤3584, S≤256) this is fine.
+// ============================================================================
+
+__device__ __forceinline__ void _compute_grad_lora_h(
+    const float *grad_y,                // [S, K_out]
+    const __nv_bfloat16 *B,              // [R, K_out]
+    float *grad_lora_h,                  // [S, R]  output
+    int S, int K_out, int R)
+{
+    int total = S * R;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int s = idx / R;
+        int r = idx % R;
+        float acc = 0.0f;
+        for (int n = 0; n < K_out; n++) {
+            acc += grad_y[s * K_out + n] * __bfloat162float(B[r * K_out + n]);
+        }
+        grad_lora_h[idx] = acc;
+    }
+}
+
+__device__ __forceinline__ void _compute_fwd_lora_h(
+    const __nv_bfloat16 *x,              // [S, K_in]
+    const __nv_bfloat16 *A,              // [K_in, R]
+    float *lora_h,                        // [S, R]  output
+    int S, int K_in, int R)
+{
+    int total = S * R;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int s = idx / R;
+        int r = idx % R;
+        float acc = 0.0f;
+        for (int k = 0; k < K_in; k++) {
+            acc += __bfloat162float(x[s * K_in + k]) * __bfloat162float(A[k * R + r]);
+        }
+        lora_h[idx] = acc;
+    }
+}
+
+// grad_A[k, r] = scaling * Σ_s x[s, k] * grad_lora_h[s, r]
+extern "C" __global__ void bwd_lora_grad_A_kernel(
+    const __nv_bfloat16 *__restrict__ x,        // [S, K_in]
+    const float *__restrict__ grad_lora_h,       // [S, R]
+    float *__restrict__ grad_A,                  // [K_in, R]
+    int S, int K_in, int R, float scaling)
+{
+    int total = K_in * R;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int k = idx / R;
+        int r = idx % R;
+        float acc = 0.0f;
+        for (int s = 0; s < S; s++) {
+            acc += __bfloat162float(x[s * K_in + k]) * grad_lora_h[s * R + r];
+        }
+        grad_A[idx] = scaling * acc;
+    }
+}
+
+// grad_B[r, n] = scaling * Σ_s lora_h[s, r] * grad_y[s, n]
+extern "C" __global__ void bwd_lora_grad_B_kernel(
+    const float *__restrict__ lora_h,            // [S, R]
+    const float *__restrict__ grad_y,            // [S, K_out]
+    float *__restrict__ grad_B,                  // [R, K_out]
+    int S, int R, int K_out, float scaling)
+{
+    int total = R * K_out;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int r = idx / K_out;
+        int n = idx % K_out;
+        float acc = 0.0f;
+        for (int s = 0; s < S; s++) {
+            acc += lora_h[s * R + r] * grad_y[s * K_out + n];
+        }
+        grad_B[idx] = scaling * acc;
+    }
+}
+
+// grad_x[s, k] += scaling * Σ_r grad_lora_h[s, r] * A[k, r]
+extern "C" __global__ void bwd_lora_add_grad_x_kernel(
+    const float *__restrict__ grad_lora_h,       // [S, R]
+    const __nv_bfloat16 *__restrict__ A,         // [K_in, R]
+    float *__restrict__ grad_x,                  // [S, K_in] (accumulated)
+    int S, int K_in, int R, float scaling)
+{
+    int total = S * K_in;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int s = idx / K_in;
+        int k = idx % K_in;
+        float acc = 0.0f;
+        for (int r = 0; r < R; r++) {
+            acc += grad_lora_h[s * R + r] * __bfloat162float(A[k * R + r]);
+        }
+        grad_x[idx] += scaling * acc;
+    }
+}
+
+// Fwd lora_h recomputation kernel (exposed so bwd_B can use it).
+extern "C" __global__ void fwd_lora_h_recompute_kernel(
+    const __nv_bfloat16 *__restrict__ x,         // [S, K_in]
+    const __nv_bfloat16 *__restrict__ A,         // [K_in, R]
+    float *__restrict__ lora_h,                   // [S, R] output
+    int S, int K_in, int R)
+{
+    int total = S * R;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int s = idx / R;
+        int r = idx % R;
+        float acc = 0.0f;
+        for (int k = 0; k < K_in; k++) {
+            acc += __bfloat162float(x[s * K_in + k]) * __bfloat162float(A[k * R + r]);
+        }
+        lora_h[idx] = acc;
+    }
+}
+
+// grad_lora_h[s, r] = Σ_n grad_y[s, n] * B[r, n]
+extern "C" __global__ void bwd_compute_grad_lora_h_kernel(
+    const float *__restrict__ grad_y,            // [S, K_out]
+    const __nv_bfloat16 *__restrict__ B,         // [R, K_out]
+    float *__restrict__ grad_lora_h,             // [S, R] output
+    int S, int K_out, int R)
+{
+    int total = S * R;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = tid; idx < total; idx += stride) {
+        int s = idx / R;
+        int r = idx % R;
+        float acc = 0.0f;
+        for (int n = 0; n < K_out; n++) {
+            acc += grad_y[s * K_out + n] * __bfloat162float(B[r * K_out + n]);
+        }
+        grad_lora_h[idx] = acc;
+    }
+}
+
+extern "C" void launch_bwd_lora_linear(
+    const void *x,        // bf16 [S, K_in]
+    const void *A,        // bf16 [K_in, R]
+    const void *B,        // bf16 [R, K_out]
+    const float *grad_y,  // fp32 [S, K_out]
+    float *grad_x,        // fp32 [S, K_in] accumulated into
+    float *grad_A,        // fp32 [K_in, R] output
+    float *grad_B,        // fp32 [R, K_out] output
+    float *workspace_lora_h,       // fp32 [S, R]
+    float *workspace_grad_lora_h,  // fp32 [S, R]
+    int S, int K_in, int K_out, int R, float scaling,
+    cudaStream_t stream)
+{
+    int block = 256;
+    auto launch = [&](auto kernel, int total) {
+        int grid = (total + block - 1) / block;
+        if (grid > 65535) grid = 65535;
+        return grid;
+    };
+
+    // 1. Recompute lora_h = x @ A
+    {
+        int total = S * R;
+        int grid = (total + block - 1) / block;
+        fwd_lora_h_recompute_kernel<<<grid, block, 0, stream>>>(
+            (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)A,
+            workspace_lora_h, S, K_in, R);
+    }
+    // 2. grad_lora_h = grad_y @ B.T
+    {
+        int total = S * R;
+        int grid = (total + block - 1) / block;
+        bwd_compute_grad_lora_h_kernel<<<grid, block, 0, stream>>>(
+            grad_y, (const __nv_bfloat16 *)B,
+            workspace_grad_lora_h, S, K_out, R);
+    }
+    // 3. grad_A = scaling · x.T @ grad_lora_h
+    {
+        int total = K_in * R;
+        int grid = (total + block - 1) / block;
+        bwd_lora_grad_A_kernel<<<grid, block, 0, stream>>>(
+            (const __nv_bfloat16 *)x, workspace_grad_lora_h,
+            grad_A, S, K_in, R, scaling);
+    }
+    // 4. grad_B = scaling · lora_h.T @ grad_y
+    {
+        int total = R * K_out;
+        int grid = (total + block - 1) / block;
+        bwd_lora_grad_B_kernel<<<grid, block, 0, stream>>>(
+            workspace_lora_h, grad_y, grad_B, S, R, K_out, scaling);
+    }
+    // 5. grad_x += scaling · grad_lora_h @ A.T
+    {
+        int total = S * K_in;
+        int grid = (total + block - 1) / block;
+        bwd_lora_add_grad_x_kernel<<<grid, block, 0, stream>>>(
+            workspace_grad_lora_h, (const __nv_bfloat16 *)A,
+            grad_x, S, K_in, R, scaling);
+    }
+}
