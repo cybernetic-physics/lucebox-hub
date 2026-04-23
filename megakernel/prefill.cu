@@ -11,6 +11,10 @@
 #define PREFILL_DN_BLOCK_SIZE 256
 #endif
 
+#ifndef PREFILL_DN_BLOCKS_PER_HEAD
+#define PREFILL_DN_BLOCKS_PER_HEAD 4
+#endif
+
 constexpr int HIDDEN = 1024;
 constexpr int INTER = 3584;
 constexpr int VOCAB = 248320;
@@ -127,58 +131,71 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
 }
 
-// ===== Standalone DeltaNet recurrence (state-in-registers, bf16 I/O, f32 state) =====
-template <int BLOCK_THREADS>
+// ===== Standalone DeltaNet recurrence tiled over value channels =====
+template <int BLOCK_THREADS, int BLOCKS_PER_HEAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
-pf_deltanet_recurrence(
-    const __nv_bfloat16 *qkv_proj, const __nv_bfloat16 *z_proj,
+pf_deltanet_recurrence_tiled(
+    const __nv_bfloat16 *qkv_proj,
     const float *beta_proj, const float *alpha_proj,
     const __nv_bfloat16 *conv_w, const __nv_bfloat16 *a_log,
-    const __nv_bfloat16 *dt_bias, const __nv_bfloat16 *norm_w,
+    const __nv_bfloat16 *dt_bias,
     float *state, float *conv_buf, __nv_bfloat16 *output, int S)
 {
-    int h = blockIdx.x; if (h >= DN_HEADS) return;
-    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
     constexpr int NWARPS = BLOCK_THREADS / 32;
-    static_assert(BLOCK_THREADS % 32 == 0, "DeltaNet prefill block size must be warp-aligned");
-    static_assert(DN_VAL % NWARPS == 0, "DeltaNet value width must divide the warp count");
-    static_assert(DN_KEY == DN_VAL, "DeltaNet prefill kernel assumes equal key/value widths");
+    constexpr int VAL_TILE = DN_VAL / BLOCKS_PER_HEAD;
     constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
-    constexpr int HEAD_CHANNELS = DN_KEY + DN_KEY + DN_VAL;
+    constexpr int QK_CHANNELS = DN_KEY + DN_KEY;
+    static_assert(BLOCK_THREADS % 32 == 0, "DeltaNet prefill block size must be warp-aligned");
+    static_assert(DN_VAL % BLOCKS_PER_HEAD == 0, "DeltaNet value width must divide the tile count");
+    static_assert(VAL_TILE % NWARPS == 0, "DeltaNet value tile must divide the warp count");
+    static_assert(DN_KEY == DN_VAL, "DeltaNet prefill kernel assumes equal key/value widths");
 
+    int block = blockIdx.x;
+    int h = block / BLOCKS_PER_HEAD;
+    if (h >= DN_HEADS) return;
+    int tile = block % BLOCKS_PER_HEAD;
+    int val_offset = tile * VAL_TILE;
+
+    int tid = threadIdx.x, wid = tid/32, lid = tid%32;
     float a_log_val = __bfloat162float(a_log[h]);
     float a_scale = __expf(a_log_val);
     float dt_b = __bfloat162float(dt_bias[h]);
 
-    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL], s_out[DN_VAL];
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[VAL_TILE], s_out[VAL_TILE];
     __shared__ float s_beta, s_decay;
-    __shared__ float s_qnorm[NWARPS], s_knorm[NWARPS], s_gnorm[NWARPS];
-    __shared__ float s_conv[HEAD_CHANNELS * DN_CONV_K];
-    __shared__ float s_conv_w[HEAD_CHANNELS * DN_CONV_K];
+    __shared__ float s_qnorm[NWARPS], s_knorm[NWARPS];
+    __shared__ float s_qk_conv[QK_CHANNELS * DN_CONV_K];
+    __shared__ float s_qk_conv_w[QK_CHANNELS * DN_CONV_K];
+    __shared__ float s_v_conv[VAL_TILE * DN_CONV_K];
+    __shared__ float s_v_conv_w[VAL_TILE * DN_CONV_K];
 
-    float *my_state = state + h * DN_KEY * DN_VAL;
+    float *my_state = state + h * DN_KEY * DN_VAL + val_offset * DN_KEY;
     const int q_base = h * DN_KEY;
     const int k_base = DN_QK_SIZE + h * DN_KEY;
-    const int v_base = 2 * DN_QK_SIZE + h * DN_VAL;
+    const int v_base = 2 * DN_QK_SIZE + h * DN_VAL + val_offset;
 
-    // Stage this head's conv ring buffer and weights in shared memory.
-    for (int idx = tid; idx < HEAD_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
+    // Stage q/k history once per tile block. This intentionally duplicates q/k work
+    // across value tiles so GB10 can keep more SMs busy during prompt prefill.
+    for (int idx = tid; idx < QK_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
         int channel = idx / DN_CONV_K;
         int tap = idx % DN_CONV_K;
-        int global_ch = (channel < DN_KEY)
-            ? (q_base + channel)
-            : ((channel < 2 * DN_KEY)
-                ? (k_base + channel - DN_KEY)
-                : (v_base + channel - 2 * DN_KEY));
-        s_conv[idx] = conv_buf[global_ch * DN_CONV_K + tap];
-        s_conv_w[idx] = __bfloat162float(conv_w[global_ch * DN_CONV_K + tap]);
+        int global_ch = (channel < DN_KEY) ? (q_base + channel) : (k_base + channel - DN_KEY);
+        s_qk_conv[idx] = conv_buf[global_ch * DN_CONV_K + tap];
+        s_qk_conv_w[idx] = __bfloat162float(conv_w[global_ch * DN_CONV_K + tap]);
+    }
+    for (int idx = tid; idx < VAL_TILE * DN_CONV_K; idx += BLOCK_THREADS) {
+        int channel = idx / DN_CONV_K;
+        int tap = idx % DN_CONV_K;
+        int global_ch = v_base + channel;
+        s_v_conv[idx] = conv_buf[global_ch * DN_CONV_K + tap];
+        s_v_conv_w[idx] = __bfloat162float(conv_w[global_ch * DN_CONV_K + tap]);
     }
     __syncthreads();
 
     // Load state into registers
-    constexpr int CPW = DN_VAL / NWARPS;  // 8
-    constexpr int RPL = DN_KEY / 32;       // 4
-    float sreg[CPW * RPL];  // 32 floats
+    constexpr int CPW = VAL_TILE / NWARPS;
+    constexpr int RPL = DN_KEY / 32;
+    float sreg[CPW * RPL];
 
     for (int jj = 0; jj < CPW; jj++) {
         int j = wid * CPW + jj;
@@ -188,43 +205,57 @@ pf_deltanet_recurrence(
 
     for (int t = 0; t < S; t++) {
         const __nv_bfloat16 *qkv_t = qkv_proj + t * DN_CONV_CH;
-        const __nv_bfloat16 *z_h = z_proj + t * DN_V_SIZE + h * DN_VAL;
         const float beta_proj_val = beta_proj[t * DN_HEADS + h];
         const float alpha_proj_val = alpha_proj[t * DN_HEADS + h];
 
-        // Conv1d + SiLU for q, k, v with head-local ring buffers staged in shared memory.
-        for (int c = tid; c < HEAD_CHANNELS; c += BLOCK_THREADS) {
+        // q/k are duplicated across value tiles; v is split by tile.
+        for (int c = tid; c < QK_CHANNELS; c += BLOCK_THREADS) {
             int base = c * DN_CONV_K;
-            float h0 = s_conv[base + 1];
-            float h1 = s_conv[base + 2];
-            float h2 = s_conv[base + 3];
-            s_conv[base + 0] = h0;
-            s_conv[base + 1] = h1;
-            s_conv[base + 2] = h2;
+            float h0 = s_qk_conv[base + 1];
+            float h1 = s_qk_conv[base + 2];
+            float h2 = s_qk_conv[base + 3];
+            s_qk_conv[base + 0] = h0;
+            s_qk_conv[base + 1] = h1;
+            s_qk_conv[base + 2] = h2;
 
             float in_val;
             if (c < DN_KEY) {
                 in_val = __bfloat162float(qkv_t[q_base + c]);
-            } else if (c < 2 * DN_KEY) {
-                in_val = __bfloat162float(qkv_t[k_base + c - DN_KEY]);
             } else {
-                in_val = __bfloat162float(qkv_t[v_base + c - 2 * DN_KEY]);
+                in_val = __bfloat162float(qkv_t[k_base + c - DN_KEY]);
             }
-            s_conv[base + 3] = in_val;
+            s_qk_conv[base + 3] = in_val;
 
             float co = 0.0f;
 #pragma unroll
             for (int k = 0; k < DN_CONV_K; k++) {
-                co += s_conv[base + k] * s_conv_w[base + k];
+                co += s_qk_conv[base + k] * s_qk_conv_w[base + k];
             }
             float act = pf_silu(co);
             if (c < DN_KEY) {
                 s_q[c] = act;
-            } else if (c < 2 * DN_KEY) {
-                s_k[c - DN_KEY] = act;
             } else {
-                s_v[c - 2 * DN_KEY] = act;
+                s_k[c - DN_KEY] = act;
             }
+        }
+        for (int c = tid; c < VAL_TILE; c += BLOCK_THREADS) {
+            int base = c * DN_CONV_K;
+            float h0 = s_v_conv[base + 1];
+            float h1 = s_v_conv[base + 2];
+            float h2 = s_v_conv[base + 3];
+            s_v_conv[base + 0] = h0;
+            s_v_conv[base + 1] = h1;
+            s_v_conv[base + 2] = h2;
+
+            float in_val = __bfloat162float(qkv_t[v_base + c]);
+            s_v_conv[base + 3] = in_val;
+
+            float co = 0.0f;
+#pragma unroll
+            for (int k = 0; k < DN_CONV_K; k++) {
+                co += s_v_conv[base + k] * s_v_conv_w[base + k];
+            }
+            s_v[c] = pf_silu(co);
         }
         __syncthreads();
 
@@ -269,7 +300,7 @@ pf_deltanet_recurrence(
         }
         __syncthreads();
         float beta = s_beta, decay = s_decay;
-        __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
+        __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL + val_offset;
 
         // State-in-registers recurrence
         for (int jj = 0; jj < CPW; jj++) {
@@ -292,39 +323,23 @@ pf_deltanet_recurrence(
             if (lid == 0) s_out[j] = attn;
         }
         __syncthreads();
-
-        // Gated RMSNorm → bf16 output, keeping the pre-norm output in shared memory.
-        float sq2 = 0.0f;
-        for (int i = tid; i < DN_VAL; i += BLOCK_THREADS) {
-            float v = s_out[i];
-            sq2 += v * v;
-        }
-        sq2 = pf_warp_sum(sq2);
-        if (lid == 0) s_gnorm[wid] = sq2;
-        __syncthreads();
-        if (wid == 0) {
-            float v = (lid < NWARPS) ? s_gnorm[lid] : 0.0f;
-            v = pf_warp_sum(v);
-            if (lid == 0) s_gnorm[0] = rsqrtf(v / DN_VAL + RMS_EPS);
-        }
-        __syncthreads();
-        float rstd = s_gnorm[0];
-        for (int i = tid; i < DN_VAL; i += BLOCK_THREADS) {
-            float n = s_out[i] * rstd * __bfloat162float(norm_w[i]);
-            out_h[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z_h[i])));
+        for (int i = tid; i < VAL_TILE; i += BLOCK_THREADS) {
+            out_h[i] = __float2bfloat16(s_out[i]);
         }
     }
 
-    // Spill the updated conv ring buffer back once per prompt.
-    for (int idx = tid; idx < HEAD_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
+    if (tile == 0) {
+        for (int idx = tid; idx < QK_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
+            int channel = idx / DN_CONV_K;
+            int tap = idx % DN_CONV_K;
+            int global_ch = (channel < DN_KEY) ? (q_base + channel) : (k_base + channel - DN_KEY);
+            conv_buf[global_ch * DN_CONV_K + tap] = s_qk_conv[idx];
+        }
+    }
+    for (int idx = tid; idx < VAL_TILE * DN_CONV_K; idx += BLOCK_THREADS) {
         int channel = idx / DN_CONV_K;
         int tap = idx % DN_CONV_K;
-        int global_ch = (channel < DN_KEY)
-            ? (q_base + channel)
-            : ((channel < 2 * DN_KEY)
-                ? (k_base + channel - DN_KEY)
-                : (v_base + channel - 2 * DN_KEY));
-        conv_buf[global_ch * DN_CONV_K + tap] = s_conv[idx];
+        conv_buf[(v_base + channel) * DN_CONV_K + tap] = s_v_conv[idx];
     }
 
     // Write state back
@@ -332,6 +347,47 @@ pf_deltanet_recurrence(
         int j = wid * CPW + jj;
         for (int ii = 0; ii < RPL; ii++)
             my_state[j*DN_KEY + lid+ii*32] = sreg[jj*RPL+ii];
+    }
+}
+
+__global__ void pf_deltanet_finalize(
+    __nv_bfloat16 *attn_out, const __nv_bfloat16 *z_proj,
+    const __nv_bfloat16 *norm_w, int S)
+{
+    int idx = blockIdx.x;
+    if (idx >= S * DN_HEADS) return;
+    int t = idx / DN_HEADS;
+    int h = idx % DN_HEADS;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lid = tid % 32;
+
+    __shared__ float smem[32];
+    __nv_bfloat16 *row = attn_out + t * DN_V_SIZE + h * DN_VAL;
+    const __nv_bfloat16 *z_h = z_proj + t * DN_V_SIZE + h * DN_VAL;
+
+    float sq = 0.0f;
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float v = __bfloat162float(row[i]);
+        sq += v * v;
+    }
+    sq = pf_warp_sum(sq);
+    if (lid == 0) {
+        smem[wid] = sq;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < blockDim.x / 32) ? smem[lid] : 0.0f;
+        v = pf_warp_sum(v);
+        if (lid == 0) {
+            smem[0] = rsqrtf(v / DN_VAL + RMS_EPS);
+        }
+    }
+    __syncthreads();
+    float rstd = smem[0];
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float n = __bfloat162float(row[i]) * rstd * __bfloat162float(norm_w[i]);
+        row[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z_h[i])));
     }
 }
 
@@ -534,12 +590,18 @@ static void launch_prefill_bf16_impl(
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
             // Standalone recurrence
-            pf_deltanet_recurrence<PREFILL_DN_BLOCK_SIZE><<<DN_HEADS, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
-                proj_buf, proj_buf2, beta_buf, alpha_buf,
-                conv_w, a_log, dt_bias, dn_norm,
+            pf_deltanet_recurrence_tiled<PREFILL_DN_BLOCK_SIZE, PREFILL_DN_BLOCKS_PER_HEAD>
+                <<<DN_HEADS * PREFILL_DN_BLOCKS_PER_HEAD, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
+                proj_buf, beta_buf, alpha_buf,
+                conv_w, a_log, dt_bias,
                 dn_states + dn_idx*dn_stride,
                 conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
                 dn_out_buf, S);
+            pf_deltanet_finalize<<<S * DN_HEADS, 256, 0, stream>>>(
+                dn_out_buf,
+                proj_buf2,
+                dn_norm,
+                S);
 
             // Out projection + residual
             cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
