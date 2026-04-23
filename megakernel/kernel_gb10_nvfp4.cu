@@ -1296,6 +1296,20 @@ __global__ void prepare_lm_hidden_bf16_kernel(
     lm_hidden[idx] = __float2bfloat16(value);
 }
 
+__global__ void prepare_lm_hidden_bf16_from_bf16_kernel(
+    const __nv_bfloat16 *__restrict__ hidden,
+    __nv_bfloat16 *__restrict__ lm_hidden)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = LM_HEAD_TC_N * HIDDEN_SIZE;
+    if (idx >= total) {
+        return;
+    }
+    int row = idx / HIDDEN_SIZE;
+    int k = idx % HIDDEN_SIZE;
+    lm_hidden[idx] = (row == 0) ? hidden[k] : __float2bfloat16(0.0f);
+}
+
 __global__ void lm_head_argmax_half_kernel(
     const __half *__restrict__ logits,
     float *__restrict__ block_max_vals,
@@ -1760,6 +1774,57 @@ extern "C" void launch_quantize_nvfp4_lm_out(
         rows,
         cols,
         scale_tiles);
+}
+
+extern "C" bool launch_lm_head_cublaslt_bf16_top1(
+    const void *hidden_bf16,
+    const void *lm_head_weight_packed,
+    const void *lm_head_scales,
+    void *lm_hidden_bf16,
+    void *lm_hidden_packed,
+    void *lm_hidden_scales,
+    void *lm_logits_f16,
+    float *block_max_vals,
+    int *block_max_idxs,
+    int *output_token_id,
+    cudaStream_t stream)
+{
+    int prepare_threads = 256;
+    int prepare_blocks = (LM_HEAD_TC_N * HIDDEN_SIZE + prepare_threads - 1) / prepare_threads;
+    prepare_lm_hidden_bf16_from_bf16_kernel<<<prepare_blocks, prepare_threads, 0, stream>>>(
+        (const __nv_bfloat16 *)hidden_bf16,
+        (__nv_bfloat16 *)lm_hidden_bf16);
+    cudaMemsetAsync(lm_hidden_scales, 0, LM_HEAD_HIDDEN_SCALE_BYTES, stream);
+    launch_quantize_nvfp4_lm_out(
+        lm_hidden_bf16,
+        LM_HEAD_TC_N,
+        HIDDEN_SIZE,
+        lm_hidden_packed,
+        lm_hidden_scales,
+        stream);
+
+    bool used_cublaslt = launch_lm_head_cublaslt(
+        (const uint8_t *)lm_head_weight_packed,
+        (const uint8_t *)lm_head_scales,
+        (const uint8_t *)lm_hidden_packed,
+        (const uint8_t *)lm_hidden_scales,
+        (__half *)lm_logits_f16,
+        stream);
+    if (!used_cublaslt) {
+        return false;
+    }
+
+    int lm_blocks = lm_launch_blocks();
+    lm_head_argmax_half_kernel<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
+        (const __half *)lm_logits_f16,
+        block_max_vals,
+        block_max_idxs);
+    lm_head_reduce_kernel<<<1, LM_BLOCK_SIZE, 0, stream>>>(
+        block_max_vals,
+        block_max_idxs,
+        output_token_id,
+        lm_blocks);
+    return true;
 }
 
 static void launch_decode_step_nvfp4(

@@ -7,6 +7,10 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#ifndef PREFILL_DN_BLOCK_SIZE
+#define PREFILL_DN_BLOCK_SIZE 256
+#endif
+
 constexpr int HIDDEN = 1024;
 constexpr int INTER = 3584;
 constexpr int VOCAB = 248320;
@@ -21,6 +25,7 @@ constexpr int FA_QPROJ_SIZE = FA_Q_SIZE * 2;
 constexpr int FA_KV_SIZE = FA_KV_HEADS * FA_HEAD_DIM;
 constexpr int FA_ROT_DIM = 64;
 constexpr float FA_ROPE_THETA = 10000000.0f;
+constexpr int FA_ROT_PAIRS = FA_ROT_DIM / 2;
 
 constexpr int DN_HEADS = 16;
 constexpr int DN_KEY = 128;
@@ -35,10 +40,43 @@ constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1}
 
 struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
 
+extern "C" bool launch_lm_head_cublaslt_bf16_top1(
+    const void *hidden_bf16,
+    const void *lm_head_weight_packed,
+    const void *lm_head_scales,
+    void *lm_hidden_bf16,
+    void *lm_hidden_packed,
+    void *lm_hidden_scales,
+    void *lm_logits_f16,
+    float *block_max_vals,
+    int *block_max_idxs,
+    int *output_token_id,
+    cudaStream_t stream);
+
+__device__ __constant__ float PF_ROPE_INV_FREQ[FA_ROT_PAIRS] = {
+    1.000000000000000000e+00f, 6.042963902381328634e-01f,
+    3.651741272548377215e-01f, 2.206734069084589911e-01f,
+    1.333521432163324028e-01f, 8.058421877614818651e-02f,
+    4.869675251658631132e-02f, 2.942727176209281731e-02f,
+    1.778279410038922925e-02f, 1.074607828321317432e-02f,
+    6.493816315762112983e-03f, 3.924189758484536265e-03f,
+    2.371373705661655382e-03f, 1.433012570236962685e-03f,
+    8.659643233600653866e-04f, 5.232991146814947340e-04f,
+    3.162277660168379394e-04f, 1.910952974970440477e-04f,
+    1.154781984689458215e-04f, 6.978305848598663529e-05f,
+    4.216965034285822237e-05f, 2.548296747979346413e-05f,
+    1.539926526059491854e-05f, 9.305720409296990429e-06f,
+    5.623413251903491208e-06f, 3.398208328942559268e-06f,
+    2.053525026457146066e-06f, 1.240937760751719527e-06f,
+    7.498942093324558477e-07f, 4.531583637600817928e-07f,
+    2.738419634264361394e-07f, 1.654817099943181354e-07f
+};
+
 __device__ __forceinline__ float pf_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
 }
-__device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ __forceinline__ float pf_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float pf_silu(float x) { return x * pf_sigmoid(x); }
 
 // Embedding
 __global__ void pf_embed(const int *ids, const __nv_bfloat16 *embed, __nv_bfloat16 *out, int S) {
@@ -90,7 +128,8 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
 }
 
 // ===== Standalone DeltaNet recurrence (state-in-registers, bf16 I/O, f32 state) =====
-__global__ void __launch_bounds__(512, 1)
+template <int BLOCK_THREADS>
+__global__ void __launch_bounds__(BLOCK_THREADS, 1)
 pf_deltanet_recurrence(
     const __nv_bfloat16 *qkv_proj, const __nv_bfloat16 *z_proj,
     const float *beta_proj, const float *alpha_proj,
@@ -100,17 +139,41 @@ pf_deltanet_recurrence(
 {
     int h = blockIdx.x; if (h >= DN_HEADS) return;
     int tid = threadIdx.x, wid = tid/32, lid = tid%32;
-    constexpr int NWARPS = 16;
+    constexpr int NWARPS = BLOCK_THREADS / 32;
+    static_assert(BLOCK_THREADS % 32 == 0, "DeltaNet prefill block size must be warp-aligned");
+    static_assert(DN_VAL % NWARPS == 0, "DeltaNet value width must divide the warp count");
+    static_assert(DN_KEY == DN_VAL, "DeltaNet prefill kernel assumes equal key/value widths");
     constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+    constexpr int HEAD_CHANNELS = DN_KEY + DN_KEY + DN_VAL;
 
     float a_log_val = __bfloat162float(a_log[h]);
+    float a_scale = __expf(a_log_val);
     float dt_b = __bfloat162float(dt_bias[h]);
 
-    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL], s_out[DN_VAL];
     __shared__ float s_beta, s_decay;
-    __shared__ float s_gnorm[NWARPS];
+    __shared__ float s_qnorm[NWARPS], s_knorm[NWARPS], s_gnorm[NWARPS];
+    __shared__ float s_conv[HEAD_CHANNELS * DN_CONV_K];
+    __shared__ float s_conv_w[HEAD_CHANNELS * DN_CONV_K];
 
     float *my_state = state + h * DN_KEY * DN_VAL;
+    const int q_base = h * DN_KEY;
+    const int k_base = DN_QK_SIZE + h * DN_KEY;
+    const int v_base = 2 * DN_QK_SIZE + h * DN_VAL;
+
+    // Stage this head's conv ring buffer and weights in shared memory.
+    for (int idx = tid; idx < HEAD_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
+        int channel = idx / DN_CONV_K;
+        int tap = idx % DN_CONV_K;
+        int global_ch = (channel < DN_KEY)
+            ? (q_base + channel)
+            : ((channel < 2 * DN_KEY)
+                ? (k_base + channel - DN_KEY)
+                : (v_base + channel - 2 * DN_KEY));
+        s_conv[idx] = conv_buf[global_ch * DN_CONV_K + tap];
+        s_conv_w[idx] = __bfloat162float(conv_w[global_ch * DN_CONV_K + tap]);
+    }
+    __syncthreads();
 
     // Load state into registers
     constexpr int CPW = DN_VAL / NWARPS;  // 8
@@ -124,39 +187,86 @@ pf_deltanet_recurrence(
     }
 
     for (int t = 0; t < S; t++) {
-        // Conv1d + SiLU (read bf16 proj, write f32 to shared)
-        for (int c = tid; c < DN_KEY; c += 512) {
-            int ch = h*DN_KEY + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_q[c]=pf_silu(co);
-        }
-        for (int c = tid; c < DN_KEY; c += 512) {
-            int ch = DN_QK_SIZE + h*DN_KEY + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_k[c]=pf_silu(co);
-        }
-        for (int c = tid; c < DN_VAL; c += 512) {
-            int ch = 2*DN_QK_SIZE + h*DN_VAL + c;
-            float h0=conv_buf[ch*DN_CONV_K+1],h1=conv_buf[ch*DN_CONV_K+2],h2=conv_buf[ch*DN_CONV_K+3];
-            conv_buf[ch*DN_CONV_K]=h0;conv_buf[ch*DN_CONV_K+1]=h1;conv_buf[ch*DN_CONV_K+2]=h2;
-            conv_buf[ch*DN_CONV_K+3]=__bfloat162float(qkv_proj[t*DN_CONV_CH+ch]);
-            float co=0;for(int k=0;k<DN_CONV_K;k++)co+=conv_buf[ch*DN_CONV_K+k]*__bfloat162float(conv_w[ch*DN_CONV_K+k]);
-            s_v[c]=pf_silu(co);
+        const __nv_bfloat16 *qkv_t = qkv_proj + t * DN_CONV_CH;
+        const __nv_bfloat16 *z_h = z_proj + t * DN_V_SIZE + h * DN_VAL;
+        const float beta_proj_val = beta_proj[t * DN_HEADS + h];
+        const float alpha_proj_val = alpha_proj[t * DN_HEADS + h];
+
+        // Conv1d + SiLU for q, k, v with head-local ring buffers staged in shared memory.
+        for (int c = tid; c < HEAD_CHANNELS; c += BLOCK_THREADS) {
+            int base = c * DN_CONV_K;
+            float h0 = s_conv[base + 1];
+            float h1 = s_conv[base + 2];
+            float h2 = s_conv[base + 3];
+            s_conv[base + 0] = h0;
+            s_conv[base + 1] = h1;
+            s_conv[base + 2] = h2;
+
+            float in_val;
+            if (c < DN_KEY) {
+                in_val = __bfloat162float(qkv_t[q_base + c]);
+            } else if (c < 2 * DN_KEY) {
+                in_val = __bfloat162float(qkv_t[k_base + c - DN_KEY]);
+            } else {
+                in_val = __bfloat162float(qkv_t[v_base + c - 2 * DN_KEY]);
+            }
+            s_conv[base + 3] = in_val;
+
+            float co = 0.0f;
+#pragma unroll
+            for (int k = 0; k < DN_CONV_K; k++) {
+                co += s_conv[base + k] * s_conv_w[base + k];
+            }
+            float act = pf_silu(co);
+            if (c < DN_KEY) {
+                s_q[c] = act;
+            } else if (c < 2 * DN_KEY) {
+                s_k[c - DN_KEY] = act;
+            } else {
+                s_v[c - 2 * DN_KEY] = act;
+            }
         }
         __syncthreads();
 
         // L2 normalize
-        if(wid==0){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_q[i]*s_q[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f)*Q_SCALE;n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_q[i]*=n;}
-        if(wid==1){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_k[i]*s_k[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f);n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_k[i]*=n;}
+        float q_sq = 0.0f;
+        float k_sq = 0.0f;
+        for (int i = tid; i < DN_KEY; i += BLOCK_THREADS) {
+            q_sq += s_q[i] * s_q[i];
+            k_sq += s_k[i] * s_k[i];
+        }
+        q_sq = pf_warp_sum(q_sq);
+        k_sq = pf_warp_sum(k_sq);
+        if (lid == 0) {
+            s_qnorm[wid] = q_sq;
+            s_knorm[wid] = k_sq;
+        }
+        __syncthreads();
+        if (wid == 0) {
+            float q_total = (lid < NWARPS) ? s_qnorm[lid] : 0.0f;
+            float k_total = (lid < NWARPS) ? s_knorm[lid] : 0.0f;
+            q_total = pf_warp_sum(q_total);
+            k_total = pf_warp_sum(k_total);
+            if (lid == 0) {
+                s_qnorm[0] = rsqrtf(q_total + 1e-6f) * Q_SCALE;
+                s_knorm[0] = rsqrtf(k_total + 1e-6f);
+            }
+        }
+        __syncthreads();
+        float q_norm = s_qnorm[0];
+        float k_norm = s_knorm[0];
+        for (int i = tid; i < DN_KEY; i += BLOCK_THREADS) {
+            s_q[i] *= q_norm;
+            s_k[i] *= k_norm;
+        }
         __syncthreads();
 
-        if(tid==0){s_beta=1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));float x=alpha_proj[t*DN_HEADS+h]+dt_b;float sp=(x>20.f)?x:logf(1.f+expf(x));s_decay=expf(-expf(a_log_val)*sp);}
+        if (tid == 0) {
+            s_beta = pf_sigmoid(beta_proj_val);
+            float x = alpha_proj_val + dt_b;
+            float sp = (x > 20.0f) ? x : log1pf(__expf(x));
+            s_decay = __expf(-a_scale * sp);
+        }
         __syncthreads();
         float beta = s_beta, decay = s_decay;
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
@@ -164,31 +274,57 @@ pf_deltanet_recurrence(
         // State-in-registers recurrence
         for (int jj = 0; jj < CPW; jj++) {
             int j = wid * CPW + jj;
-            float kv = 0;
-            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid+ii*32];
-            kv = pf_warp_sum(kv); kv = __shfl_sync(0xffffffff, kv, 0);
-            float delta = (s_v[j] - decay * kv) * beta;
-            float attn = 0;
+            float kv = 0.0f;
             for (int ii = 0; ii < RPL; ii++) {
-                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + s_k[lid+ii*32] * delta;
-                attn += sreg[jj*RPL+ii] * s_q[lid+ii*32];
+                kv += sreg[jj * RPL + ii] * s_k[lid + ii * 32];
+            }
+            kv = pf_warp_sum(kv);
+            kv = __shfl_sync(0xffffffff, kv, 0);
+            float delta = (s_v[j] - decay * kv) * beta;
+            float attn = 0.0f;
+            for (int ii = 0; ii < RPL; ii++) {
+                int key_idx = lid + ii * 32;
+                float new_state = decay * sreg[jj * RPL + ii] + s_k[key_idx] * delta;
+                sreg[jj * RPL + ii] = new_state;
+                attn += new_state * s_q[key_idx];
             }
             attn = pf_warp_sum(attn);
-            if (lid == 0) out_h[j] = __float2bfloat16(attn);
+            if (lid == 0) s_out[j] = attn;
         }
         __syncthreads();
 
-        // Gated RMSNorm → bf16 output
-        const __nv_bfloat16 *z_h = z_proj + t*DN_V_SIZE + h*DN_VAL;
-        float sq2=0;for(int i=tid;i<DN_VAL;i+=512){float v=__bfloat162float(out_h[i]);sq2+=v*v;}
-        sq2=pf_warp_sum(sq2);if(lid==0)s_gnorm[wid]=sq2;__syncthreads();
-        if(wid==0){float v=(lid<NWARPS)?s_gnorm[lid]:0;v=pf_warp_sum(v);if(lid==0)s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS);}
-        __syncthreads();float rstd=s_gnorm[0];
-        for(int i=tid;i<DN_VAL;i+=512){
-            float n=__bfloat162float(out_h[i])*rstd*__bfloat162float(norm_w[i]);
-            out_h[i]=__float2bfloat16(n*pf_silu(__bfloat162float(z_h[i])));
+        // Gated RMSNorm → bf16 output, keeping the pre-norm output in shared memory.
+        float sq2 = 0.0f;
+        for (int i = tid; i < DN_VAL; i += BLOCK_THREADS) {
+            float v = s_out[i];
+            sq2 += v * v;
+        }
+        sq2 = pf_warp_sum(sq2);
+        if (lid == 0) s_gnorm[wid] = sq2;
+        __syncthreads();
+        if (wid == 0) {
+            float v = (lid < NWARPS) ? s_gnorm[lid] : 0.0f;
+            v = pf_warp_sum(v);
+            if (lid == 0) s_gnorm[0] = rsqrtf(v / DN_VAL + RMS_EPS);
         }
         __syncthreads();
+        float rstd = s_gnorm[0];
+        for (int i = tid; i < DN_VAL; i += BLOCK_THREADS) {
+            float n = s_out[i] * rstd * __bfloat162float(norm_w[i]);
+            out_h[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z_h[i])));
+        }
+    }
+
+    // Spill the updated conv ring buffer back once per prompt.
+    for (int idx = tid; idx < HEAD_CHANNELS * DN_CONV_K; idx += BLOCK_THREADS) {
+        int channel = idx / DN_CONV_K;
+        int tap = idx % DN_CONV_K;
+        int global_ch = (channel < DN_KEY)
+            ? (q_base + channel)
+            : ((channel < 2 * DN_KEY)
+                ? (k_base + channel - DN_KEY)
+                : (v_base + channel - 2 * DN_KEY));
+        conv_buf[global_ch * DN_CONV_K + tap] = s_conv[idx];
     }
 
     // Write state back
@@ -216,8 +352,10 @@ __global__ void pf_qk_norm_rope(
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(qh[i])*sc*(1.f+__bfloat162float(qnw[i]));
             if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float angle = float(pos) * PF_ROPE_INV_FREQ[i & (FA_ROT_PAIRS - 1)];
+                float sv, cv;
+                __sincosf(angle, &sv, &cv);
+                int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
                 float pv=__bfloat162float(qh[p])*sc*(1.f+__bfloat162float(qnw[p]));
                 qh[i]=__float2bfloat16((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
             } else qh[i]=__float2bfloat16(normed);
@@ -235,8 +373,10 @@ __global__ void pf_qk_norm_rope(
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(kh[i])*sc*(1.f+__bfloat162float(knw[i])); float fk;
             if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float angle = float(pos) * PF_ROPE_INV_FREQ[i & (FA_ROT_PAIRS - 1)];
+                float sv, cv;
+                __sincosf(angle, &sv, &cv);
+                int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
                 float pv=__bfloat162float(kh[p])*sc*(1.f+__bfloat162float(knw[p]));
                 fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
             } else fk=normed;
@@ -265,11 +405,11 @@ __global__ void pf_causal_attn(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
         const __nv_bfloat16 *vv=v+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
         float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*__bfloat162float(kv[lid*EPL+e]);
         sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
-        float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
-        float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*__bfloat162float(vv[lid*EPL+e]);
+        float om=mx; mx=fmaxf(mx,sc); float ed=__expf(om-mx); float wexp=__expf(sc-mx); se=se*ed+wexp;
+        float wt=wexp; for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*__bfloat162float(vv[lid*EPL+e]);
     }
     float rs=1.f/se;
-    for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-__bfloat162float(gv[i])));ov[i]=__float2bfloat16(oa[e]*rs*g);}
+    for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=pf_sigmoid(__bfloat162float(gv[i]));ov[i]=__float2bfloat16(oa[e]*rs*g);}
 }
 
 // Final norm
@@ -329,10 +469,11 @@ static void cublas_bf16_gemm(cublasHandle_t h,
 }
 
 // ===== Main orchestrator =====
-extern "C" void launch_prefill_bf16(
+static void launch_prefill_bf16_impl(
     const int *token_ids, int seq_len, int *output_token,
     const __nv_bfloat16 *embed_weight, const PFLayerWeights *layers,
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
     float *dn_states, float *conv_bufs,
     // Scratch (ALL bf16 except state/conv which are f32)
@@ -343,6 +484,8 @@ extern "C" void launch_prefill_bf16(
     float *beta_buf, float *alpha_buf,
     __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
+    __nv_bfloat16 *lm_hidden_bf16, uint8_t *lm_hidden_packed,
+    uint8_t *lm_hidden_scales, __half *lm_logits_f16,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -385,14 +528,13 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *up_w=(const __nv_bfloat16*)lw.ptrs[12];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
 
-            // cuBLAS projections — direct bf16, no conversion!
             cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
             cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
             // Standalone recurrence
-            pf_deltanet_recurrence<<<DN_HEADS, 512, 0, stream>>>(
+            pf_deltanet_recurrence<PREFILL_DN_BLOCK_SIZE><<<DN_HEADS, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
                 proj_buf, proj_buf2, beta_buf, alpha_buf,
                 conv_w, a_log, dt_bias, dn_norm,
                 dn_states + dn_idx*dn_stride,
@@ -456,7 +598,89 @@ extern "C" void launch_prefill_bf16(
 
     pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
 
-    int lm_blocks = 512;
-    pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
-    pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+    bool used_nvfp4_lm = false;
+    if (lm_head_weight_packed && lm_head_scales && lm_hidden_bf16 && lm_hidden_packed &&
+        lm_hidden_scales && lm_logits_f16) {
+        used_nvfp4_lm = launch_lm_head_cublaslt_bf16_top1(
+            final_normed,
+            lm_head_weight_packed,
+            lm_head_scales,
+            lm_hidden_bf16,
+            lm_hidden_packed,
+            lm_hidden_scales,
+            lm_logits_f16,
+            lm_bmv,
+            lm_bmi,
+            output_token,
+            stream);
+    }
+    if (!used_nvfp4_lm) {
+        int lm_blocks = 512;
+        pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
+        pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+    }
+}
+
+extern "C" void launch_prefill_bf16(
+    const int *token_ids, int seq_len, int *output_token,
+    const void *embed_weight, const PFLayerWeights *layers,
+    const void *final_norm_w, const void *lm_head_w,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden, void *residual, void *normalized,
+    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *dn_out_buf, void *beta_buf, void *alpha_buf,
+    void *final_normed, void *hidden_bf16_out,
+    void *lm_bmv, void *lm_bmi,
+    cudaStream_t stream)
+{
+    launch_prefill_bf16_impl(
+        token_ids, seq_len, output_token,
+        (const __nv_bfloat16 *)embed_weight, layers,
+        (const __nv_bfloat16 *)final_norm_w, (const __nv_bfloat16 *)lm_head_w,
+        nullptr, nullptr,
+        (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
+        (float *)dn_states, (float *)conv_bufs,
+        (__nv_bfloat16 *)hidden, (__nv_bfloat16 *)residual, (__nv_bfloat16 *)normalized,
+        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2,
+        (__nv_bfloat16 *)attn_buf, (__nv_bfloat16 *)mlp_buf,
+        (__nv_bfloat16 *)dn_out_buf,
+        (float *)beta_buf, (float *)alpha_buf,
+        (__nv_bfloat16 *)final_normed, (__nv_bfloat16 *)hidden_bf16_out,
+        (float *)lm_bmv, (int *)lm_bmi,
+        nullptr, nullptr, nullptr, nullptr,
+        stream);
+}
+
+extern "C" void launch_prefill_bf16_nvfp4_lm(
+    const int *token_ids, int seq_len, int *output_token,
+    const void *embed_weight, const PFLayerWeights *layers,
+    const void *final_norm_w, const void *lm_head_w,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden, void *residual, void *normalized,
+    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *dn_out_buf, void *beta_buf, void *alpha_buf,
+    void *final_normed, void *hidden_bf16_out,
+    void *lm_bmv, void *lm_bmi,
+    void *lm_hidden_bf16, void *lm_hidden_packed,
+    void *lm_hidden_scales, void *lm_logits_f16,
+    cudaStream_t stream)
+{
+    launch_prefill_bf16_impl(
+        token_ids, seq_len, output_token,
+        (const __nv_bfloat16 *)embed_weight, layers,
+        (const __nv_bfloat16 *)final_norm_w, (const __nv_bfloat16 *)lm_head_w,
+        lm_head_weight_packed, lm_head_scales,
+        (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
+        (float *)dn_states, (float *)conv_bufs,
+        (__nv_bfloat16 *)hidden, (__nv_bfloat16 *)residual, (__nv_bfloat16 *)normalized,
+        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2,
+        (__nv_bfloat16 *)attn_buf, (__nv_bfloat16 *)mlp_buf,
+        (__nv_bfloat16 *)dn_out_buf,
+        (float *)beta_buf, (float *)alpha_buf,
+        (__nv_bfloat16 *)final_normed, (__nv_bfloat16 *)hidden_bf16_out,
+        (float *)lm_bmv, (int *)lm_bmi,
+        (__nv_bfloat16 *)lm_hidden_bf16, (uint8_t *)lm_hidden_packed,
+        (uint8_t *)lm_hidden_scales, (__half *)lm_logits_f16,
+        stream);
 }

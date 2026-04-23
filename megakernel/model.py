@@ -36,13 +36,14 @@ _decode = None
 _decode_nvfp4 = None
 _decode_many_nvfp4 = None
 _prefill_bf16 = None
+_prefill_bf16_nvfp4_lm = None
 _quantize_nvfp4_out = None
 _quantize_nvfp4_lm_out = None
 
 
 def _load_op():
     global _decode, _decode_nvfp4, _decode_many_nvfp4
-    global _prefill_bf16, _quantize_nvfp4_out, _quantize_nvfp4_lm_out
+    global _prefill_bf16, _prefill_bf16_nvfp4_lm, _quantize_nvfp4_out, _quantize_nvfp4_lm_out
     if _decode is None:
         import qwen35_megakernel_bf16_C
         ops = torch.ops.qwen35_megakernel_bf16_C
@@ -50,6 +51,7 @@ def _load_op():
         _decode_nvfp4 = ops.decode_nvfp4
         _decode_many_nvfp4 = ops.decode_many_nvfp4
         _prefill_bf16 = ops.prefill_bf16
+        _prefill_bf16_nvfp4_lm = ops.prefill_bf16_nvfp4_lm
         _quantize_nvfp4_out = ops.quantize_nvfp4_out
         _quantize_nvfp4_lm_out = ops.quantize_nvfp4_lm_out
 
