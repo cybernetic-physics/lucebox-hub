@@ -48,6 +48,25 @@ the live path reports:
 lm_head_cublaslt: used=1
 ```
 
+The prompt-side change after that was in the DeltaNet prefill path. The old
+prefill recurrence only launched `16` blocks total, one per DeltaNet head,
+which left most of the GB10 idle during prompt processing. The current prompt
+path now:
+
+- targets `sm_121a` explicitly in the extension build
+- tiles the DeltaNet recurrence across value channels
+- launches `4` blocks per head in the hot recurrence
+- separates the post-recurrence RMSNorm+gate step into its own CUDA kernel so
+  the tiled recurrence stays mathematically exact
+
+The best validated setting on this GB10 was:
+
+- `PREFILL_DN_BLOCKS_PER_HEAD = 4`
+- `PREFILL_DN_BLOCK_SIZE = 256`
+
+That moved the focused prompt benchmark from the earlier `pp520 ≈ 11.3k tok/s`
+range into the `16k tok/s` range on clean runs.
+
 ## Current Luce results
 
 ### Repo benchmark
@@ -64,14 +83,31 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `pp520 = 10786 tok/s`
-- `tg128 = 180 tok/s`
-- prompt time: `48.2 ms`
-- decode time: `712.9 ms`
+- `pp520 = 15847 tok/s`
+- `tg128 = 181 tok/s`
+- prompt time: `32.8 ms`
+- decode time: `707.3 ms`
 
 Approximate combined `520 + 128` latency:
 
-- `761.1 ms`
+- `740.1 ms`
+
+### Focused pp / tg harness
+
+Command:
+
+```bash
+env HF_HOME=/home/sparkz/hf_cache \
+    MEGAKERNEL_BACKEND=nvfp4 \
+    /home/sparkz/dreamzero/.venv-cu132-src/bin/python \
+    /home/sparkz/lucebox-hub/megakernel/bench_pp_tg.py \
+    --section pp --prompt-tokens 520
+```
+
+Validated result:
+
+- `pp520 = 16048.5 tok/s`
+- `32.4 ms`
 
 ### Decode-only benchmark
 
@@ -87,8 +123,8 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `tg128 = 88.0 tok/s`
-- `1454.2 ms` total in that harness
+- `tg128 = 197.3 tok/s`
+- `648.9 ms` total in that harness
 
 This harness is still useful for relative decode progression, but the current
 headline number for the repo is the `final_bench.py` result above.
@@ -159,25 +195,27 @@ Result:
 
 | workload | Luce NVFP4 | llama.cpp BF16 | winner |
 | --- | ---: | ---: | --- |
-| `pp520` | `10786 tok/s` | `14150.99 tok/s` | `llama.cpp` |
-| `tg128` | `180 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
-| combined `520 + 128` latency | `761.1 ms` | `1012.9 ms` | `Luce NVFP4` |
+| `pp520` | `15847 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
+| `tg128` | `181 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
+| combined `520 + 128` latency | `740.1 ms` | `1012.9 ms` | `Luce NVFP4` |
 
 Relative to the clean refreshed `llama.cpp` run:
 
-- Luce prompt ingest is about `23.8%` slower
-- Luce decode is about `33.2%` faster
-- Luce total `520 + 128` latency is about `24.9%` lower
+- Luce prompt ingest is about `12.0%` faster
+- Luce decode is about `34.0%` faster
+- Luce total `520 + 128` latency is about `26.9%` lower
 
 ## Current conclusion
 
 On the current code:
 
-- `llama.cpp` is still better at prompt ingest on this model
-- Luce NVFP4 is now clearly better on decode
-- Luce NVFP4 is also clearly better on end-to-end latency for the `520 + 128`
+- Luce NVFP4 is now ahead of the refreshed BF16 `llama.cpp` run on prompt
+  ingest
+- Luce NVFP4 remains clearly ahead on decode
+- Luce NVFP4 is also clearly ahead on end-to-end latency for the `520 + 128`
   workload that matters here
 
-The next practical optimization target is no longer the LM head. The next
-target is moving more of the projection work off scalar FP4 unpack loops and
-onto SM12x tensor-core grouped GEMMs.
+The next practical optimization target is no longer the LM head or the raw
+DeltaNet recurrence occupancy issue. The next target is moving more of the
+projection work off repeated BF16 GEMM launches and onto a more persistent
+CUDA/CUTLASS/CUBLASLt prompt schedule.
