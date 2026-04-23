@@ -1302,3 +1302,261 @@ extern "C" void launch_fused_adamw(
         (__nv_bfloat16 *)params_bf16, m, v, grad,
         numel, step, lr, beta1, beta2, eps, wd, bc1, bc2);
 }
+
+// ============================================================================
+// Backward pass — CE loss + LM head backward.
+//
+// Forward:
+//   logits[V] = final_normed[H] @ lm_head_w[V, H]^T       (one vector, last position)
+//   loss = -log_softmax(logits)[target_token]
+//
+// Backward:
+//   grad_logits[V] = softmax(logits) - onehot(target)
+//   grad_final_normed[H] = grad_logits[V] @ lm_head_w[V, H]
+//
+// Executed by one block to keep it simple (HIDDEN=1024 is tiny).
+// ============================================================================
+
+extern "C" __global__ void bwd_ce_lm_head_kernel(
+    const __nv_bfloat16 *__restrict__ final_normed,   // [HIDDEN]
+    const __nv_bfloat16 *__restrict__ lm_head_w,      // [VOCAB, HIDDEN]
+    int target_token,
+    float *__restrict__ grad_final_normed_out,        // [HIDDEN]
+    float *__restrict__ loss_out)                      // [1]
+{
+    // Phase 1: materialize logits + compute max for stable softmax.
+    // We avoid allocating [VOCAB] global memory for logits by streaming.
+    // Each warp processes V_PER_WARP rows in a reduction of logsumexp and
+    // gradient accumulation for that warp's share.
+    //
+    // Organization: 1 block × 512 threads = 16 warps × 32 lanes.
+    // Each warp handles a contiguous slice of the vocab.
+    __shared__ float s_max_per_warp[16];
+    __shared__ float s_sumexp_per_warp[16];
+    __shared__ float s_max_global[1];
+    __shared__ float s_sumexp_global[1];
+    __shared__ float s_logit_target[1];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int nwarps = blockDim.x / 32;
+
+    // Cache final_normed[H] in shared to save repeated reads.
+    __shared__ __nv_bfloat16 s_h[HIDDEN];
+    for (int i = tid; i < HIDDEN; i += blockDim.x) s_h[i] = final_normed[i];
+    __syncthreads();
+
+    // Pass 1: find row-max. Each warp handles (V/nwarps) rows.
+    const int rows_per_warp = (VOCAB + nwarps - 1) / nwarps;
+    const int v_start = warp_id * rows_per_warp;
+    const int v_end = min(v_start + rows_per_warp, VOCAB);
+
+    float local_max = -INFINITY;
+    for (int v = v_start + lane; v < v_end; v += 32) {
+        const __nv_bfloat16 *wr = lm_head_w + (size_t)v * HIDDEN;
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (int h = 0; h < HIDDEN; h++) {
+            sum += __bfloat162float(wr[h]) * __bfloat162float(s_h[h]);
+        }
+        // Save logit for target token
+        if (v == target_token) s_logit_target[0] = sum;
+        if (sum > local_max) local_max = sum;
+    }
+    // Warp-reduce max
+    for (int o = 16; o > 0; o >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, o));
+    if (lane == 0) s_max_per_warp[warp_id] = local_max;
+    __syncthreads();
+    if (warp_id == 0) {
+        float gm = (lane < nwarps) ? s_max_per_warp[lane] : -INFINITY;
+        for (int o = 16; o > 0; o >>= 1)
+            gm = fmaxf(gm, __shfl_xor_sync(0xffffffff, gm, o));
+        if (lane == 0) s_max_global[0] = gm;
+    }
+    __syncthreads();
+    const float row_max = s_max_global[0];
+
+    // Pass 2: compute sumexp (streaming, recomputing logits).
+    float local_sumexp = 0.0f;
+    for (int v = v_start + lane; v < v_end; v += 32) {
+        const __nv_bfloat16 *wr = lm_head_w + (size_t)v * HIDDEN;
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (int h = 0; h < HIDDEN; h++) {
+            sum += __bfloat162float(wr[h]) * __bfloat162float(s_h[h]);
+        }
+        local_sumexp += __expf(sum - row_max);
+    }
+    for (int o = 16; o > 0; o >>= 1)
+        local_sumexp += __shfl_xor_sync(0xffffffff, local_sumexp, o);
+    if (lane == 0) s_sumexp_per_warp[warp_id] = local_sumexp;
+    __syncthreads();
+    if (warp_id == 0) {
+        float gs = (lane < nwarps) ? s_sumexp_per_warp[lane] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1)
+            gs += __shfl_xor_sync(0xffffffff, gs, o);
+        if (lane == 0) s_sumexp_global[0] = gs;
+    }
+    __syncthreads();
+    const float sumexp = s_sumexp_global[0];
+    const float inv_sum = 1.0f / sumexp;
+
+    if (tid == 0) {
+        *loss_out = -(s_logit_target[0] - row_max - __logf(sumexp));
+    }
+
+    // Pass 3: accumulate grad_final_normed[h] = Σ_v (p[v] - δ[v,t]) * W[v,h]
+    // Each block computes partial contribution for its vocab slice, summed
+    // across warps via shared memory.
+    extern __shared__ float s_grad_partial[];   // [nwarps][HIDDEN]
+    float *my_partial = s_grad_partial + warp_id * HIDDEN;
+    for (int h = lane; h < HIDDEN; h += 32) my_partial[h] = 0.0f;
+
+    for (int v = v_start + lane; v < v_end; v += 32) {
+        const __nv_bfloat16 *wr = lm_head_w + (size_t)v * HIDDEN;
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (int h = 0; h < HIDDEN; h++) {
+            sum += __bfloat162float(wr[h]) * __bfloat162float(s_h[h]);
+        }
+        float p = __expf(sum - row_max) * inv_sum;
+        float g = p - (v == target_token ? 1.0f : 0.0f);
+        // Accumulate g * wr[h] into my_partial[h] — serial per lane over H
+        // but vectorized across lanes of the warp (each v goes to one lane).
+        for (int h = 0; h < HIDDEN; h++) {
+            atomicAdd(my_partial + h, g * __bfloat162float(wr[h]));
+        }
+    }
+    __syncthreads();
+
+    // Sum across warps into output.
+    for (int h = tid; h < HIDDEN; h += blockDim.x) {
+        float s = 0.0f;
+        for (int w = 0; w < nwarps; w++) s += s_grad_partial[w * HIDDEN + h];
+        grad_final_normed_out[h] = s;
+    }
+}
+
+extern "C" void launch_bwd_ce_lm_head(
+    const void *final_normed, const void *lm_head_w,
+    int target_token,
+    float *grad_final_normed_out, float *loss_out,
+    cudaStream_t stream)
+{
+    const int block_size = 512;
+    const int nwarps = block_size / 32;
+    const size_t smem_bytes = (size_t)nwarps * HIDDEN * sizeof(float);  // s_grad_partial
+
+    static bool cfg = false;
+    if (!cfg) {
+        cudaFuncSetAttribute((void *)bwd_ce_lm_head_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        cfg = true;
+    }
+    bwd_ce_lm_head_kernel<<<1, block_size, smem_bytes, stream>>>(
+        (const __nv_bfloat16 *)final_normed, (const __nv_bfloat16 *)lm_head_w,
+        target_token, grad_final_normed_out, loss_out);
+}
+
+// ============================================================================
+// Backward: RMSNorm.
+//
+// Forward:
+//   rms = sqrt(mean(x^2) + eps)
+//   normed[i] = x[i] / rms * (1 + w[i])
+//
+// Backward (per-row, closed form):
+//   Let r = 1 / rms, a = (1 + w)
+//   dx[i] = r * a[i] * dy[i] - r^3 / H * x[i] * Σ_j x[j] * a[j] * dy[j]
+//
+// One block per row; for final norm we only have 1 row so 1 block.
+// ============================================================================
+
+extern "C" __global__ void bwd_rmsnorm_kernel(
+    const __nv_bfloat16 *__restrict__ x,        // [S, H]
+    const __nv_bfloat16 *__restrict__ w,        // [H]
+    const float *__restrict__ dy,                // [S, H]
+    float *__restrict__ dx_out,                  // [S, H]
+    int S, int H, float eps)
+{
+    extern __shared__ float smem_raw_rms[];
+    float *s_x = smem_raw_rms;                           // [H]
+    float *s_a = s_x + H;                                 // [H]
+    float *s_dy = s_a + H;                                // [H]
+    float *s_red = s_dy + H;                              // [NW]
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int nwarps = blockDim.x / 32;
+
+    for (int s = blockIdx.x; s < S; s += gridDim.x) {
+        const __nv_bfloat16 *x_row = x + (size_t)s * H;
+        const float *dy_row = dy + (size_t)s * H;
+        float *dx_row = dx_out + (size_t)s * H;
+
+        // Load x, compute a = 1 + w, copy dy into smem; compute sum(x^2).
+        float sq = 0.0f;
+        for (int i = tid; i < H; i += blockDim.x) {
+            float xi = __bfloat162float(x_row[i]);
+            s_x[i] = xi;
+            s_a[i] = 1.0f + __bfloat162float(w[i]);
+            s_dy[i] = dy_row[i];
+            sq += xi * xi;
+        }
+        // Block reduce sq
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffff, sq, o);
+        if (lane == 0) s_red[warp_id] = sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            float v = (lane < nwarps) ? s_red[lane] : 0.0f;
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        const float mean_sq = s_red[0] / (float)H;
+        const float rstd = rsqrtf(mean_sq + eps);          // 1 / rms
+
+        // Compute Σ_j x[j] * a[j] * dy[j]
+        float dot = 0.0f;
+        for (int i = tid; i < H; i += blockDim.x) {
+            dot += s_x[i] * s_a[i] * s_dy[i];
+        }
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+        if (lane == 0) s_red[warp_id] = dot;
+        __syncthreads();
+        if (warp_id == 0) {
+            float v = (lane < nwarps) ? s_red[lane] : 0.0f;
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        const float dot_all = s_red[0];
+        const float scale = rstd * rstd * rstd / (float)H * dot_all;
+
+        for (int i = tid; i < H; i += blockDim.x) {
+            dx_row[i] = rstd * s_a[i] * s_dy[i] - scale * s_x[i];
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" void launch_bwd_rmsnorm(
+    const void *x, const void *w, const float *dy, float *dx,
+    int S, int H, float eps, cudaStream_t stream)
+{
+    const int block_size = 256;
+    const int nwarps = block_size / 32;
+    const size_t smem_bytes = (3 * H + nwarps) * sizeof(float);
+
+    static bool cfg = false;
+    if (!cfg) {
+        cudaFuncSetAttribute((void *)bwd_rmsnorm_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        cfg = true;
+    }
+    bwd_rmsnorm_kernel<<<S, block_size, smem_bytes, stream>>>(
+        (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)w, dy, dx, S, H, eps);
+}

@@ -129,6 +129,16 @@ extern "C" void launch_fused_adamw(
     float lr, float beta1, float beta2, float eps, float wd,
     cudaStream_t stream);
 
+extern "C" void launch_bwd_ce_lm_head(
+    const void *final_normed, const void *lm_head_w,
+    int target_token,
+    float *grad_final_normed_out, float *loss_out,
+    cudaStream_t stream);
+
+extern "C" void launch_bwd_rmsnorm(
+    const void *x, const void *w, const float *dy, float *dx,
+    int S, int H, float eps, cudaStream_t stream);
+
 void fused_adamw_step(
     torch::Tensor params,
     torch::Tensor m, torch::Tensor v,
@@ -171,5 +181,39 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
             "Tensor grad, int step, float lr, float beta1, float beta2, "
             "float eps, float wd) -> ()");
     ops.impl("fused_adamw_step", torch::kCUDA, &fused_adamw_step);
+
+    ops.def("bwd_ce_lm_head(Tensor final_normed, Tensor lm_head_w, "
+            "int target_token, Tensor(a!) grad_final_normed, Tensor(b!) loss) -> ()");
+    ops.impl("bwd_ce_lm_head", torch::kCUDA, +[](
+        torch::Tensor final_normed, torch::Tensor lm_head_w,
+        int64_t target_token,
+        torch::Tensor grad_final_normed, torch::Tensor loss) {
+            TORCH_CHECK(final_normed.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(lm_head_w.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(grad_final_normed.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(loss.scalar_type() == torch::kFloat32);
+            launch_bwd_ce_lm_head(
+                final_normed.data_ptr(), lm_head_w.data_ptr(),
+                (int)target_token,
+                (float *)grad_final_normed.data_ptr(),
+                (float *)loss.data_ptr(),
+                c10::cuda::getCurrentCUDAStream().stream());
+        });
+
+    ops.def("bwd_rmsnorm(Tensor x, Tensor w, Tensor dy, Tensor(a!) dx, "
+            "int S, int H, float eps) -> ()");
+    ops.impl("bwd_rmsnorm", torch::kCUDA, +[](
+        torch::Tensor x, torch::Tensor w, torch::Tensor dy, torch::Tensor dx,
+        int64_t S, int64_t H, double eps) {
+            TORCH_CHECK(x.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(w.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(dy.scalar_type() == torch::kFloat32);
+            TORCH_CHECK(dx.scalar_type() == torch::kFloat32);
+            launch_bwd_rmsnorm(
+                x.data_ptr(), w.data_ptr(),
+                (const float *)dy.data_ptr(), (float *)dx.data_ptr(),
+                (int)S, (int)H, (float)eps,
+                c10::cuda::getCurrentCUDAStream().stream());
+        });
 }
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
