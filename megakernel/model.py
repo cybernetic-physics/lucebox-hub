@@ -23,7 +23,10 @@ DN_VALUE_DIM = 128
 DN_QK_SIZE = DN_NUM_HEADS * DN_KEY_DIM
 DN_V_SIZE = DN_NUM_HEADS * DN_VALUE_DIM
 DN_CONV_CHANNELS = DN_QK_SIZE * 2 + DN_V_SIZE
+DN_BETA_ALPHA_SIZE = DN_NUM_HEADS * 2
 DN_CONV_KERNEL = 4
+PREFILL_PROJ_FUSED_SIZE = max(DN_CONV_CHANNELS + DN_V_SIZE + DN_BETA_ALPHA_SIZE, FA_QPROJ_SIZE + 2 * FA_KV_SIZE, INTERMEDIATE_SIZE * 2)
+PREFILL_PROJ_SCRATCH_SIZE = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
 
 LAYER_TYPE = [0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1]
 NVFP4_GROUP_SIZE = 32
@@ -118,6 +121,27 @@ def _quantize_matrix_nvfp4_lm(weight):
     scales = torch.empty((rows // 128) * scale_tiles * 512, dtype=torch.uint8, device=weight.device)
     _quantize_nvfp4_lm_out(packed, scales, weight.contiguous())
     return {"packed": packed, "scales": scales}
+
+
+def _attach_prefill_fused_weights(weights):
+    if "prefill_fused_layer_data" in weights:
+        return
+
+    fused_layer_data = []
+    for ld in weights["layer_data"]:
+        ptrs = ld["ptrs"]
+        if ld["type"] == 1:
+            proj_weight = torch.cat([ptrs[1], ptrs[2], ptrs[3]], dim=0).contiguous()
+            gate_up_weight = torch.cat([ptrs[8], ptrs[9]], dim=0).contiguous()
+        else:
+            proj_weight = torch.cat([ptrs[1], ptrs[2], ptrs[3], ptrs[4]], dim=0).contiguous()
+            gate_up_weight = torch.cat([ptrs[11], ptrs[12]], dim=0).contiguous()
+        fused_layer_data.append({
+            "proj_weight": proj_weight,
+            "gate_up_weight": gate_up_weight,
+        })
+
+    weights["prefill_fused_layer_data"] = fused_layer_data
 
 
 def _attach_nvfp4_weights(weights, group_size=NVFP4_GROUP_SIZE, verbose=True):
@@ -297,6 +321,8 @@ def load_weights(
         total = sum(sum(t.numel() for t in ld["ptrs"]) for ld in layer_data) + lm_head.numel()
         print(f"BF16 weights: {total/1e6:.1f}M params ({total*2/1e6:.0f} MB)")
 
+    _attach_prefill_fused_weights(weights)
+
     if resolved_backend == "nvfp4":
         _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
 
@@ -343,6 +369,21 @@ def _pack_layer_weights_nvfp4(layer_data, group_size):
     return torch.frombuffer(buf, dtype=torch.uint8).cuda()
 
 
+def _pack_prefill_fused_layer_weights(fused_layer_data):
+    ptr_size = 8
+    fields = 2
+    struct_size = ptr_size * fields
+
+    buf = bytearray(NUM_LAYERS * struct_size)
+    for i in range(NUM_LAYERS):
+        ld = fused_layer_data[i]
+        offset = i * struct_size
+        struct.pack_into("Q", buf, offset, ld["proj_weight"].data_ptr())
+        struct.pack_into("Q", buf, offset + ptr_size, ld["gate_up_weight"].data_ptr())
+
+    return torch.frombuffer(buf, dtype=torch.uint8).cuda()
+
+
 class Decoder:
     """Stateful decoder for Qwen3.5-0.8B megakernel backends."""
 
@@ -375,6 +416,7 @@ class Decoder:
             )
         elif self.backend == "nvfp4":
             _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
+        _attach_prefill_fused_weights(weights)
         self.tokenizer = tokenizer
         self._position = 0
         self._weights = weights
@@ -382,6 +424,9 @@ class Decoder:
         self._final_norm_weight = weights["final_norm_weight"]
         self._lm_head_weight = weights["lm_head_weight"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_data"])
+        self._prefill_fused_weights_packed = _pack_prefill_fused_layer_weights(
+            weights["prefill_fused_layer_data"]
+        )
         self._layer_weights_packed_nvfp4 = None
         self._lm_head_weight_packed = None
         self._lm_head_scales = None
@@ -440,13 +485,12 @@ class Decoder:
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32, device="cuda")
-        mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
         self._prefill_buffers = dict(
             hidden=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
             residual=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
             normalized=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
-            proj_buf=torch.empty(max_tokens * mx, **bf16),
-            proj_buf2=torch.empty(max_tokens * mx, **bf16),
+            proj_buf=torch.empty(max_tokens * PREFILL_PROJ_FUSED_SIZE, **bf16),
+            proj_buf2=torch.empty(max_tokens * PREFILL_PROJ_SCRATCH_SIZE, **bf16),
             attn_buf=torch.empty(max_tokens * max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
             mlp_buf=torch.empty(max_tokens * INTERMEDIATE_SIZE, **bf16),
             dn_out_buf=torch.empty(max_tokens * DN_V_SIZE, **bf16),
@@ -473,6 +517,7 @@ class Decoder:
             token_ids,
             self._embed_weight,
             self._layer_weights_packed,
+            self._prefill_fused_weights_packed,
             self._final_norm_weight,
             self._lm_head_weight,
             self._lm_head_weight_packed,

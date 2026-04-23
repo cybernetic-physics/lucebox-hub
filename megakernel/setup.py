@@ -30,8 +30,9 @@ def _int_env(name, default):
 arch = _detect_arch()
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
 lm_block_size = _int_env("MEGAKERNEL_LM_BLOCK_SIZE", 256)
-prefill_dn_block_size = _int_env("MEGAKERNEL_PREFILL_DN_BLOCK_SIZE", 256)
-prefill_dn_blocks_per_head = _int_env("MEGAKERNEL_PREFILL_DN_BLOCKS_PER_HEAD", 4)
+prefill_dn_block_size = _int_env("MEGAKERNEL_PREFILL_DN_BLOCK_SIZE", 128)
+prefill_dn_blocks_per_head = _int_env("MEGAKERNEL_PREFILL_DN_BLOCKS_PER_HEAD", 8)
+prefill_fa_block_size = _int_env("MEGAKERNEL_PREFILL_FA_BLOCK_SIZE", 256)
 
 setup(
     name="qwen35_megakernel_bf16",
@@ -55,6 +56,7 @@ setup(
                     f"-DLM_BLOCK_SIZE={lm_block_size}",
                     f"-DPREFILL_DN_BLOCK_SIZE={prefill_dn_block_size}",
                     f"-DPREFILL_DN_BLOCKS_PER_HEAD={prefill_dn_blocks_per_head}",
+                    f"-DPREFILL_FA_BLOCK_SIZE={prefill_fa_block_size}",
                 ],
             },
             libraries=["cublas", "cublasLt"],
