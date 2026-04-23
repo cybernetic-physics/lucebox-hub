@@ -47,7 +47,10 @@ add_library(dflash27b STATIC
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
-set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "86")
+if(NOT DEFINED DFLASH_CUDA_ARCH)
+    set(DFLASH_CUDA_ARCH "100")  # sm_100 = B200 Blackwell datacenter; override with -DDFLASH_CUDA_ARCH=XX
+endif()
+set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${DFLASH_CUDA_ARCH}")
 
 target_include_directories(dflash27b
     PUBLIC
