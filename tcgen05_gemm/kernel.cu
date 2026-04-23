@@ -144,14 +144,16 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
         }
     };
 
-    // Prologue: issue stage-0 AND stage-1 loads (up to 2 ahead).
-    load_a_tile(0, 0);
-    load_b_tile(0, 0);
-    asm volatile("cp.async.commit_group;\n");
-    if (K_TILES > 1) {
-        load_a_tile(1, 1);
-        load_b_tile(1, 1);
-        asm volatile("cp.async.commit_group;\n");
+    // Deep prologue: preload min(NBUF-1, K_TILES) tiles so the main loop's
+    // cp.async.wait_group can keep NBUF-1 loads in flight.
+    constexpr int PRELOAD = NBUF - 1;
+    #pragma unroll
+    for (int p = 0; p < PRELOAD; p++) {
+        if (p < K_TILES) {
+            load_a_tile(p, p % NBUF);
+            load_b_tile(p, p % NBUF);
+            asm volatile("cp.async.commit_group;\n");
+        }
     }
 
     // --------- 4. Issue MMA chain by one thread ---------
@@ -181,20 +183,22 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     //      consistent shared-mem state with MMA thread's descriptor reads.
     for (int kt = 0; kt < K_TILES; kt++) {
         int buf = kt % NBUF;
-        int prefetch_kt = kt + 2;
+        int prefetch_kt = kt + PRELOAD;
         int prefetch_buf = prefetch_kt % NBUF;
 
-        // Wait for tile kt to be ready. We have up to 2 loads in flight
-        // (tile kt+1 already queued, maybe tile kt+2 about to queue).
+        // Prefetch tile kt + PRELOAD if available, keeping NBUF-1 loads in flight.
         if (prefetch_kt < K_TILES) {
             load_a_tile(prefetch_kt, prefetch_buf);
             load_b_tile(prefetch_kt, prefetch_buf);
             asm volatile("cp.async.commit_group;\n");
-            asm volatile("cp.async.wait_group 2;\n");
-        } else if (kt + 1 < K_TILES) {
-            asm volatile("cp.async.wait_group 1;\n");
+            asm volatile("cp.async.wait_group %0;\n" :: "n"(PRELOAD));
         } else {
-            asm volatile("cp.async.wait_group 0;\n");
+            int remaining = K_TILES - 1 - kt;        // groups still pending after this iter
+            if (remaining > 0) {
+                asm volatile("cp.async.wait_group %0;\n" :: "n"(PRELOAD - 1));
+            } else {
+                asm volatile("cp.async.wait_group 0;\n");
+            }
         }
         __syncthreads();
 
