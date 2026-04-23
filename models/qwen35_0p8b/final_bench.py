@@ -41,6 +41,11 @@ def parse_args():
     parser.add_argument("--hf-pp-runs", type=int, default=3)
     parser.add_argument("--skip-hf", action="store_true")
     parser.add_argument("--verbose-loader", action="store_true")
+    parser.add_argument("--prefill-mode", default="eager",
+                        choices=("eager", "mega"),
+                        help="'eager' = cuBLAS+launches prefill (prefill_bf16); "
+                             "'mega' = single-dispatch persistent megakernel "
+                             "(prefill_bf16_mega)")
     return parser.parse_args()
 
 
@@ -86,10 +91,37 @@ def get_prefill_op(decoder):
     return ops.prefill_bf16
 
 
-def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
+def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op, use_mega=False):
     decoder.reset()
     if decoder.backend == "nvfp4":
         return decoder.prefill_tokens(ids_t)
+    elif use_mega:
+        prefill_op(
+            decoder._out_token,
+            ids_t,
+            decoder._embed_weight,
+            decoder._layer_weights_packed,
+            decoder._final_norm_weight,
+            decoder._lm_head_weight,
+            decoder._fa_k_cache,
+            decoder._fa_v_cache,
+            decoder._dn_states,
+            decoder._conv_bufs,
+            buffers["hidden"],
+            buffers["residual"],
+            buffers["normalized"],
+            buffers["proj_buf"],
+            buffers["proj_buf2"],
+            buffers["attn_buf"],
+            buffers["mlp_buf"],
+            buffers["dn_out_buf"],
+            buffers["beta_buf"],
+            buffers["alpha_buf"],
+            buffers["final_normed"],
+            buffers["hidden_bf16_out"],
+            buffers["lm_bmv"],
+            buffers["lm_bmi"],
+        )
     else:
         prefill_op(
             decoder._out_token,
@@ -124,10 +156,21 @@ def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
 
 
 def benchmark_megakernel(decoder, tokenizer, prompt_ids, args):
-    prefill_op = get_prefill_op(decoder)
+    use_mega = getattr(args, "prefill_mode", "eager") == "mega" and decoder.backend != "nvfp4"
+    if use_mega:
+        prefill_op = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16_mega
+    else:
+        prefill_op = get_prefill_op(decoder)
     prompt_len = len(prompt_ids)
-    ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
-    buffers = alloc_prefill_buffers(prompt_len)
+    if use_mega:
+        padded_len = ((prompt_len + 31) // 32) * 32
+        ids_t = torch.zeros(padded_len, dtype=torch.int32, device="cuda")
+        ids_t[:prompt_len] = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+        ids_t = ids_t[:prompt_len]  # pass actual length; kernel reads only 0..prompt_len
+        buffers = alloc_prefill_buffers(padded_len)
+    else:
+        ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
+        buffers = alloc_prefill_buffers(prompt_len)
 
     print(f"Backend: {decoder.backend_label}", flush=True)
     print(
@@ -136,12 +179,12 @@ def benchmark_megakernel(decoder, tokenizer, prompt_ids, args):
     )
 
     for _ in range(args.our_warmup_runs):
-        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op)
+        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op, use_mega=use_mega)
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     for _ in range(args.our_pp_runs):
-        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op)
+        run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op, use_mega=use_mega)
         torch.cuda.synchronize()
     our_pp_ms = (time.perf_counter() - t0) / args.our_pp_runs * 1000.0
     our_pp_tps = prompt_len / our_pp_ms * 1000.0
@@ -155,7 +198,7 @@ def benchmark_megakernel(decoder, tokenizer, prompt_ids, args):
         backend=args.backend,
         verbose=args.verbose_loader,
     )
-    first = run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op)
+    first = run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op, use_mega=use_mega)
     decoded_ids = [first]
     eos = tokenizer.eos_token_id
 

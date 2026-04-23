@@ -9,8 +9,12 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 
 #include <algorithm>
+#include <cstdlib>
+
+namespace cg = cooperative_groups;
 
 // =============================================================================
 // Model constants
@@ -111,32 +115,17 @@ struct LayerWeights {
 };
 
 // =============================================================================
-// Atomic barrier
+// Grid-wide barrier (cooperative launch). The previous hand-rolled
+// fence.acq_rel.gpu + atomicAdd barrier made no forward progress on sm_100
+// (B200) when launched with a block count >= its SM count minus a few,
+// presumably because L2 ordering differs on Blackwell datacenter. The NVFP4
+// path (kernel_gb10_nvfp4.cu) already uses cg::this_grid().sync() and is
+// happy on both GB10 and B200, so we use the same primitive here.
 // =============================================================================
 
 struct AtomicGridSync {
-    unsigned int *counter;
-    unsigned int *generation;
-    unsigned int nblocks;
-    unsigned int local_gen;
-
-    __device__ void sync() {
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            unsigned int my_gen = local_gen;
-            asm volatile("fence.acq_rel.gpu;" ::: "memory");
-            unsigned int arrived = atomicAdd(counter, 1);
-            if (arrived == nblocks - 1) {
-                *counter = 0;
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
-                atomicAdd(generation, 1);
-            } else {
-                volatile unsigned int *vgen = (volatile unsigned int *)generation;
-                while (*vgen <= my_gen) {}
-            }
-            local_gen = my_gen + 1;
-        }
-        __syncthreads();
+    __device__ __forceinline__ void sync() {
+        cg::this_grid().sync();
     }
 };
 
@@ -759,9 +748,7 @@ __global__ void lm_head_kernel(
     const float *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ weight,   // [VOCAB, HIDDEN] bf16
     float *__restrict__ block_max_vals,
-    int *__restrict__ block_max_idxs,
-    int *__restrict__ output_token,
-    unsigned int *__restrict__ sync_counter)
+    int *__restrict__ block_max_idxs)
 {
     __shared__ float s_hidden[HIDDEN_SIZE];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LM_BLOCK_SIZE) s_hidden[i] = hidden[i];
@@ -801,18 +788,29 @@ __global__ void lm_head_kernel(
         }
         if (lane_id == 0) { block_max_vals[blockIdx.x] = mv; block_max_idxs[blockIdx.x] = mi; }
     }
-    __syncthreads();
-    if (threadIdx.x == 0) { __threadfence(); atomicAdd(sync_counter, 1); }
-    if (blockIdx.x == 0) {
-        if (threadIdx.x == 0) { volatile unsigned int *vc = (volatile unsigned int *)sync_counter; while (*vc < (unsigned int)gridDim.x) {} __threadfence(); }
-        __syncthreads();
-        int tid = threadIdx.x; float bv = -INFINITY; int bi = -1;
-        for (int i = tid; i < gridDim.x; i += LM_BLOCK_SIZE) { float v = block_max_vals[i]; if (v > bv) { bv = v; bi = block_max_idxs[i]; } }
-        __shared__ float sv[256]; __shared__ int si[256];
-        sv[tid] = bv; si[tid] = bi; __syncthreads();
-        for (int s = LM_BLOCK_SIZE/2; s > 0; s >>= 1) { if (tid < s && sv[tid+s] > sv[tid]) { sv[tid] = sv[tid+s]; si[tid] = si[tid+s]; } __syncthreads(); }
-        if (tid == 0) *output_token = si[0];
+}
+
+__global__ void lm_head_reduce_kernel_bf16(
+    const float *__restrict__ block_max_vals,
+    const int *__restrict__ block_max_idxs,
+    int *__restrict__ output_token,
+    int num_blocks)
+{
+    int tid = threadIdx.x;
+    float bv = -INFINITY; int bi = -1;
+    for (int i = tid; i < num_blocks; i += blockDim.x) {
+        float v = block_max_vals[i];
+        if (v > bv) { bv = v; bi = block_max_idxs[i]; }
     }
+    __shared__ float sv[LM_BLOCK_SIZE];
+    __shared__ int si[LM_BLOCK_SIZE];
+    sv[tid] = bv; si[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && sv[tid + s] > sv[tid]) { sv[tid] = sv[tid + s]; si[tid] = si[tid + s]; }
+        __syncthreads();
+    }
+    if (tid == 0) *output_token = si[0];
 }
 
 // =============================================================================
@@ -845,21 +843,12 @@ decode_kernel(
     int input_token_id, int position, int max_seq_len)
 {
     int block_id = blockIdx.x;
-    int num_blocks = gridDim.x;
+    // barrier_counter / barrier_generation are kept on the arg list for ABI
+    // compatibility but unused now that we sync via cg::this_grid().
+    (void)barrier_counter;
+    (void)barrier_generation;
 
-    // Initialize barrier
-    if (block_id == 0 && threadIdx.x == 0) { *barrier_counter = 0; *barrier_generation = 0; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        asm volatile("fence.acq_rel.gpu;" ::: "memory");
-        unsigned int arrived = atomicAdd(barrier_counter, 1);
-        if (arrived == (unsigned int)num_blocks - 1) { *barrier_counter = 0; asm volatile("fence.acq_rel.gpu;" ::: "memory"); atomicAdd(barrier_generation, 1); }
-        else { volatile unsigned int *vg = (volatile unsigned int *)barrier_generation; while (*vg == 0) {} }
-        asm volatile("fence.acq_rel.gpu;" ::: "memory");
-    }
-    __syncthreads();
-
-    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 1};
+    AtomicGridSync grid{};
 
     // Shared memory: large enough for max(HIDDEN_SIZE bf16, INTERMEDIATE_SIZE f32)
     __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
@@ -934,43 +923,98 @@ extern "C" void launch_decode(
     unsigned int *lm_sync_counter,
     int position, int max_seq_len, cudaStream_t stream)
 {
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, device);
+    static int cached_decode_blocks = 0;
+    static int cached_lm_blocks = 0;
+    if (cached_decode_blocks == 0) {
+        if (const char *override_blocks = std::getenv("MEGAKERNEL_DECODE_BLOCKS")) {
+            int v = std::atoi(override_blocks);
+            if (v > 0) cached_decode_blocks = v;
+        }
+        if (cached_decode_blocks == 0) {
+            int device = 0;
+            cudaGetDevice(&device);
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, device);
+            int active = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, decode_kernel, BLOCK_SIZE, 0);
+            cached_decode_blocks = std::max(1, active * prop.multiProcessorCount);
+        }
+    }
+    if (cached_lm_blocks == 0) {
+        if (const char *override_blocks = std::getenv("MEGAKERNEL_LM_BLOCKS")) {
+            int v = std::atoi(override_blocks);
+            if (v > 0) cached_lm_blocks = v;
+        }
+        if (cached_lm_blocks == 0) {
+            int device = 0;
+            cudaGetDevice(&device);
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, device);
+            int active = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, lm_head_kernel, LM_BLOCK_SIZE, 0);
+            int resident = std::max(1, active * prop.multiProcessorCount);
+            int target = std::max(resident, prop.multiProcessorCount * 8);
+            cached_lm_blocks = std::min(1024, target);
+        }
+    }
 
-    int active_decode_blocks = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_decode_blocks, decode_kernel, BLOCK_SIZE, 0);
-    int decode_blocks = std::max(1, active_decode_blocks * prop.multiProcessorCount);
+    const void *embed_w_arg = embed_weight;
+    const void *final_norm_w_arg = final_norm_weight;
+    const void *lm_head_w_arg = lm_head_weight;
+    const LayerWeights *layer_weights_arg = layer_weights;
+    void *fa_k_cache_arg = fa_k_cache;
+    void *fa_v_cache_arg = fa_v_cache;
+    void *dn_states_arg = dn_states;
+    void *conv_bufs_arg = conv_bufs;
+    void *hidden_buffer_arg = hidden_buffer;
+    void *g_activations_arg = g_activations;
+    void *g_residual_arg = g_residual;
+    void *g_qkv_scratch_arg = g_qkv_scratch;
+    void *g_kv_scratch_arg = g_kv_scratch;
+    void *g_attn_out_arg = g_attn_out;
+    void *g_mlp_inter_arg = g_mlp_inter;
+    void *g_z_scratch_arg = g_z_scratch;
+    void *g_beta_scratch_arg = g_beta_scratch;
+    void *g_alpha_scratch_arg = g_alpha_scratch;
+    void *g_normalized_arg = g_normalized;
+    unsigned int *barrier_counter_arg = barrier_counter;
+    unsigned int *barrier_generation_arg = barrier_generation;
+    int input_token_id_arg = input_token_id;
+    int position_arg = position;
+    int max_seq_len_arg = max_seq_len;
 
-    decode_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
-        (const __nv_bfloat16 *)embed_weight,
-        (const __nv_bfloat16 *)final_norm_weight,
-        (const __nv_bfloat16 *)lm_head_weight,
-        layer_weights,
-        (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
-        (float *)dn_states, (float *)conv_bufs,
-        (__nv_bfloat16 *)hidden_buffer,
-        (float *)g_activations, (__nv_bfloat16 *)g_residual,
-        (float *)g_qkv_scratch, (float *)g_kv_scratch,
-        (float *)g_attn_out, (float *)g_mlp_inter,
-        (float *)g_z_scratch, (float *)g_beta_scratch,
-        (float *)g_alpha_scratch, (float *)g_normalized,
-        barrier_counter, barrier_generation,
-        input_token_id, position, max_seq_len);
+    void *decode_args[] = {
+        (void *)&embed_w_arg,
+        (void *)&final_norm_w_arg,
+        (void *)&lm_head_w_arg,
+        (void *)&layer_weights_arg,
+        (void *)&fa_k_cache_arg, (void *)&fa_v_cache_arg,
+        (void *)&dn_states_arg, (void *)&conv_bufs_arg,
+        (void *)&hidden_buffer_arg,
+        (void *)&g_activations_arg, (void *)&g_residual_arg,
+        (void *)&g_qkv_scratch_arg, (void *)&g_kv_scratch_arg,
+        (void *)&g_attn_out_arg, (void *)&g_mlp_inter_arg,
+        (void *)&g_z_scratch_arg, (void *)&g_beta_scratch_arg,
+        (void *)&g_alpha_scratch_arg, (void *)&g_normalized_arg,
+        (void *)&barrier_counter_arg, (void *)&barrier_generation_arg,
+        (void *)&input_token_id_arg, (void *)&position_arg, (void *)&max_seq_len_arg,
+    };
+    cudaLaunchCooperativeKernel(
+        (void *)decode_kernel,
+        dim3(cached_decode_blocks),
+        dim3(BLOCK_SIZE),
+        decode_args,
+        0,
+        stream);
 
-    cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
+    (void)lm_sync_counter;
 
-    int active_lm_blocks = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_lm_blocks, lm_head_kernel, LM_BLOCK_SIZE, 0);
-    int resident_lm_blocks = std::max(1, active_lm_blocks * prop.multiProcessorCount);
-    int lm_blocks = std::min(1024, std::max(resident_lm_blocks, prop.multiProcessorCount * 8));
-
-    lm_head_kernel<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
+    lm_head_kernel<<<cached_lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
-        block_max_vals, block_max_idxs,
-        output_token_id, lm_sync_counter);
+        block_max_vals, block_max_idxs);
+    lm_head_reduce_kernel_bf16<<<1, LM_BLOCK_SIZE, 0, stream>>>(
+        block_max_vals, block_max_idxs, output_token_id, cached_lm_blocks);
 }

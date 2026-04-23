@@ -44,6 +44,7 @@ setup(
                 "kernel.cu",
                 "kernel_gb10_nvfp4.cu",
                 "prefill.cu",
+                "prefill_megakernel.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3"],

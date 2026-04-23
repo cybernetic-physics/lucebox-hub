@@ -11,6 +11,12 @@
   <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
+<p align="center">
+  Additional per-arch benchmark notes:
+  <a href="../../docs/results/qwen35_0p8b_b200.md">B200 / sm_100</a> ·
+  <a href="../../docs/results/qwen35_0p8b_gb10.md">GB10 / sm_121a</a>
+</p>
+
 ---
 
 ```
