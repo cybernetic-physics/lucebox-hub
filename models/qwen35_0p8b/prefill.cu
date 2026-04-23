@@ -112,8 +112,17 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
 // Grid: (S, DN_HEADS). Block: 128 threads (4 warps). Each block handles
 // one (t, h) — computes conv for the 384 per-head channels (3 per
 // thread), normalizes q and k, and writes processed beta/decay.
+// IMPORTANT: pf_dn_prep must NOT overwrite qkv_proj in place. Grid scheduling
+// on CUDA is unordered across blocks within a single kernel launch, so a
+// block at (t, h) may read qkv_proj[t-3 .. t-1] AFTER the block at (t-1, h)
+// has already written post-silu/post-norm values there. That races in the
+// conv1d inputs and corrupts downstream DeltaNet state.
+//
+// Fix: write to a SEPARATE `qkv_prepped` output buffer. The downstream
+// recurrence kernel reads from this buffer, not qkv_proj.
 __global__ void pf_dn_prep(
-    __nv_bfloat16 *qkv_proj,                // IN raw / OUT post-conv-silu-norm
+    const __nv_bfloat16 *qkv_proj,           // IN only (raw, stays intact)
+    __nv_bfloat16 *qkv_prepped,              // OUT post-conv-silu-norm
     const __nv_bfloat16 *conv_w,
     const float *conv_buf,                   // IN only (history from prior prefill)
     const __nv_bfloat16 *a_log,
@@ -191,7 +200,7 @@ __global__ void pf_dn_prep(
     }
     __syncthreads();
 
-    // Write post-silu/post-norm values back to qkv_proj.
+    // Write post-silu/post-norm values to the SEPARATE output buffer.
     for (int c = tid; c < QKV_CH; c += blockDim.x) {
         int gch;
         float val;
@@ -205,7 +214,7 @@ __global__ void pf_dn_prep(
             gch = 2 * DN_QK_SIZE + h * DN_VAL + (c - 2 * DN_KEY);
             val = s_v[c - 2 * DN_KEY];
         }
-        qkv_proj[t * DN_CONV_CH + gch] = __float2bfloat16(val);
+        qkv_prepped[t * DN_CONV_CH + gch] = __float2bfloat16(val);
     }
 }
 
@@ -1000,6 +1009,10 @@ static void prefill_bf16_body(
     int lora_rank, float lora_scaling, __nv_bfloat16 *lora_h_ws,
     // Saved activations for backward (optional — all-null → inference-only)
     SavedActivationsPF saved,
+    // Output buffer for pf_dn_prep (sized [S, DN_CONV_CH] bf16). Must be
+    // DISTINCT from proj_buf so blocks in pf_dn_prep don't race on reads
+    // of the raw qkv values at (t-3..t-1) positions — see pf_dn_prep docs.
+    __nv_bfloat16 *dn_qkv_prepped_scratch,
     cudaStream_t stream)
 {
     int bk = (S*HIDDEN+255)/256;
@@ -1056,30 +1069,37 @@ static void prefill_bf16_body(
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
-            // Update conv_buf with last 4 RAW qkv_proj positions for next
-            // prefill call continuity — must run BEFORE pf_dn_prep overwrites
-            // qkv_proj with post-silu/post-norm values.
+            // Pre-pass: compute conv+silu+L2norm(q,k) for all (t, h) in
+            // parallel, compute sigmoid(beta) and decay. Writes POST-processed
+            // values to dn_qkv_prepped (NOT proj_buf — see pf_dn_prep docs
+            // for the race-free buffer requirement). Grid (S, DN_HEADS).
+            //
+            // IMPORTANT: this must run BEFORE pf_dn_conv_buf_update so that
+            // pf_dn_prep reads the PRIOR conv history from conv_bufs. If we
+            // updated conv_bufs first, pf_dn_prep at t=0..2 would see this
+            // prefill's own tail positions as "prior history" and silently
+            // corrupt the recurrence. (Prior code had this reversed because
+            // pf_dn_prep used to overwrite qkv_proj in-place; now that it
+            // writes to a separate scratch we reorder.)
+            {
+                dim3 grid(S, DN_HEADS);
+                pf_dn_prep<<<grid, 128, 0, stream>>>(
+                    proj_buf, dn_qkv_prepped_scratch, conv_w,
+                    conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
+                    a_log, dt_bias, beta_buf, alpha_buf, S);
+            }
+
+            // Persist the last 4 raw qkv positions into conv_bufs for the
+            // next prefill/decode call's conv history.
             {
                 int conv_update_blocks = (DN_CONV_CH + 127) / 128;
                 pf_dn_conv_buf_update<<<conv_update_blocks, 128, 0, stream>>>(
                     proj_buf, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
             }
 
-            // Pre-pass: compute conv+silu+L2norm(q,k) for all (t, h) in
-            // parallel, compute sigmoid(beta) and decay, overwrite the
-            // respective scratch buffers in place. Grid (S, DN_HEADS).
-            {
-                dim3 grid(S, DN_HEADS);
-                pf_dn_prep<<<grid, 128, 0, stream>>>(
-                    proj_buf, conv_w,
-                    conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
-                    a_log, dt_bias, beta_buf, alpha_buf, S);
-            }
-
             // V-split recurrence: each block owns a V-slice of one head's
             // recurrence state and runs the full S sequential steps on it.
-            // Now reads pre-processed q/k/v/beta/decay — NO conv, normalize,
-            // beta/decay or per-step __syncthreads in the recurrence.
+            // Reads pre-processed q/k/v/beta/decay from dn_qkv_prepped.
             int num_v_splits = 8;
             int dn_block_size = 512;
             if (const char *env = std::getenv("MEGAKERNEL_DN_V_SPLITS")) {
@@ -1094,7 +1114,7 @@ static void prefill_bf16_body(
             int nwarps_want = dn_block_size / 32;
             while (v_slice < nwarps_want) { dn_block_size >>= 1; nwarps_want = dn_block_size / 32; }
             pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
-                proj_buf, beta_buf, alpha_buf,
+                dn_qkv_prepped_scratch, beta_buf, alpha_buf,
                 dn_states + dn_idx*dn_stride,
                 dn_out_buf, S, num_v_splits);
             // Gnorm + silu-mul with z, applied across full V per (t, head).
@@ -1276,6 +1296,18 @@ extern "C" void launch_prefill_bf16(
     }
     cublasSetStream(cublas, stream);
 
+    // Internal scratch for pf_dn_prep's race-free output. Sized to the
+    // largest seq_len seen so far. Kept in a static allocator so we don't
+    // need Python callers to plumb yet another buffer.
+    static __nv_bfloat16 *dn_qkv_prepped = nullptr;
+    static size_t dn_qkv_prepped_capacity = 0;
+    size_t need_bytes = (size_t)seq_len * DN_CONV_CH * sizeof(__nv_bfloat16);
+    if (need_bytes > dn_qkv_prepped_capacity) {
+        if (dn_qkv_prepped) cudaFree(dn_qkv_prepped);
+        cudaMalloc(&dn_qkv_prepped, need_bytes);
+        dn_qkv_prepped_capacity = need_bytes;
+    }
+
     bool disable_graph = std::getenv("MEGAKERNEL_PREFILL_NOGRAPH") != nullptr;
 
     PrefillGraphKey key{};
@@ -1359,7 +1391,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
         if (hit) hit->eager_runs++;
         return;
     }
@@ -1382,7 +1414,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
         return;
     }
 
@@ -1412,7 +1444,7 @@ extern "C" void launch_prefill_bf16(
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, capture_stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, capture_stream);
     {
         cudaGraph_t graph = nullptr;
         err = cudaStreamEndCapture(capture_stream, &graph);
@@ -1460,7 +1492,7 @@ fallback_eager:
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);
     if (hit) {
         hit->eager_runs++;  // stay in warmup until capture finally works
     }
