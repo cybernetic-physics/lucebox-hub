@@ -31,6 +31,18 @@ def main():
     print("Check row 0 cols 0..7 across lanes 0..7:")
     # If layout is lane=col within each 8-col stripe, then lane 0..7's reg 0 covers row 0
     # (under my current code path)
+    # Diagnose: where does C[0,1] actually live in ref?
+    target = C[0, 1].item()
+    print(f"\nC[0, 1] = {target:.6f}")
+    diffs = (ref[0, :].cpu() - target).abs()
+    best_j = int(diffs.argmin())
+    print(f"closest ref[0, j] is at j={best_j} with value {ref[0, best_j].item():.6f} (|Δ|={diffs[best_j].item():.2e})")
+    # Same for C[0, 2..7]
+    for i in range(2, 8):
+        target = C[0, i].item()
+        diffs = (ref[0, :].cpu() - target).abs()
+        best_j = int(diffs.argmin())
+        print(f"C[0, {i}] = {target:.4f} → ref[0, {best_j}] = {ref[0, best_j].item():.4f}  (|Δ|={diffs[best_j].item():.2e})")
     exact = (C - ref).abs() < 1e-3
     hits = exact.nonzero()
     print(f"exact matches count: {hits.shape[0]}")
