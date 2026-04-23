@@ -51,7 +51,7 @@ setup(
                     f"-DLM_BLOCK_SIZE={lm_block_size}",
                 ],
             },
-            libraries=["cublas"],
+            libraries=["cublas", "cublasLt"],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

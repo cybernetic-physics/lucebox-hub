@@ -27,16 +27,22 @@ DN_CONV_KERNEL = 4
 
 LAYER_TYPE = [0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1]
 NVFP4_GROUP_SIZE = 32
+NVFP4_LM_GROUP_SIZE = 16
+LM_HEAD_TENSORCORE_N = 16
+LM_HEAD_TENSORCORE_PACKED_BYTES = LM_HEAD_TENSORCORE_N * (HIDDEN_SIZE // 2)
+LM_HEAD_TENSORCORE_SCALE_BYTES = ((LM_HEAD_TENSORCORE_N + 127) // 128) * (HIDDEN_SIZE // 64) * 512
 
 _decode = None
 _decode_nvfp4 = None
 _decode_many_nvfp4 = None
 _prefill_bf16 = None
 _quantize_nvfp4_out = None
+_quantize_nvfp4_lm_out = None
 
 
 def _load_op():
-    global _decode, _decode_nvfp4, _decode_many_nvfp4, _prefill_bf16, _quantize_nvfp4_out
+    global _decode, _decode_nvfp4, _decode_many_nvfp4
+    global _prefill_bf16, _quantize_nvfp4_out, _quantize_nvfp4_lm_out
     if _decode is None:
         import qwen35_megakernel_bf16_C
         ops = torch.ops.qwen35_megakernel_bf16_C
@@ -45,6 +51,7 @@ def _load_op():
         _decode_many_nvfp4 = ops.decode_many_nvfp4
         _prefill_bf16 = ops.prefill_bf16
         _quantize_nvfp4_out = ops.quantize_nvfp4_out
+        _quantize_nvfp4_lm_out = ops.quantize_nvfp4_lm_out
 
 
 def _resolve_backend(backend):
@@ -79,8 +86,32 @@ def _quantize_matrix_nvfp4(weight, group_size):
     return {"packed": packed, "scales": scales}
 
 
+def _quantize_matrix_nvfp4_lm(weight):
+    _load_op()
+    if weight.dtype != torch.bfloat16:
+        raise TypeError(f"expected bfloat16 weight, got {weight.dtype}")
+    if weight.dim() != 2:
+        raise ValueError(f"expected 2D weight, got shape {tuple(weight.shape)}")
+
+    rows, cols = weight.shape
+    if rows % 128 != 0:
+        raise ValueError(f"lm_head out_dim {rows} must be divisible by 128")
+    if cols % 64 != 0:
+        raise ValueError(f"lm_head in_dim {cols} must be divisible by 64")
+
+    scale_tiles = cols // 64
+    packed = torch.empty((rows, cols // 2), dtype=torch.uint8, device=weight.device)
+    scales = torch.empty((rows // 128) * scale_tiles * 512, dtype=torch.uint8, device=weight.device)
+    _quantize_nvfp4_lm_out(packed, scales, weight.contiguous())
+    return {"packed": packed, "scales": scales}
+
+
 def _attach_nvfp4_weights(weights, group_size=NVFP4_GROUP_SIZE, verbose=True):
-    if "nvfp4" in weights and weights["nvfp4"]["group_size"] == group_size:
+    if (
+        "nvfp4" in weights
+        and weights["nvfp4"]["group_size"] == group_size
+        and weights["nvfp4"].get("lm_group_size") == NVFP4_LM_GROUP_SIZE
+    ):
         return weights
 
     if verbose:
@@ -144,12 +175,13 @@ def _attach_nvfp4_weights(weights, group_size=NVFP4_GROUP_SIZE, verbose=True):
             packed_bytes += q["packed"].numel() * q["packed"].element_size()
             scale_bytes += q["scales"].numel() * q["scales"].element_size()
 
-    lm_head_nvfp4 = _quantize_matrix_nvfp4(weights["lm_head_weight"], group_size)
+    lm_head_nvfp4 = _quantize_matrix_nvfp4_lm(weights["lm_head_weight"])
     packed_bytes += lm_head_nvfp4["packed"].numel() * lm_head_nvfp4["packed"].element_size()
     scale_bytes += lm_head_nvfp4["scales"].numel() * lm_head_nvfp4["scales"].element_size()
 
     weights["nvfp4"] = {
         "group_size": group_size,
+        "lm_group_size": NVFP4_LM_GROUP_SIZE,
         "layer_data": layer_data_nvfp4,
         "lm_head_weight_packed": lm_head_nvfp4["packed"],
         "lm_head_scales": lm_head_nvfp4["scales"],
@@ -341,6 +373,7 @@ class Decoder:
             self._lm_head_scales = nvfp4["lm_head_scales"]
 
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
+        f16 = dict(dtype=torch.float16, device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32, device="cuda")
         u32 = dict(dtype=torch.uint32, device="cuda")
@@ -365,6 +398,10 @@ class Decoder:
         self._beta_scratch = torch.empty(DN_NUM_HEADS, **f32)
         self._alpha_scratch = torch.empty(DN_NUM_HEADS, **f32)
         self._normalized = torch.empty(HIDDEN_SIZE, **f32)
+        self._lm_hidden_bf16 = torch.empty((LM_HEAD_TENSORCORE_N, HIDDEN_SIZE), **bf16)
+        self._lm_hidden_packed = torch.empty(LM_HEAD_TENSORCORE_PACKED_BYTES, dtype=torch.uint8, device="cuda")
+        self._lm_hidden_scales = torch.empty(LM_HEAD_TENSORCORE_SCALE_BYTES, dtype=torch.uint8, device="cuda")
+        self._lm_logits_f16 = torch.empty((LM_HEAD_TENSORCORE_N, VOCAB_SIZE), **f16)
 
         self._barrier_counter = torch.zeros(1, **u32)
         self._barrier_generation = torch.zeros(1, **u32)
@@ -380,6 +417,7 @@ class Decoder:
                 self._out_token, token_id,
                 self._embed_weight, self._layer_weights_packed_nvfp4,
                 self._final_norm_weight, self._lm_head_weight_packed, self._lm_head_scales,
+                self._lm_hidden_bf16, self._lm_hidden_packed, self._lm_hidden_scales, self._lm_logits_f16,
                 self._fa_k_cache, self._fa_v_cache,
                 self._dn_states, self._conv_bufs,
                 self._hidden, self._activations, self._residual,
@@ -424,6 +462,7 @@ class Decoder:
             output_tokens, self._out_token, token_id,
             self._embed_weight, self._layer_weights_packed_nvfp4,
             self._final_norm_weight, self._lm_head_weight_packed, self._lm_head_scales,
+            self._lm_hidden_bf16, self._lm_hidden_packed, self._lm_hidden_scales, self._lm_logits_f16,
             self._fa_k_cache, self._fa_v_cache,
             self._dn_states, self._conv_bufs,
             self._hidden, self._activations, self._residual,
