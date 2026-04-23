@@ -199,75 +199,160 @@ __device__ void phase_rmsnorm(
 }
 
 // ============================================================================
-// GEMM primitives: tensor-core WMMA 16×16×16 bf16 tiles with f32 accumulation.
+// GEMM primitives: WMMA 16×16×16 bf16 tiles, f32 accumulation,
+// cp.async double-buffered K-pipeline.
 //
-// Output layout: Y[S, N] = X[S, K] @ W[N, K]^T  (W stored row-major).
-// Each warp computes one 16×16 output tile. With NW=16 warps/block and 148
-// blocks on B200, the grid holds 2368 warps — each owns one tile and strides
-// through the (S/16)*(N/16) output grid.
+// Layout per block:
+//   Each block owns a [M_BLK=16, N_BLK=NW*16=256] output macro tile.
+//   All NW warps share the same 16-row A-slab; each warp's 16-col B-slab
+//   is contiguous within a single shared-memory B buffer.
 //
-// Preconditions (enforced by caller):
-//   - S % 16 == 0   (pad tokens to multiple of 16 in Python)
-//   - K % 16 == 0   (true for every K in Qwen 3.5-0.8B — HIDDEN/INTER/FA_Q_SIZE/DN_V_SIZE)
-//   - N % 16 == 0   (true for every output projection in Qwen 3.5-0.8B)
+// Pipeline:
+//   Stage N's cp.async is issued while stage N-1's MMA runs. cp.async.wait_group
+//   blocks only on commits older than the one in flight, letting the tensor
+//   cores overlap with loads.
+//
+// Memory:
+//   s_A[2][16][K_TILE=32]                = 2 KB
+//   s_B[2][N_BLK=256][K_TILE=32]         = 32 KB
+//   s_store[NW=16][16*16 f32]            = 16 KB
+//   total                                = 50 KB → needs opt-in via
+//                                          cudaFuncAttributeMaxDynamicSharedMemorySize
+//
+// Preconditions:
+//   - S % 16 == 0, K % 32 == 0, N % 256 == 0  (all satisfied by Qwen 3.5-0.8B)
 // ============================================================================
+
+constexpr int GEMM_M_BLK = 16;
+constexpr int GEMM_N_BLK = NW * 16;   // 256
+constexpr int GEMM_K_TILE = 32;       // 2 MMAs per K-chunk
+
+__device__ __forceinline__ void cp_async_16B(void *smem_dst, const void *global_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                 :: "r"(smem_addr), "l"(global_src));
+}
 
 template <typename T>
 __device__ void gemm_wmma_core(
     const __nv_bfloat16 *__restrict__ X, int K,
     const __nv_bfloat16 *__restrict__ W,
-    T *__restrict__ Y,                      // bf16 or float
-    const __nv_bfloat16 *__restrict__ R,    // optional residual (bf16) - nullptr if none
+    T *__restrict__ Y,
+    const __nv_bfloat16 *__restrict__ R,
     int S, int N)
 {
-    const int warp_block = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int warps_grid = gridDim.x * NW;
-    const int warp_grid = blockIdx.x * NW + warp_block;
+    const int tid = threadIdx.x;
+    const int warp_block = tid >> 5;
+    const int lane = tid & 31;
+
     const int tiles_M = S >> 4;
-    const int tiles_N = N >> 4;
-    const int total_tiles = tiles_M * tiles_N;
+    const int tiles_N = N / GEMM_N_BLK;
+    const int total_macro = tiles_M * tiles_N;
 
-    // Shared memory f32 tile per warp for store_matrix_sync -> bf16 conversion.
-    extern __shared__ float s_tiles_raw[];
-    float *s_tile = s_tiles_raw + warp_block * 256;
+    // Shared memory layout — offsets in bytes from smem_raw base.
+    //   s_A: 2 * 16 * 32 * 2 = 2048  B
+    //   s_B: 2 * 256 * 32 * 2 = 32768 B
+    //   s_store: NW * 256 * 4 = 16384 B
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16 *s_A = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
+    __nv_bfloat16 *s_B = s_A + 2 * GEMM_M_BLK * GEMM_K_TILE;          // after A
+    float *s_store = reinterpret_cast<float *>(
+        s_B + 2 * GEMM_N_BLK * GEMM_K_TILE);                           // after B
+    float *s_tile_warp = s_store + warp_block * 256;
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a0, a1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b0, b1;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
 
-    for (int t = warp_grid; t < total_tiles; t += warps_grid) {
-        int tm = t / tiles_N;
-        int tn = t % tiles_N;
+    // A-load helper: warp 0 loads 16 rows × 32 cols = 512 bf16 = 1024 bytes
+    // via 64 × 16-byte cp.asyncs (each covers 8 bf16 = 16 bytes).
+    // Warp 0 (32 threads) → 2 loads per thread, 4 col-segments per row.
+    auto load_A = [&](int buf, int s_start, int k_off) {
+        __nv_bfloat16 *A_buf = s_A + buf * GEMM_M_BLK * GEMM_K_TILE;
+        if (warp_block == 0) {
+            #pragma unroll
+            for (int it = 0; it < 2; it++) {
+                int i = lane + it * 32;         // 0..64
+                int r = i >> 2;                  // 0..16
+                int c = (i & 3) << 3;            // 0, 8, 16, 24
+                __nv_bfloat16 *dst = A_buf + r * GEMM_K_TILE + c;
+                const __nv_bfloat16 *src = X + (s_start + r) * K + k_off + c;
+                cp_async_16B(dst, src);
+            }
+        }
+    };
+
+    // B-load helper: 512 threads load 256 rows × 32 cols = 8192 bf16 = 16384 bytes
+    // via 1024 × 16-byte cp.asyncs. 512 threads → 2 loads per thread, each row has
+    // 4 col-segments (0, 8, 16, 24 in bf16 offsets).
+    auto load_B = [&](int buf, int n_block_start, int k_off) {
+        __nv_bfloat16 *B_buf = s_B + buf * GEMM_N_BLK * GEMM_K_TILE;
+        #pragma unroll
+        for (int it = 0; it < 2; it++) {
+            int i = tid + it * 512;       // 0..1024
+            int r = i >> 2;                // 0..256
+            int c = (i & 3) << 3;          // 0, 8, 16, 24
+            __nv_bfloat16 *dst = B_buf + r * GEMM_K_TILE + c;
+            const __nv_bfloat16 *src = W + (n_block_start + r) * K + k_off + c;
+            cp_async_16B(dst, src);
+        }
+    };
+
+    for (int macro = blockIdx.x; macro < total_macro; macro += gridDim.x) {
+        int tm = macro / tiles_N;
+        int tnb = macro % tiles_N;
         int s_start = tm << 4;
-        int n_start = tn << 4;
+        int n_block_start = tnb * GEMM_N_BLK;
+        int n_start = n_block_start + (warp_block << 4);
 
         wmma::fill_fragment(c_frag, 0.0f);
-        #pragma unroll 4
-        for (int k = 0; k < K; k += 16) {
-            wmma::load_matrix_sync(a_frag, X + s_start * K + k, K);
-            // W[N,K] row-major tile starting at W + n_start*K + k.
-            // We want B = W^T's 16×16 tile: B[k_i, n_j] = W[n_j, k_i].
-            // Passing col_major with stride K says "column j starts at offset j*K",
-            // i.e. column j of B is row j of W — exactly what we want.
-            wmma::load_matrix_sync(b_frag, W + n_start * K + k, K);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        // Prologue: issue stage 0 load.
+        load_A(0, s_start, 0);
+        load_B(0, n_block_start, 0);
+        asm volatile("cp.async.commit_group;");
+
+        int buf = 0;
+        #pragma unroll 1
+        for (int k = 0; k < K; k += GEMM_K_TILE) {
+            int next_k = k + GEMM_K_TILE;
+            int next_buf = buf ^ 1;
+
+            // Issue next stage (if any).
+            if (next_k < K) {
+                load_A(next_buf, s_start, next_k);
+                load_B(next_buf, n_block_start, next_k);
+                asm volatile("cp.async.commit_group;");
+                asm volatile("cp.async.wait_group 1;");
+            } else {
+                asm volatile("cp.async.wait_group 0;");
+            }
+            __syncthreads();
+
+            // MMA on current buf.
+            __nv_bfloat16 *A_buf = s_A + buf * GEMM_M_BLK * GEMM_K_TILE;
+            __nv_bfloat16 *B_buf = s_B + buf * GEMM_N_BLK * GEMM_K_TILE
+                                         + (warp_block * 16) * GEMM_K_TILE;
+            wmma::load_matrix_sync(a0, A_buf + 0,  GEMM_K_TILE);
+            wmma::load_matrix_sync(a1, A_buf + 16, GEMM_K_TILE);
+            wmma::load_matrix_sync(b0, B_buf + 0,  GEMM_K_TILE);
+            wmma::load_matrix_sync(b1, B_buf + 16, GEMM_K_TILE);
+            wmma::mma_sync(c_frag, a0, b0, c_frag);
+            wmma::mma_sync(c_frag, a1, b1, c_frag);
+
+            __syncthreads();
+            buf = next_buf;
         }
 
-        // Store f32 accumulator to shared, then convert to the output dtype.
-        wmma::store_matrix_sync(s_tile, c_frag, 16, wmma::mem_row_major);
-        // 32 lanes cooperatively write 256 elements.
+        // Store accumulator.
+        wmma::store_matrix_sync(s_tile_warp, c_frag, 16, wmma::mem_row_major);
         #pragma unroll
         for (int i = lane; i < 256; i += 32) {
             int r = i >> 4;
             int c = i & 15;
-            int out_s = s_start + r;
-            int out_n = n_start + c;
-            int idx = out_s * N + out_n;
-            float v = s_tile[i];
-            if (R != nullptr) {
-                v += __bfloat162float(R[idx]);
-            }
+            int idx = (s_start + r) * N + (n_start + c);
+            float v = s_tile_warp[i];
+            if (R != nullptr) v += __bfloat162float(R[idx]);
             if constexpr (std::is_same<T, __nv_bfloat16>::value) {
                 Y[idx] = __float2bfloat16(v);
             } else {
@@ -988,8 +1073,24 @@ extern "C" void launch_prefill_megakernel(
     int S, int max_seq,
     cudaStream_t stream)
 {
-    // Dynamic shared memory: NW warps × 16×16 f32 tile = 16 * 256 * 4 = 16 KB.
-    constexpr size_t smem_bytes = (size_t)NW * 256 * sizeof(float);
+    // Dynamic shared memory:
+    //   s_A:     2 × 16 × 32 × 2 = 2048 bytes
+    //   s_B:     2 × 256 × 32 × 2 = 32768 bytes
+    //   s_store: NW × 256 × 4 = 16384 bytes
+    //   total:   51200 bytes (50 KB). >48 KB default needs opt-in.
+    constexpr size_t smem_bytes =
+        2 * 16 * 32 * sizeof(__nv_bfloat16) +
+        2 * 256 * 32 * sizeof(__nv_bfloat16) +
+        (size_t)NW * 256 * sizeof(float);
+
+    static bool smem_configured = false;
+    if (!smem_configured) {
+        cudaFuncSetAttribute(
+            (void *)prefill_megakernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)smem_bytes);
+        smem_configured = true;
+    }
 
     // Cooperative launch requires ALL blocks concurrently resident.
     // Query occupancy (WMMA register pressure can drop it below 1/SM) and
