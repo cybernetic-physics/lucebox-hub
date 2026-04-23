@@ -1017,6 +1017,185 @@ static void debug_compare_prefill_tc_proj(
     cudaFree(ref);
 }
 
+namespace {
+
+constexpr int PREFILL_TC_PLAN_CACHE_SIZE = 6;
+
+struct PrefillTcPlan {
+    bool initialized = false;
+    bool supported = false;
+    int out_rows = 0;
+    int seq_len = 0;
+    int k = 0;
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatrixLayout_t d_desc = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    size_t required_workspace = 0;
+};
+
+struct PrefillTcRuntime {
+    cublasLtHandle_t handle = nullptr;
+    void *workspace = nullptr;
+    size_t workspace_size = 0;
+    PrefillTcPlan plans[PREFILL_TC_PLAN_CACHE_SIZE];
+    int next_slot = 0;
+};
+
+static PrefillTcRuntime &prefill_tc_runtime() {
+    static PrefillTcRuntime runtime;
+    return runtime;
+}
+
+static void destroy_prefill_tc_plan(PrefillTcPlan &plan) {
+    if (plan.d_desc) cublasLtMatrixLayoutDestroy(plan.d_desc);
+    if (plan.c_desc) cublasLtMatrixLayoutDestroy(plan.c_desc);
+    if (plan.b_desc) cublasLtMatrixLayoutDestroy(plan.b_desc);
+    if (plan.a_desc) cublasLtMatrixLayoutDestroy(plan.a_desc);
+    if (plan.op_desc) cublasLtMatmulDescDestroy(plan.op_desc);
+    plan = PrefillTcPlan{};
+}
+
+static bool ensure_prefill_tc_runtime() {
+    auto &runtime = prefill_tc_runtime();
+    if (runtime.handle == nullptr) {
+        if (cublasLtCreate(&runtime.handle) != CUBLAS_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+    if (runtime.workspace == nullptr) {
+        if (cudaMalloc(&runtime.workspace, PREFILL_TC_MAX_WORKSPACE) != cudaSuccess) {
+            runtime.workspace = nullptr;
+            runtime.workspace_size = 0;
+            return false;
+        }
+        runtime.workspace_size = PREFILL_TC_MAX_WORKSPACE;
+    }
+    return true;
+}
+
+static PrefillTcPlan *get_prefill_tc_plan(
+    int out_rows,
+    int seq_len,
+    int k,
+    const uint8_t *weight_scales,
+    const uint8_t *act_scales)
+{
+    auto &runtime = prefill_tc_runtime();
+    cublasLtMatmulPreference_t preference = nullptr;
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    int returned_results = 0;
+    if (!ensure_prefill_tc_runtime()) {
+        return nullptr;
+    }
+
+    for (auto &plan : runtime.plans) {
+        if (plan.initialized &&
+            plan.supported &&
+            plan.out_rows == out_rows &&
+            plan.seq_len == seq_len &&
+            plan.k == k) {
+            return &plan;
+        }
+    }
+
+    int slot = -1;
+    for (int i = 0; i < PREFILL_TC_PLAN_CACHE_SIZE; ++i) {
+        if (!runtime.plans[i].initialized) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        slot = runtime.next_slot;
+        runtime.next_slot = (runtime.next_slot + 1) % PREFILL_TC_PLAN_CACHE_SIZE;
+        destroy_prefill_tc_plan(runtime.plans[slot]);
+    }
+
+    PrefillTcPlan &plan = runtime.plans[slot];
+    plan.initialized = true;
+    plan.out_rows = out_rows;
+    plan.seq_len = seq_len;
+    plan.k = k;
+
+    cublasOperation_t trans_a = CUBLAS_OP_T;
+    cublasOperation_t trans_b = CUBLAS_OP_N;
+    cublasLtMatmulMatrixScale_t a_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulMatrixScale_t b_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtOrder_t col_order = CUBLASLT_ORDER_COL;
+
+    if (cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) {
+        goto fail;
+    }
+    if (cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &a_scale_mode, sizeof(a_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &b_scale_mode, sizeof(b_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_scales, sizeof(act_scales)) != CUBLAS_STATUS_SUCCESS) {
+        goto fail;
+    }
+
+    if (cublasLtMatrixLayoutCreate(&plan.a_desc, CUDA_R_4F_E2M1, k, out_rows, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.b_desc, CUDA_R_4F_E2M1, k, seq_len, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.d_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS) {
+        goto fail;
+    }
+
+    cublasLtMatrixLayoutSetAttribute(plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(plan.d_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+
+    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
+        goto fail;
+    }
+    if (cublasLtMatmulPreferenceSetAttribute(
+        preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &runtime.workspace_size,
+        sizeof(runtime.workspace_size)) != CUBLAS_STATUS_SUCCESS) {
+        goto fail;
+    }
+
+    {
+        cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+            runtime.handle,
+            plan.op_desc,
+            plan.a_desc,
+            plan.b_desc,
+            plan.c_desc,
+            plan.d_desc,
+            preference,
+            1,
+            &heuristic,
+            &returned_results);
+        cublasLtMatmulPreferenceDestroy(preference);
+        if (heuristic_status != CUBLAS_STATUS_SUCCESS ||
+            returned_results == 0 ||
+            heuristic.workspaceSize > runtime.workspace_size) {
+            goto fail;
+        }
+    }
+
+    plan.algo = heuristic.algo;
+    plan.required_workspace = heuristic.workspaceSize;
+    plan.supported = true;
+    return &plan;
+
+fail:
+    if (preference) {
+        cublasLtMatmulPreferenceDestroy(preference);
+    }
+    destroy_prefill_tc_plan(plan);
+    return nullptr;
+}
+
+}  // namespace
+
 static bool cublaslt_nvfp4_bf16_gemm(
     const uint8_t *weight_packed,
     const uint8_t *weight_scales,
@@ -1032,126 +1211,55 @@ static bool cublaslt_nvfp4_bf16_gemm(
         return false;
     }
 
-    static cublasLtHandle_t handle = nullptr;
-    static void *workspace = nullptr;
-    static size_t workspace_size = 0;
-    if (!handle && cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+    auto &runtime = prefill_tc_runtime();
+    PrefillTcPlan *plan = get_prefill_tc_plan(out_rows, seq_len, k, weight_scales, act_scales);
+    if (plan == nullptr || !plan->supported) {
         return false;
     }
-    if (workspace == nullptr) {
-        if (cudaMalloc(&workspace, PREFILL_TC_MAX_WORKSPACE) != cudaSuccess) {
-            workspace = nullptr;
-            workspace_size = 0;
-            return false;
-        }
-        workspace_size = PREFILL_TC_MAX_WORKSPACE;
+
+    if (cublasLtMatmulDescSetAttribute(
+            plan->op_desc,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &weight_scales,
+            sizeof(weight_scales)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(
+            plan->op_desc,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &act_scales,
+            sizeof(act_scales)) != CUBLAS_STATUS_SUCCESS) {
+        return false;
     }
-
-    cublasLtMatmulDesc_t op_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr;
-    cublasLtMatrixLayout_t b_desc = nullptr;
-    cublasLtMatrixLayout_t c_desc = nullptr;
-    cublasLtMatrixLayout_t d_desc = nullptr;
-    cublasLtMatmulPreference_t preference = nullptr;
-    bool ok = false;
-    cublasLtMatmulAlgo_t algo{};
-    cublasLtMatmulHeuristicResult_t heuristic{};
-    int returned_results = 0;
-    cublasStatus_t heuristic_status = CUBLAS_STATUS_SUCCESS;
-
-    cublasOperation_t trans_a = CUBLAS_OP_T;
-    cublasOperation_t trans_b = CUBLAS_OP_N;
-    cublasLtMatmulMatrixScale_t a_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-    cublasLtMatmulMatrixScale_t b_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-    cublasLtOrder_t col_order = CUBLASLT_ORDER_COL;
-
-    if (cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) {
-        goto cleanup;
-    }
-    if (cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &a_scale_mode, sizeof(a_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &b_scale_mode, sizeof(b_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_scales, sizeof(act_scales)) != CUBLAS_STATUS_SUCCESS) {
-        goto cleanup;
-    }
-
-    if (cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, k, out_rows, k) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, k, seq_len, k) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS) {
-        goto cleanup;
-    }
-
-    cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
-    cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
-    cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
-    cublasLtMatrixLayoutSetAttribute(d_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
-
-    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
-        goto cleanup;
-    }
-    cublasLtMatmulPreferenceSetAttribute(
-        preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &workspace_size,
-        sizeof(workspace_size));
-
-    heuristic_status = cublasLtMatmulAlgoGetHeuristic(
-        handle,
-        op_desc,
-        a_desc,
-        b_desc,
-        c_desc,
-        d_desc,
-        preference,
-        1,
-        &heuristic,
-        &returned_results);
-    if (heuristic_status != CUBLAS_STATUS_SUCCESS || returned_results == 0 || heuristic.workspaceSize > workspace_size) {
-        goto cleanup;
-    }
-    algo = heuristic.algo;
 
     {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cudaGetLastError();
         cublasStatus_t status = cublasLtMatmul(
-            handle,
-            op_desc,
+            runtime.handle,
+            plan->op_desc,
             &alpha,
             weight_packed,
-            a_desc,
+            plan->a_desc,
             act_packed,
-            b_desc,
+            plan->b_desc,
             &beta,
             out,
-            c_desc,
+            plan->c_desc,
             out,
-            d_desc,
-            &algo,
-            workspace,
-            heuristic.workspaceSize,
+            plan->d_desc,
+            &plan->algo,
+            runtime.workspace,
+            plan->required_workspace,
             stream);
         cudaError_t last_error = cudaGetLastError();
-        ok = (status == CUBLAS_STATUS_SUCCESS && last_error == cudaSuccess);
+        bool ok = (status == CUBLAS_STATUS_SUCCESS && last_error == cudaSuccess);
         if (prefill_tc_debug_enabled() && !ok) {
             std::fprintf(stderr,
                          "prefill_tc_cublaslt: status=%d cuda=%d m=%d n=%d k=%d\n",
                          int(status), int(last_error), out_rows, seq_len, k);
         }
+        return ok;
     }
-
-cleanup:
-    if (preference) cublasLtMatmulPreferenceDestroy(preference);
-    if (d_desc) cublasLtMatrixLayoutDestroy(d_desc);
-    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
-    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
-    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
-    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
-    return ok;
 }
 
 // ===== Main orchestrator =====
