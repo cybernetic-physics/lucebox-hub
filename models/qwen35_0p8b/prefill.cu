@@ -883,8 +883,75 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+// ===== cuBLAS bf16 GEMM, "NN" layout (row-major X @ W without transposing W) =====
+// Used for LoRA matmuls where A is stored as [K_in, R] and B as [R, K_out].
+// Supports alpha/beta so the B-matmul can accumulate into the base proj
+// buffer via beta=1, saving a separate residual-add kernel.
+static void cublas_bf16_gemm_nn(cublasHandle_t h,
+    const __nv_bfloat16 *X, const __nv_bfloat16 *W, __nv_bfloat16 *Y,
+    int S, int N, int K, float alpha, float beta) {
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, S, K,
+        &alpha, W, CUDA_R_16BF, N, X, CUDA_R_16BF, K,
+        &beta, Y, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+// ===== LoRA pointer bundle (mirrors LoraSet in the trainer's kernel.cu) =====
+// Each A is a contiguous buffer over (per-type-layers, K_in, R); each B is
+// (per-type-layers, R, K_out). Nullable per entry. When all are null or
+// lora_rank == 0, the forward path is a bit-exact copy of the
+// inference-only prefill (no extra work).
+struct LoraPFSet {
+    const __nv_bfloat16 *fa_q_A,    *fa_q_B;
+    const __nv_bfloat16 *fa_k_A,    *fa_k_B;
+    const __nv_bfloat16 *fa_v_A,    *fa_v_B;
+    const __nv_bfloat16 *fa_o_A,    *fa_o_B;
+    const __nv_bfloat16 *fa_gate_A, *fa_gate_B;
+    const __nv_bfloat16 *fa_up_A,   *fa_up_B;
+    const __nv_bfloat16 *fa_down_A, *fa_down_B;
+    const __nv_bfloat16 *dn_qkv_A,  *dn_qkv_B;
+    const __nv_bfloat16 *dn_z_A,    *dn_z_B;
+    const __nv_bfloat16 *dn_out_A,  *dn_out_B;
+    const __nv_bfloat16 *dn_gate_A, *dn_gate_B;
+    const __nv_bfloat16 *dn_up_A,   *dn_up_B;
+    const __nv_bfloat16 *dn_down_A, *dn_down_B;
+};
+
+// Fire the LoRA A/B cuBLAS pair for one projection, accumulating into
+// Y (which already holds the base projection output). Skips entirely if
+// A or B is null or rank==0 — the whole branch collapses to a single null
+// check in the captured graph.
+static inline void apply_lora_linear(cublasHandle_t h,
+    const __nv_bfloat16 *X,
+    const __nv_bfloat16 *A_layer, const __nv_bfloat16 *B_layer,
+    __nv_bfloat16 *Y_base, __nv_bfloat16 *lora_h_ws,
+    int S, int N, int K_in, int lora_rank, float lora_scaling)
+{
+    if (A_layer == nullptr || B_layer == nullptr || lora_rank <= 0) return;
+    // lora_h = X @ A_layer   (S, K_in) @ (K_in, R) → (S, R)
+    cublas_bf16_gemm_nn(h, X, A_layer, lora_h_ws,
+                        S, lora_rank, K_in, 1.0f, 0.0f);
+    // Y_base += scaling * (lora_h @ B_layer)   (S, R) @ (R, N) → (S, N)
+    cublas_bf16_gemm_nn(h, lora_h_ws, B_layer, Y_base,
+                        S, N, lora_rank, lora_scaling, 1.0f);
+}
+
 // ===== Prefill body (capturable). All device work lives here so we can
 //       wrap it in cudaStreamBeginCapture and replay via cudaGraphLaunch. =====
+// Helper: per-projection LoRA offset into a per-type-layer-major
+// (layer_idx, K_IN, R) / (layer_idx, R, K_OUT) buffer. Returns nullptr
+// when the base pointer is null (LoRA disabled for this slot).
+static inline const __nv_bfloat16 *lora_layer_ptr_a(
+    const __nv_bfloat16 *base, int layer_idx, int K_in, int rank) {
+    if (base == nullptr) return nullptr;
+    return base + (size_t)layer_idx * K_in * rank;
+}
+static inline const __nv_bfloat16 *lora_layer_ptr_b(
+    const __nv_bfloat16 *base, int layer_idx, int K_out, int rank) {
+    if (base == nullptr) return nullptr;
+    return base + (size_t)layer_idx * rank * K_out;
+}
+
 static void prefill_bf16_body(
     cublasHandle_t cublas,
     const PFLayerWeights *hl,              // host-side mirror of layers[]
@@ -900,10 +967,21 @@ static void prefill_bf16_body(
     float *beta_buf, float *alpha_buf,
     __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
+    // LoRA (optional — null pointers + rank==0 → inference-only path)
+    LoraPFSet lora,
+    int lora_rank, float lora_scaling, __nv_bfloat16 *lora_h_ws,
     cudaStream_t stream)
 {
     int bk = (S*HIDDEN+255)/256;
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+
+    // Convenience wrapper — one line per projection, still nops out when
+    // the per-type-layer pointer is null.
+    #define APPLY_LORA(A_BASE, B_BASE, X, Y, K_IN, K_OUT, LAYER_IDX)               \
+        apply_lora_linear(cublas, (X),                                             \
+            lora_layer_ptr_a((A_BASE), (LAYER_IDX), (K_IN),  lora_rank),           \
+            lora_layer_ptr_b((B_BASE), (LAYER_IDX), (K_OUT), lora_rank),           \
+            (Y), lora_h_ws, S, (K_OUT), (K_IN), lora_rank, lora_scaling)
 
     int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
@@ -932,9 +1010,13 @@ static void prefill_bf16_body(
             const __nv_bfloat16 *up_w=(const __nv_bfloat16*)lw.ptrs[12];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
 
-            // cuBLAS projections — direct bf16, no conversion!
+            // cuBLAS projections — direct bf16, no conversion.
+            // LoRA applied in-place on each projection output when ptrs are
+            // non-null; an identity no-op when LoRA is disabled.
             cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
+            APPLY_LORA(lora.dn_qkv_A, lora.dn_qkv_B, normalized, proj_buf, HIDDEN, DN_CONV_CH, dn_idx);
             cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
+            APPLY_LORA(lora.dn_z_A, lora.dn_z_B, normalized, proj_buf2, HIDDEN, DN_V_SIZE, dn_idx);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
@@ -985,15 +1067,19 @@ static void prefill_bf16_body(
 
             // Out projection + residual
             cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
+            APPLY_LORA(lora.dn_out_A, lora.dn_out_B, dn_out_buf, proj_buf, DN_V_SIZE, HIDDEN, dn_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
+            APPLY_LORA(lora.dn_gate_A, lora.dn_gate_B, normalized, proj_buf, HIDDEN, INTER, dn_idx);
             cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            APPLY_LORA(lora.dn_up_A, lora.dn_up_B, normalized, proj_buf2, HIDDEN, INTER, dn_idx);
             int mlp_bk = (S*INTER+255)/256;
             pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
+            APPLY_LORA(lora.dn_down_A, lora.dn_down_B, mlp_buf, proj_buf, INTER, HIDDEN, dn_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             dn_idx++;
@@ -1011,8 +1097,11 @@ static void prefill_bf16_body(
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[10];
 
             cublas_bf16_gemm(cublas, normalized, q_w, proj_buf, S, FA_QPROJ_SIZE, HIDDEN);
+            APPLY_LORA(lora.fa_q_A, lora.fa_q_B, normalized, proj_buf, HIDDEN, FA_QPROJ_SIZE, fa_idx);
             cublas_bf16_gemm(cublas, normalized, k_w, proj_buf2, S, FA_KV_SIZE, HIDDEN);
+            APPLY_LORA(lora.fa_k_A, lora.fa_k_B, normalized, proj_buf2, HIDDEN, FA_KV_SIZE, fa_idx);
             cublas_bf16_gemm(cublas, normalized, v_w, attn_buf, S, FA_KV_SIZE, HIDDEN);
+            APPLY_LORA(lora.fa_v_A, lora.fa_v_B, normalized, attn_buf, HIDDEN, FA_KV_SIZE, fa_idx);
 
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
@@ -1023,20 +1112,25 @@ static void prefill_bf16_body(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
 
             cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
+            APPLY_LORA(lora.fa_o_A, lora.fa_o_B, dn_out_buf, proj_buf, FA_Q_SIZE, HIDDEN, fa_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
+            APPLY_LORA(lora.fa_gate_A, lora.fa_gate_B, normalized, proj_buf, HIDDEN, INTER, fa_idx);
             cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            APPLY_LORA(lora.fa_up_A, lora.fa_up_B, normalized, proj_buf2, HIDDEN, INTER, fa_idx);
             int mlp_bk = (S*INTER+255)/256;
             pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
+            APPLY_LORA(lora.fa_down_A, lora.fa_down_B, mlp_buf, proj_buf, INTER, HIDDEN, fa_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             fa_idx++;
         }
     }
+    #undef APPLY_LORA
 
     pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
 
@@ -1076,6 +1170,10 @@ struct PrefillGraphKey {
     const void *hidden_bf16_out;
     const void *lm_bmv;
     const void *lm_bmi;
+    LoraPFSet lora;
+    int lora_rank;
+    float lora_scaling;
+    const void *lora_h_ws;
 };
 
 struct PrefillGraphEntry {
@@ -1109,6 +1207,9 @@ extern "C" void launch_prefill_bf16(
     float *beta_buf, float *alpha_buf,
     __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
+    // LoRA (optional — null ptrs + rank==0 means "inference only", fast path)
+    LoraPFSet lora, int lora_rank, float lora_scaling,
+    __nv_bfloat16 *lora_h_ws,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -1158,6 +1259,10 @@ extern "C" void launch_prefill_bf16(
     key.hidden_bf16_out = hidden_bf16_out;
     key.lm_bmv = lm_bmv;
     key.lm_bmi = lm_bmi;
+    key.lora = lora;
+    key.lora_rank = lora_rank;
+    key.lora_scaling = lora_scaling;
+    key.lora_h_ws = lora_h_ws;
 
     PrefillGraphEntry *hit = nullptr;
     if (!disable_graph) {
@@ -1208,7 +1313,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
         if (hit) hit->eager_runs++;
         return;
     }
@@ -1231,7 +1336,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, stream);
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
         return;
     }
 
@@ -1261,7 +1366,7 @@ extern "C" void launch_prefill_bf16(
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, capture_stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, capture_stream);
     {
         cudaGraph_t graph = nullptr;
         err = cudaStreamEndCapture(capture_stream, &graph);
@@ -1309,7 +1414,7 @@ fallback_eager:
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, stream);
     if (hit) {
         hit->eager_runs++;  // stay in warmup until capture finally works
     }

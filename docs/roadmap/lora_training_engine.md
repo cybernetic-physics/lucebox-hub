@@ -126,16 +126,47 @@ Following the list already in `train_megakernel/README.md`:
 4. Gradient check against HF transformers + PEFT LoRA on a 16-token
    sample, tolerance 1e-3 bf16-relative.
 
-### Phase 3 — cuBLAS/CUTLASS wiring (2-3 days)
+### Phase 3 — cuBLAS/CUTLASS wiring  ✅ **done** (2026-04-23)
 
-- LoRA A matmul `[B*T, K_in] @ [K_in, R] = [B*T, R]` → cuBLAS GEMM
-  (R is tiny, ~16, but cuBLAS still wins over hand-rolled at this
-  shape class).
-- LoRA B matmul `[B*T, R] @ [R, K_out] = [B*T, K_out]` → cuBLAS.
-- For the base-model projections that already live inside the
-  megakernel, keep them inside — fusion with LoRA residual-add is
-  the win there.
-- Replace any remaining `tcgen05_gemm` call sites.
+Instead of fusing LoRA into the megakernel's hand-rolled WMMA
+matmuls, we plumbed an optional `LoraPFSet` into the existing
+cuBLAS+cudaGraph prefill path (`models/qwen35_0p8b/prefill.cu`'s
+`launch_prefill_bf16`). Two cuBLAS `GemmEx` calls per LoRA'd
+projection:
+
+```cpp
+apply_lora_linear(cublas, X, A_layer, B_layer,
+                  Y_base, lora_h_ws,
+                  S, N, K_in, lora_rank, lora_scaling);
+// internally:
+//   lora_h = X @ A_layer                   (GemmEx, beta=0)
+//   Y_base += scaling * (lora_h @ B_layer) (GemmEx, beta=1)
+```
+
+The B-matmul's `beta=1` accumulates straight into the base projection
+output — no residual-add kernel needed. Null pointers disable LoRA on
+individual projections, so the inference extension (`qwen35_megakernel_bf16_C`)
+reuses the same binary with all-null slots and essentially zero overhead.
+New op: `prefill_bf16_with_lora` in the same extension.
+
+**Measured on B200, S=520, rank=16, LoRA active on all 13 linears:**
+
+```
+  trainer megakernel (hand-rolled WMMA, all in one dispatch) : 95.54 ms/step
+  cuBLAS+graph+LoRA  (prefill_bf16_with_lora, this commit)   : 14.35 ms/step
+                                                              →  6.66× faster
+```
+
+Correctness (`trainer/test_lora_forward_cublas.py`): zero-LoRA and
+nonzero-LoRA cases produce bit-exact token ids matching the existing
+trainer megakernel.
+
+Inference path (no LoRA) on the same extension unchanged: pp520
+~40,275 tok/s after the change (vs ~40,600 prior). The `LoraPFSet{}`
+all-null branch in `launch_prefill_bf16` costs one predictable
+null-check per projection per layer — within noise.
+
+The `tcgen05_gemm/` sandbox is retired at `experiments/tcgen05_gemm/`.
 
 ### Phase 4 — rl/backend integration (1-2 days)
 
