@@ -236,17 +236,29 @@ pf_deltanet_recurrence(
         }
         __syncthreads();
 
-        // Gated RMSNorm → bf16 output. z-row and norm_w already live in
-        // shared; s_out is fp32 so we skip the bf16 round-trip.
+        // Gated RMSNorm → bf16 output. After the per-warp partial-sum
+        // write+sync, every thread reads all 16 partials and computes rstd
+        // locally, avoiding the second "warp 0 reduces then everyone syncs
+        // to pick up rstd" shared-memory round trip. Saves one
+        // __syncthreads per step (×520 steps ×18 layers per prefill).
         float sq2=0; for(int i=tid;i<DN_VAL;i+=512){ float v=s_out[i]; sq2+=v*v; }
         sq2=pf_warp_sum(sq2); if(lid==0) s_gnorm[wid]=sq2; __syncthreads();
-        if(wid==0){ float v=(lid<NWARPS)?s_gnorm[lid]:0; v=pf_warp_sum(v); if(lid==0) s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS); }
-        __syncthreads(); float rstd=s_gnorm[0];
+
+        float total = 0;
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) total += s_gnorm[w];
+        float rstd = rsqrtf(total / DN_VAL + RMS_EPS);
+
         for(int i=tid;i<DN_VAL;i+=512){
             float n = s_out[i] * rstd * s_norm_w[i];
             out_h[i] = __float2bfloat16(n * pf_silu(s_z[i]));
         }
-        __syncthreads();
+        // No __syncthreads() here: the next iteration's conv+z prefetch
+        // writes to s_conv / s_q / s_k / s_v / s_z, and each thread only
+        // touches its own slot of those arrays (stride = blockDim.x). The
+        // first sync of the next iteration fences before any cross-thread
+        // read (phase B reads s_q/s_k across warps). Saves one sync per
+        // step (×520 steps ×18 layers = ~9k syncs removed per prefill).
     }
 
     // Write state back
