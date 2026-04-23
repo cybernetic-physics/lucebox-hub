@@ -73,19 +73,29 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     __syncthreads();
     const uint32_t taddr = tmem_slot;
 
-    // --------- 3. Load A, B row-major to shared via cp.async (128B swizzle is
-    // handled by hardware given the SMEM descriptor swizzle=2 flag — the
-    // data in shared looks row-major to us but gets reinterpreted by the MMA).
-    //
-    // A: 128 rows × 128 bytes = 16 KB. Each 16-byte cp.async = 8 bf16.
-    // Total = 16384/16 = 1024 loads. With 512 threads × 2 = 1024.
+    // --------- 3. Load A, B to shared via cp.async WITH 128B swizzle applied.
+    // Raw row-major must be rearranged: for row r and 16-byte chunk index
+    // chunk_idx, the swizzled physical chunk position is chunk_idx ^ (r & 7).
+    // Each row has 128 bytes = 8 chunks of 16 bytes (= 8 bf16 elements).
+    // So row r, bf16 offset c (where c is a multiple of 8):
+    //   chunk = c >> 3
+    //   swizzled_chunk = chunk ^ (r & 7)
+    //   write to s_*[r * K + (swizzled_chunk << 3)]
+    auto swz_offset = [](int r, int c_bf16) -> int {
+        int chunk = c_bf16 >> 3;
+        int sw = chunk ^ (r & 7);
+        return sw << 3;
+    };
+
+    // A: 128 rows × 8 chunks = 1024 loads.
     {
         for (int it = 0; it < 2; it++) {
-            int i = tid + it * 512;                  // 0..1024
-            int r = i / 8;                            // 0..128 (M dim)
-            int c = (i % 8) * 8;                     // 0, 8, 16, 24, 32, 40, 48, 56 (bf16 offset)
+            int i = tid + it * 512;
+            int r = i / 8;
+            int c = (i % 8) * 8;                      // bf16 offset: 0, 8, 16, ..., 56
             if (r < M) {
-                __nv_bfloat16 *dst = s_A + r * K + c;
+                int sw_c = swz_offset(r, c);
+                __nv_bfloat16 *dst = s_A + r * K + sw_c;
                 const __nv_bfloat16 *src = A + r * K + c;
                 uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
@@ -93,14 +103,15 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
             }
         }
     }
-    // B: 256 rows × 128 bytes = 32 KB. 2048 loads of 16 bytes. 512 threads × 4.
+    // B: 256 rows × 8 chunks = 2048 loads.
     {
         for (int it = 0; it < 4; it++) {
-            int i = tid + it * 512;                  // 0..2048
-            int r = i / 8;                            // 0..256 (N dim)
+            int i = tid + it * 512;
+            int r = i / 8;
             int c = (i % 8) * 8;
             if (r < N) {
-                __nv_bfloat16 *dst = s_B + r * K + c;
+                int sw_c = swz_offset(r, c);
+                __nv_bfloat16 *dst = s_B + r * K + sw_c;
                 const __nv_bfloat16 *src = B + r * K + c;
                 uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
