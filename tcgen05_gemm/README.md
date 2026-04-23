@@ -61,48 +61,66 @@ physical_chunk[r][c]:
   7    7 6 5 4 3 2 1 0
 ```
 
-## Benchmark at M=128 N=256 K=64 (4 MFLOPs)
+## Benchmark at realistic scale
+
+### M=1024, N=4096, K=1024 (8.6 GFLOPs)
 
 ```
-tcgen05 (bf16 → fp32)      :  22.5 μs
-torch.matmul bf16 (cuBLAS) :  14.5 μs   (cuBLAS 1.56× faster at this size)
-torch.matmul fp32 (cuBLAS) :  39.6 μs
+tcgen05 (bf16 → fp32)      :   32.8 μs    ~262 TFLOPs   (13% of B200 bf16 peak)
+torch.matmul bf16 (cuBLAS) :   11.1 μs    ~738 TFLOPs   (37% of peak)
+torch.matmul fp32 (cuBLAS) :  182.5 μs     (fp32 path, not tensor cores)
 ```
 
-At this tiny shape both kernels are launch-overhead-limited (4 MFLOPs in
-22 μs = 180 GFLOPs, way below B200 peak of ~2 PFLOPs). The comparison is
-unfair — real throughput needs M/N/K in the thousands.
+tcgen05 is **2.95× slower than cuBLAS at realistic scale.** This is
+the honest state at current session end.
 
-**Scaling up requires two more pieces:**
+### Extensions that landed
 
-1. **K-tile-major layout for K > 64** — currently K=64 fits one 128B
-   super-block per row. For K=128+ rows span multiple super-blocks, and
-   the descriptor advance by 32 bytes per K-step crosses block
-   boundaries, breaking layout. Fix: store A/B as K-tile-major (each
-   K-tile = BLOCK_M rows × 128 bytes = 16 KB, concatenated in K),
-   advance descriptor by `k_tile_idx * BLOCK_M * 128` per tile per
-   gau-nernst's pattern.
+1. **K-tile-major shared memory layout** — K_TILES copies of
+   [M × K_TILE bf16] / [N × K_TILE bf16], each with 128B swizzle
+   applied to its rows. Descriptor advance between K-tiles is
+   `M * K_TILE * 2` bytes. Tested correct at K=64, K=128, K=256, K=1024.
+2. **cp.async K-streaming** — 2-buffer ping-pong loads one K-tile
+   ahead of MMA, so arbitrary K is supported with fixed 96 KB of
+   shared memory.
+3. **2D grid tiling** — `(blockIdx.x, blockIdx.y)` = `(n_tile, m_tile)`.
+   128 blocks for M=1024 N=4096 — uses most of B200's 148 SMs.
 
-2. **M/N tiling across blocks** — one cooperative grid launch with each
-   block handling a different `(m_tile, n_tile)` output tile. TMEM alloc
-   amortizes across all MMA calls within a block.
+### What closes the remaining 2.95× gap
 
-Both are mechanical extensions of the working single-tile kernel.
+1. **Producer/consumer warp specialization** (biggest single win).
+   Current kernel has all 512 threads cp.async'ing together, then 511
+   wait while thread 0 issues 4 MMAs. Split into 2 producer warps
+   doing TMA + 14 consumer warps doing MMA — mbarriers handle
+   handoff. This is the ThunderKittens Blackwell pattern and gets
+   "only one bubble in the whole tensor pipeline".
+2. **TMA instead of cp.async** — `cp.async.bulk.tensor.2d` with a
+   host-constructed tensor map. Hardware does the swizzle for us.
+   Roughly halves load latency vs cp.async.
+3. **`cta_group::2`** — two CTAs sharing TMEM support MMA_M=256,
+   i.e. twice the per-call FLOPs.
+4. **Register-level MMA issue pipelining** — hoist the descriptor
+   recomputation so thread 0 issues with near-zero idle cycles.
+
+Each is 1 focused session of careful PTX work. None of them needs
+tcgen05 infrastructure redesign — the alloc / mbarrier / commit /
+wait / ld pattern is all correct, it's about filling the pipeline.
 
 ## Next session: integrate into prefill_megakernel
 
-With tcgen05 correctness established:
+With tcgen05 correctness established and K-streaming working:
 
-1. Add K-tile-major load helpers (applicable for K=1024 = 16 K-tiles).
-2. Tile across N in a grid loop.
-3. Package as `gemm_tcgen05_core` matching `gemm_wmma_core`'s signature.
-4. Swap it into `../prefill_megakernel/kernel.cu`.
-5. Bench full Qwen 3.5-0.8B prefill forward vs existing cuBLAS path.
+1. Package as `gemm_tcgen05_core` matching `gemm_wmma_core`'s
+   signature in the prefill megakernel.
+2. Swap it into `../prefill_megakernel/kernel.cu`.
+3. Bench full Qwen 3.5-0.8B prefill forward vs existing cuBLAS path.
 
-Expected: 1.2–1.8× cuBLAS for the full megakernel at S=256 (per
-published Blackwell tcgen05 kernel numbers). Path to 2×+ requires TMA
-for loads (eliminates cp.async overhead) and producer/consumer warp
-specialization per the ThunderKittens Blackwell pattern.
+Expected even at current 2.95× per-GEMM deficit: roughly similar to
+current WMMA shipping state (0.74× of cuBLAS in full prefill) —
+because the GEMM time is a fraction of total time that's dominated
+by DN recurrence + RMSNorms + attention. Closing the GEMM gap to 1×
+cuBLAS (via producer/consumer above) and then beyond unlocks
+1.5–2× cuBLAS for the full prefill.
 
 ## Files
 
