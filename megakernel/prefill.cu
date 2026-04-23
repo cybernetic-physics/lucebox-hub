@@ -5,7 +5,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #ifndef PREFILL_DN_BLOCK_SIZE
 #define PREFILL_DN_BLOCK_SIZE 128
@@ -46,14 +50,27 @@ constexpr int DN_Z_OFFSET = DN_CONV_CH;
 constexpr int DN_BETA_OFFSET = DN_Z_OFFSET + DN_V_SIZE;
 constexpr int DN_ALPHA_OFFSET = DN_BETA_OFFSET + DN_HEADS;
 constexpr int DN_PROJ_FUSED = DN_ALPHA_OFFSET + DN_HEADS;
+constexpr int DN_PROJ_FUSED_PADDED = ((DN_PROJ_FUSED + 127) / 128) * 128;
 constexpr int FA_QKV_FUSED = FA_QPROJ_SIZE + 2 * FA_KV_SIZE;
 constexpr int MLP_GATE_UP_FUSED = INTER * 2;
+constexpr int NVFP4_TC_ROWS_PER_TILE = 128;
+constexpr int NVFP4_TC_COLS_PER_TILE = 4;
+constexpr int NVFP4_TC_BLOCK_K = 16;
+constexpr int NVFP4_TC_K_PER_TILE = NVFP4_TC_COLS_PER_TILE * NVFP4_TC_BLOCK_K;
+constexpr size_t PREFILL_TC_MAX_WORKSPACE = 32ull * 1024ull * 1024ull;
 
 constexpr int NUM_LAYERS = 24;
 constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1};
 
 struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
-struct PFFusedLayerWeights { void *proj_weight; void *gate_up_weight; };
+struct PFFusedLayerWeights {
+    void *proj_weight;
+    void *gate_up_weight;
+    void *proj_weight_packed;
+    void *proj_weight_scales;
+    void *gate_up_weight_packed;
+    void *gate_up_weight_scales;
+};
 
 extern "C" bool launch_lm_head_cublaslt_bf16_top1(
     const void *hidden_bf16,
@@ -67,6 +84,10 @@ extern "C" bool launch_lm_head_cublaslt_bf16_top1(
     int *block_max_idxs,
     int *output_token_id,
     cudaStream_t stream);
+
+extern "C" void launch_quantize_nvfp4_lm_out(
+    const void *weight, int rows, int cols,
+    void *packed_out, void *scales_out, cudaStream_t stream);
 
 __device__ __constant__ float PF_ROPE_INV_FREQ[FA_ROT_PAIRS] = {
     1.000000000000000000e+00f, 6.042963902381328634e-01f,
@@ -272,6 +293,20 @@ __global__ void pf_silu_mul_fused_bf16(const __nv_bfloat16 *gate_up, __nv_bfloat
         pf_silu(gate.y) * up.y);
 }
 
+__global__ void pf_half_to_bf16(const __half *in, __nv_bfloat16 *out, int N) {
+    int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    int pairs = N / 2;
+    if (pair < pairs) {
+        const __half2 *in2 = reinterpret_cast<const __half2 *>(in);
+        __nv_bfloat162 *out2 = reinterpret_cast<__nv_bfloat162 *>(out);
+        float2 fv = __half22float2(in2[pair]);
+        out2[pair] = __floats2bfloat162_rn(fv.x, fv.y);
+    }
+    if ((N & 1) && pair == 0) {
+        out[N - 1] = __float2bfloat16(__half2float(in[N - 1]));
+    }
+}
+
 // Precompute DeltaNet q/k once per head so the tiled recurrence no longer
 // repeats the q/k conv and normalization work across every value tile.
 template <int BLOCK_THREADS>
@@ -354,6 +389,9 @@ pf_deltanet_recurrence_tiled(
     int qkv_stride,
     const __nv_bfloat16 *__restrict__ qk_norm,
     int qk_stride,
+    const __nv_bfloat16 *__restrict__ beta_proj,
+    const __nv_bfloat16 *__restrict__ alpha_proj,
+    int ctrl_stride,
     const __nv_bfloat16 *__restrict__ conv_w, const __nv_bfloat16 *__restrict__ a_log,
     const __nv_bfloat16 *__restrict__ dt_bias,
     float *__restrict__ state, float *__restrict__ conv_buf, __nv_bfloat16 *__restrict__ output, int S)
@@ -406,8 +444,17 @@ pf_deltanet_recurrence_tiled(
     for (int t = 0; t < S; t++) {
         const __nv_bfloat16 *qkv_t = qkv_proj + t * qkv_stride;
         const __nv_bfloat16 *qk_t = qk_norm + t * qk_stride + h * (DN_KEY * 2);
-        const float beta_proj_val = __bfloat162float(qkv_t[DN_BETA_OFFSET + h]);
-        const float alpha_proj_val = __bfloat162float(qkv_t[DN_ALPHA_OFFSET + h]);
+        float beta_proj_val;
+        float alpha_proj_val;
+        if (beta_proj != nullptr && alpha_proj != nullptr) {
+            const __nv_bfloat16 *beta_t = beta_proj + t * ctrl_stride;
+            const __nv_bfloat16 *alpha_t = alpha_proj + t * ctrl_stride;
+            beta_proj_val = __bfloat162float(beta_t[h]);
+            alpha_proj_val = __bfloat162float(alpha_t[h]);
+        } else {
+            beta_proj_val = __bfloat162float(qkv_t[DN_BETA_OFFSET + h]);
+            alpha_proj_val = __bfloat162float(qkv_t[DN_ALPHA_OFFSET + h]);
+        }
 
         float v_lane = 0.0f;
         if (lid < CPW) {
@@ -448,6 +495,7 @@ pf_deltanet_recurrence_tiled(
 
         float beta = s_beta;
         float decay = s_decay;
+
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL + val_offset;
 
 #pragma unroll
@@ -543,24 +591,43 @@ __global__ void pf_qk_norm_rope(
     const __nv_bfloat16 *qnw, const __nv_bfloat16 *knw,
     __nv_bfloat16 *k_cache, __nv_bfloat16 *v_cache, int S, int max_seq)
 {
+    constexpr int HALF_DIM = FA_HEAD_DIM / 2;
+    constexpr int ROT_HALF = FA_ROT_DIM / 2;
     int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     int lid = threadIdx.x % 32;
     int total_q = S * FA_Q_HEADS, total_k = S * FA_KV_HEADS;
     if (idx < total_q) {
         int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
         __nv_bfloat16 *qh = qkv + pos * qkv_stride + head * FA_HEAD_DIM * 2;
-        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = __bfloat162float(qh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = __bfloat162float(qh[i])*sc*(1.f+__bfloat162float(qnw[i]));
-            if (i < FA_ROT_DIM) {
-                float angle = float(pos) * PF_ROPE_INV_FREQ[i & (FA_ROT_PAIRS - 1)];
-                float sv, cv;
-                __sincosf(angle, &sv, &cv);
-                int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=__bfloat162float(qh[p])*sc*(1.f+__bfloat162float(qnw[p]));
-                qh[i]=__float2bfloat16((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
-            } else qh[i]=__float2bfloat16(normed);
+        const __nv_bfloat162 *qh2 = reinterpret_cast<const __nv_bfloat162 *>(qh);
+        const __nv_bfloat162 *qnw2 = reinterpret_cast<const __nv_bfloat162 *>(qnw);
+        __nv_bfloat162 *qh2_out = reinterpret_cast<__nv_bfloat162 *>(qh);
+        float ss = 0;
+        for (int i2 = lid; i2 < HALF_DIM; i2 += 32) {
+            float2 v = __bfloat1622float2(qh2[i2]);
+            ss += v.x * v.x + v.y * v.y;
+        }
+        ss = pf_warp_sum(ss);
+        float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
+        sc = __shfl_sync(0xffffffff, sc, 0);
+
+        for (int pair = lid; pair < FA_ROT_PAIRS; pair += 32) {
+            int lo = pair;
+            int hi = pair + FA_ROT_PAIRS;
+            float lo_norm = __bfloat162float(qh[lo]) * sc * (1.f + __bfloat162float(qnw[lo]));
+            float hi_norm = __bfloat162float(qh[hi]) * sc * (1.f + __bfloat162float(qnw[hi]));
+            float angle = float(pos) * PF_ROPE_INV_FREQ[pair];
+            float sv, cv;
+            __sincosf(angle, &sv, &cv);
+            qh[lo] = __float2bfloat16(lo_norm * cv - hi_norm * sv);
+            qh[hi] = __float2bfloat16(hi_norm * cv + lo_norm * sv);
+        }
+        for (int i2 = lid + ROT_HALF; i2 < HALF_DIM; i2 += 32) {
+            float2 rv = __bfloat1622float2(qh2[i2]);
+            float2 wv = __bfloat1622float2(qnw2[i2]);
+            qh2_out[i2] = __floats2bfloat162_rn(
+                rv.x * sc * (1.f + wv.x),
+                rv.y * sc * (1.f + wv.y));
         }
     }
     int kidx = idx - total_q;
@@ -570,19 +637,47 @@ __global__ void pf_qk_norm_rope(
         const __nv_bfloat16 *vh = qkv + pos * qkv_stride + FA_QPROJ_SIZE + FA_KV_SIZE + head * FA_HEAD_DIM;
         __nv_bfloat16 *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         __nv_bfloat16 *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = __bfloat162float(kh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = __bfloat162float(kh[i])*sc*(1.f+__bfloat162float(knw[i])); float fk;
-            if (i < FA_ROT_DIM) {
-                float angle = float(pos) * PF_ROPE_INV_FREQ[i & (FA_ROT_PAIRS - 1)];
-                float sv, cv;
-                __sincosf(angle, &sv, &cv);
-                int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=__bfloat162float(kh[p])*sc*(1.f+__bfloat162float(knw[p]));
-                fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
-            } else fk=normed;
-            kh[i]=__float2bfloat16(fk); kc[i]=__float2bfloat16(fk); vc[i]=vh[i];
+        const __nv_bfloat162 *kh2 = reinterpret_cast<const __nv_bfloat162 *>(kh);
+        const __nv_bfloat162 *vh2 = reinterpret_cast<const __nv_bfloat162 *>(vh);
+        const __nv_bfloat162 *knw2 = reinterpret_cast<const __nv_bfloat162 *>(knw);
+        __nv_bfloat162 *kh2_out = reinterpret_cast<__nv_bfloat162 *>(kh);
+        __nv_bfloat162 *kc2 = reinterpret_cast<__nv_bfloat162 *>(kc);
+        __nv_bfloat162 *vc2 = reinterpret_cast<__nv_bfloat162 *>(vc);
+        float ss = 0;
+        for (int i2 = lid; i2 < HALF_DIM; i2 += 32) {
+            float2 v = __bfloat1622float2(kh2[i2]);
+            ss += v.x * v.x + v.y * v.y;
+        }
+        ss = pf_warp_sum(ss);
+        float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
+        sc = __shfl_sync(0xffffffff, sc, 0);
+
+        for (int pair = lid; pair < FA_ROT_PAIRS; pair += 32) {
+            int lo = pair;
+            int hi = pair + FA_ROT_PAIRS;
+            float lo_norm = __bfloat162float(kh[lo]) * sc * (1.f + __bfloat162float(knw[lo]));
+            float hi_norm = __bfloat162float(kh[hi]) * sc * (1.f + __bfloat162float(knw[hi]));
+            float angle = float(pos) * PF_ROPE_INV_FREQ[pair];
+            float sv, cv;
+            __sincosf(angle, &sv, &cv);
+            __nv_bfloat16 lo_out = __float2bfloat16(lo_norm * cv - hi_norm * sv);
+            __nv_bfloat16 hi_out = __float2bfloat16(hi_norm * cv + lo_norm * sv);
+            kh[lo] = lo_out;
+            kh[hi] = hi_out;
+            kc[lo] = lo_out;
+            kc[hi] = hi_out;
+            vc[lo] = vh[lo];
+            vc[hi] = vh[hi];
+        }
+        for (int i2 = lid + ROT_HALF; i2 < HALF_DIM; i2 += 32) {
+            float2 kv = __bfloat1622float2(kh2[i2]);
+            float2 wv = __bfloat1622float2(knw2[i2]);
+            __nv_bfloat162 out2 = __floats2bfloat162_rn(
+                kv.x * sc * (1.f + wv.x),
+                kv.y * sc * (1.f + wv.y));
+            kh2_out[i2] = out2;
+            kc2[i2] = out2;
+            vc2[i2] = vh2[i2];
         }
     }
 }
@@ -799,6 +894,258 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+static bool prefill_tc_debug_enabled() {
+    static int enabled = []() {
+        const char *value = std::getenv("MEGAKERNEL_DEBUG_PREFILL_TC");
+        return (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static bool prefill_tc_compare_enabled() {
+    static int enabled = []() {
+        const char *value = std::getenv("MEGAKERNEL_DEBUG_PREFILL_TC_COMPARE");
+        return (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static bool prefill_tc_proj_enabled() {
+    static int enabled = []() {
+        const char *master = std::getenv("MEGAKERNEL_PREFILL_TC");
+        if (master == nullptr || master[0] == '\0' || master[0] == '0') {
+            return 0;
+        }
+        const char *value = std::getenv("MEGAKERNEL_PREFILL_TC_PROJ");
+        return (value == nullptr || value[0] == '\0' || value[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static bool prefill_tc_gate_up_enabled() {
+    static int enabled = []() {
+        const char *master = std::getenv("MEGAKERNEL_PREFILL_TC");
+        if (master == nullptr || master[0] == '\0' || master[0] == '0') {
+            return 0;
+        }
+        const char *value = std::getenv("MEGAKERNEL_PREFILL_TC_GATE_UP");
+        return (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+static size_t nvfp4_tc_scale_bytes(int rows, int cols) {
+    return static_cast<size_t>((rows + NVFP4_TC_ROWS_PER_TILE - 1) / NVFP4_TC_ROWS_PER_TILE) *
+           static_cast<size_t>(cols / NVFP4_TC_K_PER_TILE) * 512ull;
+}
+
+static void debug_compare_prefill_tc_proj(
+    cublasHandle_t cublas,
+    const __nv_bfloat16 *normalized,
+    const __nv_bfloat16 *weight_bf16,
+    const __nv_bfloat16 *tc_out,
+    int seq_len,
+    int logical_rows,
+    int out_stride,
+    int k,
+    const char *tag)
+{
+    static int already_dumped = 0;
+    if (!prefill_tc_compare_enabled() || already_dumped) {
+        return;
+    }
+
+    __nv_bfloat16 *ref = nullptr;
+    if (cudaMalloc(&ref, static_cast<size_t>(seq_len) * logical_rows * sizeof(__nv_bfloat16)) != cudaSuccess) {
+        return;
+    }
+
+    cudaStream_t stream = nullptr;
+    cublasGetStream(cublas, &stream);
+    cublas_bf16_gemm(cublas, normalized, weight_bf16, ref, seq_len, logical_rows, k);
+    cudaStreamSynchronize(stream);
+
+    int ref_count = seq_len * logical_rows;
+    int tc_count = seq_len * out_stride;
+    std::vector<__nv_bfloat16> tc_host(tc_count);
+    std::vector<__nv_bfloat16> ref_host(ref_count);
+    cudaMemcpy(tc_host.data(), tc_out, static_cast<size_t>(tc_count) * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(ref_host.data(), ref, static_cast<size_t>(ref_count) * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    auto tc_at = [&](int row, int col) { return __bfloat162float(tc_host[row * out_stride + col]); };
+    auto bf16_at = [&](int row, int col) { return __bfloat162float(ref_host[row * logical_rows + col]); };
+
+    float max_row_major = 0.0f;
+    float sum_row_major = 0.0f;
+    int finite_row = 0;
+    int total = seq_len * logical_rows;
+    for (int s = 0; s < seq_len; ++s) {
+        for (int n = 0; n < logical_rows; ++n) {
+            float ref_v = bf16_at(s, n);
+            float row_v = tc_at(s, n);
+            float diff_row = fabsf(row_v - ref_v);
+            max_row_major = fmaxf(max_row_major, diff_row);
+            sum_row_major += diff_row;
+            finite_row += int(isfinite(row_v));
+        }
+    }
+
+    std::fprintf(
+        stderr,
+        "prefill_tc_compare[%s]: seq=%d logical=%d stride=%d k=%d row_max=%.6f row_mean=%.6f row_finite=%d/%d ref0=%.6f row0=%.6f\n",
+        tag,
+        seq_len,
+        logical_rows,
+        out_stride,
+        k,
+        max_row_major,
+        sum_row_major / total,
+        finite_row,
+        total,
+        bf16_at(0, 0),
+        tc_at(0, 0));
+
+    already_dumped = 1;
+    cudaFree(ref);
+}
+
+static bool cublaslt_nvfp4_bf16_gemm(
+    const uint8_t *weight_packed,
+    const uint8_t *weight_scales,
+    const uint8_t *act_packed,
+    const uint8_t *act_scales,
+    __nv_bfloat16 *out,
+    int out_rows,
+    int seq_len,
+    int k,
+    cudaStream_t stream)
+{
+    if (!weight_packed || !weight_scales || !act_packed || !act_scales || !out) {
+        return false;
+    }
+
+    static cublasLtHandle_t handle = nullptr;
+    static void *workspace = nullptr;
+    static size_t workspace_size = 0;
+    if (!handle && cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+    if (workspace == nullptr) {
+        if (cudaMalloc(&workspace, PREFILL_TC_MAX_WORKSPACE) != cudaSuccess) {
+            workspace = nullptr;
+            workspace_size = 0;
+            return false;
+        }
+        workspace_size = PREFILL_TC_MAX_WORKSPACE;
+    }
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatrixLayout_t d_desc = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    bool ok = false;
+    cublasLtMatmulAlgo_t algo{};
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    int returned_results = 0;
+    cublasStatus_t heuristic_status = CUBLAS_STATUS_SUCCESS;
+
+    cublasOperation_t trans_a = CUBLAS_OP_T;
+    cublasOperation_t trans_b = CUBLAS_OP_N;
+    cublasLtMatmulMatrixScale_t a_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulMatrixScale_t b_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtOrder_t col_order = CUBLASLT_ORDER_COL;
+
+    if (cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) {
+        goto cleanup;
+    }
+    if (cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &a_scale_mode, sizeof(a_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &b_scale_mode, sizeof(b_scale_mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_scales, sizeof(act_scales)) != CUBLAS_STATUS_SUCCESS) {
+        goto cleanup;
+    }
+
+    if (cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, k, out_rows, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, k, seq_len, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_16BF, out_rows, seq_len, out_rows) != CUBLAS_STATUS_SUCCESS) {
+        goto cleanup;
+    }
+
+    cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+    cublasLtMatrixLayoutSetAttribute(d_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &col_order, sizeof(col_order));
+
+    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
+        goto cleanup;
+    }
+    cublasLtMatmulPreferenceSetAttribute(
+        preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_size,
+        sizeof(workspace_size));
+
+    heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+        handle,
+        op_desc,
+        a_desc,
+        b_desc,
+        c_desc,
+        d_desc,
+        preference,
+        1,
+        &heuristic,
+        &returned_results);
+    if (heuristic_status != CUBLAS_STATUS_SUCCESS || returned_results == 0 || heuristic.workspaceSize > workspace_size) {
+        goto cleanup;
+    }
+    algo = heuristic.algo;
+
+    {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cudaGetLastError();
+        cublasStatus_t status = cublasLtMatmul(
+            handle,
+            op_desc,
+            &alpha,
+            weight_packed,
+            a_desc,
+            act_packed,
+            b_desc,
+            &beta,
+            out,
+            c_desc,
+            out,
+            d_desc,
+            &algo,
+            workspace,
+            heuristic.workspaceSize,
+            stream);
+        cudaError_t last_error = cudaGetLastError();
+        ok = (status == CUBLAS_STATUS_SUCCESS && last_error == cudaSuccess);
+        if (prefill_tc_debug_enabled() && !ok) {
+            std::fprintf(stderr,
+                         "prefill_tc_cublaslt: status=%d cuda=%d m=%d n=%d k=%d\n",
+                         int(status), int(last_error), out_rows, seq_len, k);
+        }
+    }
+
+cleanup:
+    if (preference) cublasLtMatmulPreferenceDestroy(preference);
+    if (d_desc) cublasLtMatrixLayoutDestroy(d_desc);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+    return ok;
+}
+
 // ===== Main orchestrator =====
 static void launch_prefill_bf16_impl(
     const int *token_ids, int seq_len, int *output_token,
@@ -810,7 +1157,8 @@ static void launch_prefill_bf16_impl(
     float *dn_states, float *conv_bufs,
     // Scratch (ALL bf16 except state/conv which are f32)
     __nv_bfloat16 *hidden, __nv_bfloat16 *residual, __nv_bfloat16 *normalized,
-    __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
+    __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2, __half *proj_buf_half,
+    uint8_t *proj_act_packed, uint8_t *proj_act_scales,
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
     __nv_bfloat16 *dn_out_buf,
     float *beta_buf, float *alpha_buf,
@@ -852,26 +1200,79 @@ static void launch_prefill_bf16_impl(
         const PFLayerWeights &lw = hl[li];
         const PFFusedLayerWeights &fw = hfl[li];
         int lt = LAYER_TYPE[li];
+        bool use_tc_weights = (
+            fw.proj_weight_packed != nullptr &&
+            fw.proj_weight_scales != nullptr &&
+            fw.gate_up_weight_packed != nullptr &&
+            fw.gate_up_weight_scales != nullptr &&
+            proj_act_packed != nullptr &&
+            proj_act_scales != nullptr);
+        bool use_tc_proj = use_tc_weights && prefill_tc_proj_enabled();
+        bool use_tc_gate_up = use_tc_weights && prefill_tc_gate_up_enabled();
 
         const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)lw.ptrs[0];
         pf_rmsnorm<<<S, 256, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+        if (use_tc_proj) {
+            cudaMemsetAsync(proj_act_scales, 0, nvfp4_tc_scale_bytes(S, HIDDEN), stream);
+            launch_quantize_nvfp4_lm_out(
+                normalized,
+                S,
+                HIDDEN,
+                proj_act_packed,
+                proj_act_scales,
+                stream);
+        }
 
         if (lt == 0) {
             // DeltaNet
             constexpr int DN_QK_PRECOMP_STRIDE = DN_HEADS * DN_KEY * 2;
+            constexpr int DN_CTRL_STRIDE = DN_HEADS;
             const __nv_bfloat16 *conv_w=(const __nv_bfloat16*)lw.ptrs[5];
             const __nv_bfloat16 *a_log=(const __nv_bfloat16*)lw.ptrs[6];
             const __nv_bfloat16 *dt_bias=(const __nv_bfloat16*)lw.ptrs[7];
             const __nv_bfloat16 *dn_norm=(const __nv_bfloat16*)lw.ptrs[8];
             const __nv_bfloat16 *out_w=(const __nv_bfloat16*)lw.ptrs[9];
             const __nv_bfloat16 *post_norm=(const __nv_bfloat16*)lw.ptrs[10];
+            const __nv_bfloat16 *beta_w=(const __nv_bfloat16*)lw.ptrs[3];
+            const __nv_bfloat16 *alpha_w=(const __nv_bfloat16*)lw.ptrs[4];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
             const __nv_bfloat16 *proj_fused_w = (const __nv_bfloat16*)fw.proj_weight;
             const __nv_bfloat16 *gate_up_fused_w = (const __nv_bfloat16*)fw.gate_up_weight;
+            int dn_proj_stride = DN_PROJ_FUSED;
+            __nv_bfloat16 *beta_proj_bf16 = nullptr;
+            __nv_bfloat16 *alpha_proj_bf16 = nullptr;
 
-            cublas_bf16_gemm(cublas, normalized, proj_fused_w, proj_buf, S, DN_PROJ_FUSED, HIDDEN);
+            bool used_tc = use_tc_proj && cublaslt_nvfp4_bf16_gemm(
+                (const uint8_t *)fw.proj_weight_packed,
+                (const uint8_t *)fw.proj_weight_scales,
+                proj_act_packed,
+                proj_act_scales,
+                proj_buf,
+                DN_PROJ_FUSED_PADDED,
+                S,
+                HIDDEN,
+                stream);
+            if (used_tc) {
+                dn_proj_stride = DN_PROJ_FUSED_PADDED;
+                beta_proj_bf16 = reinterpret_cast<__nv_bfloat16 *>(beta_buf);
+                alpha_proj_bf16 = reinterpret_cast<__nv_bfloat16 *>(alpha_buf);
+                cublas_bf16_gemm(cublas, normalized, beta_w, beta_proj_bf16, S, DN_HEADS, HIDDEN);
+                cublas_bf16_gemm(cublas, normalized, alpha_w, alpha_proj_bf16, S, DN_HEADS, HIDDEN);
+                debug_compare_prefill_tc_proj(
+                    cublas,
+                    normalized,
+                    proj_fused_w,
+                    proj_buf,
+                    S,
+                    DN_PROJ_FUSED,
+                    DN_PROJ_FUSED_PADDED,
+                    HIDDEN,
+                    "dn_proj");
+            } else {
+                cublas_bf16_gemm(cublas, normalized, proj_fused_w, proj_buf, S, DN_PROJ_FUSED, HIDDEN);
+            }
             pf_deltanet_prepare_qk<256><<<DN_HEADS, 256, 0, stream>>>(
-                proj_buf, DN_PROJ_FUSED,
+                proj_buf, dn_proj_stride,
                 conv_w,
                 conv_bufs + dn_idx * DN_CONV_CH * DN_CONV_K,
                 proj_buf2,
@@ -881,8 +1282,9 @@ static void launch_prefill_bf16_impl(
             // Standalone recurrence
             pf_deltanet_recurrence_tiled<PREFILL_DN_BLOCK_SIZE, PREFILL_DN_BLOCKS_PER_HEAD>
                 <<<DN_HEADS * PREFILL_DN_BLOCKS_PER_HEAD, PREFILL_DN_BLOCK_SIZE, 0, stream>>>(
-                proj_buf, DN_PROJ_FUSED,
+                proj_buf, dn_proj_stride,
                 proj_buf2, DN_QK_PRECOMP_STRIDE,
+                beta_proj_bf16, alpha_proj_bf16, DN_CTRL_STRIDE,
                 conv_w, a_log, dt_bias,
                 dn_states + dn_idx*dn_stride,
                 conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
@@ -890,7 +1292,7 @@ static void launch_prefill_bf16_impl(
             pf_deltanet_finalize<<<S * DN_HEADS, 64, 0, stream>>>(
                 dn_out_buf,
                 proj_buf,
-                DN_PROJ_FUSED,
+                dn_proj_stride,
                 DN_CONV_CH,
                 dn_norm,
                 S);
@@ -902,7 +1304,29 @@ static void launch_prefill_bf16_impl(
 
             // MLP
             int mlp_bk = (S*INTER + 511) / 512;
-            cublas_bf16_gemm(cublas, normalized, gate_up_fused_w, proj_buf, S, MLP_GATE_UP_FUSED, HIDDEN);
+            if (use_tc_gate_up) {
+                cudaMemsetAsync(proj_act_scales, 0, nvfp4_tc_scale_bytes(S, HIDDEN), stream);
+                launch_quantize_nvfp4_lm_out(
+                    normalized,
+                    S,
+                    HIDDEN,
+                    proj_act_packed,
+                    proj_act_scales,
+                    stream);
+            }
+            used_tc = use_tc_gate_up && cublaslt_nvfp4_bf16_gemm(
+                (const uint8_t *)fw.gate_up_weight_packed,
+                (const uint8_t *)fw.gate_up_weight_scales,
+                proj_act_packed,
+                proj_act_scales,
+                proj_buf,
+                MLP_GATE_UP_FUSED,
+                S,
+                HIDDEN,
+                stream);
+            if (!used_tc) {
+                cublas_bf16_gemm(cublas, normalized, gate_up_fused_w, proj_buf, S, MLP_GATE_UP_FUSED, HIDDEN);
+            }
             pf_silu_mul_fused_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, mlp_buf, S, INTER);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf2, S, HIDDEN, INTER);
             pf_add_residual_bf16<<<res_bk, 256, 0, stream>>>(proj_buf2, residual, hidden, S*HIDDEN);
@@ -918,7 +1342,30 @@ static void launch_prefill_bf16_impl(
             const __nv_bfloat16 *proj_fused_w = (const __nv_bfloat16*)fw.proj_weight;
             const __nv_bfloat16 *gate_up_fused_w = (const __nv_bfloat16*)fw.gate_up_weight;
 
-            cublas_bf16_gemm(cublas, normalized, proj_fused_w, proj_buf, S, FA_QKV_FUSED, HIDDEN);
+            bool used_tc = use_tc_proj && cublaslt_nvfp4_bf16_gemm(
+                (const uint8_t *)fw.proj_weight_packed,
+                (const uint8_t *)fw.proj_weight_scales,
+                proj_act_packed,
+                proj_act_scales,
+                proj_buf,
+                FA_QKV_FUSED,
+                S,
+                HIDDEN,
+                stream);
+            if (used_tc) {
+                debug_compare_prefill_tc_proj(
+                    cublas,
+                    normalized,
+                    proj_fused_w,
+                    proj_buf,
+                    S,
+                    FA_QKV_FUSED,
+                    FA_QKV_FUSED,
+                    HIDDEN,
+                    "fa_proj");
+            } else {
+                cublas_bf16_gemm(cublas, normalized, proj_fused_w, proj_buf, S, FA_QKV_FUSED, HIDDEN);
+            }
 
             constexpr int PREFILL_FA_WARPS = PREFILL_FA_BLOCK_SIZE / 32;
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
@@ -940,7 +1387,29 @@ static void launch_prefill_bf16_impl(
 
             // MLP
             int mlp_bk = (S*INTER + 511) / 512;
-            cublas_bf16_gemm(cublas, normalized, gate_up_fused_w, proj_buf, S, MLP_GATE_UP_FUSED, HIDDEN);
+            if (use_tc_gate_up) {
+                cudaMemsetAsync(proj_act_scales, 0, nvfp4_tc_scale_bytes(S, HIDDEN), stream);
+                launch_quantize_nvfp4_lm_out(
+                    normalized,
+                    S,
+                    HIDDEN,
+                    proj_act_packed,
+                    proj_act_scales,
+                    stream);
+            }
+            used_tc = use_tc_gate_up && cublaslt_nvfp4_bf16_gemm(
+                (const uint8_t *)fw.gate_up_weight_packed,
+                (const uint8_t *)fw.gate_up_weight_scales,
+                proj_act_packed,
+                proj_act_scales,
+                proj_buf,
+                MLP_GATE_UP_FUSED,
+                S,
+                HIDDEN,
+                stream);
+            if (!used_tc) {
+                cublas_bf16_gemm(cublas, normalized, gate_up_fused_w, proj_buf, S, MLP_GATE_UP_FUSED, HIDDEN);
+            }
             pf_silu_mul_fused_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, mlp_buf, S, INTER);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf2, S, HIDDEN, INTER);
             pf_add_residual_bf16<<<res_bk, 256, 0, stream>>>(proj_buf2, residual, hidden, S*HIDDEN);
@@ -981,7 +1450,8 @@ extern "C" void launch_prefill_bf16(
     const void *final_norm_w, const void *lm_head_w,
     void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
     void *hidden, void *residual, void *normalized,
-    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *proj_buf, void *proj_buf2, void *proj_buf_half, void *proj_act_packed, void *proj_act_scales,
+    void *attn_buf, void *mlp_buf,
     void *dn_out_buf, void *beta_buf, void *alpha_buf,
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
@@ -995,7 +1465,8 @@ extern "C" void launch_prefill_bf16(
         (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
         (float *)dn_states, (float *)conv_bufs,
         (__nv_bfloat16 *)hidden, (__nv_bfloat16 *)residual, (__nv_bfloat16 *)normalized,
-        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2,
+        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2, (__half *)proj_buf_half,
+        (uint8_t *)proj_act_packed, (uint8_t *)proj_act_scales,
         (__nv_bfloat16 *)attn_buf, (__nv_bfloat16 *)mlp_buf,
         (__nv_bfloat16 *)dn_out_buf,
         (float *)beta_buf, (float *)alpha_buf,
@@ -1013,7 +1484,8 @@ extern "C" void launch_prefill_bf16_nvfp4_lm(
     const void *lm_head_weight_packed, const void *lm_head_scales,
     void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
     void *hidden, void *residual, void *normalized,
-    void *proj_buf, void *proj_buf2, void *attn_buf, void *mlp_buf,
+    void *proj_buf, void *proj_buf2, void *proj_buf_half, void *proj_act_packed, void *proj_act_scales,
+    void *attn_buf, void *mlp_buf,
     void *dn_out_buf, void *beta_buf, void *alpha_buf,
     void *final_normed, void *hidden_bf16_out,
     void *lm_bmv, void *lm_bmi,
@@ -1029,7 +1501,8 @@ extern "C" void launch_prefill_bf16_nvfp4_lm(
         (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
         (float *)dn_states, (float *)conv_bufs,
         (__nv_bfloat16 *)hidden, (__nv_bfloat16 *)residual, (__nv_bfloat16 *)normalized,
-        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2,
+        (__nv_bfloat16 *)proj_buf, (__nv_bfloat16 *)proj_buf2, (__half *)proj_buf_half,
+        (uint8_t *)proj_act_packed, (uint8_t *)proj_act_scales,
         (__nv_bfloat16 *)attn_buf, (__nv_bfloat16 *)mlp_buf,
         (__nv_bfloat16 *)dn_out_buf,
         (float *)beta_buf, (float *)alpha_buf,
