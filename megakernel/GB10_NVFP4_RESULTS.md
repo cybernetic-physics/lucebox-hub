@@ -67,6 +67,16 @@ The best validated setting on this GB10 was:
 That moved the focused prompt benchmark from the earlier `pp520 ≈ 11.3k tok/s`
 range into the `16k tok/s` range on clean runs.
 
+On top of that, the current hybrid prefill path now uses CUDA graph replay for
+repeated prompt lengths. The captured sequence keeps the existing CUDA/cuBLAS
+prompt schedule, but replays it as a persistent graph instead of rebuilding the
+same layer-by-layer launch train every time. This is enabled by default for the
+NVFP4 hybrid prompt path and can be disabled with:
+
+```bash
+MEGAKERNEL_PREFILL_GRAPH=0
+```
+
 ## Current Luce results
 
 ### Repo benchmark
@@ -83,14 +93,14 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `pp520 = 15847 tok/s`
-- `tg128 = 181 tok/s`
-- prompt time: `32.8 ms`
-- decode time: `707.3 ms`
+- `pp520 = 16681 tok/s`
+- `tg128 = 182 tok/s`
+- prompt time: `31.2 ms`
+- decode time: `705.2 ms`
 
 Approximate combined `520 + 128` latency:
 
-- `740.1 ms`
+- `736.4 ms`
 
 ### Focused pp / tg harness
 
@@ -106,8 +116,8 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `pp520 = 16048.5 tok/s`
-- `32.4 ms`
+- `pp520 = 16398.1 tok/s`
+- `31.7 ms`
 
 ### Decode-only benchmark
 
@@ -195,15 +205,15 @@ Result:
 
 | workload | Luce NVFP4 | llama.cpp BF16 | winner |
 | --- | ---: | ---: | --- |
-| `pp520` | `15847 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
-| `tg128` | `181 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
-| combined `520 + 128` latency | `740.1 ms` | `1012.9 ms` | `Luce NVFP4` |
+| `pp520` | `16681 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
+| `tg128` | `182 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
+| combined `520 + 128` latency | `736.4 ms` | `1012.9 ms` | `Luce NVFP4` |
 
 Relative to the clean refreshed `llama.cpp` run:
 
-- Luce prompt ingest is about `12.0%` faster
-- Luce decode is about `34.0%` faster
-- Luce total `520 + 128` latency is about `26.9%` lower
+- Luce prompt ingest is about `17.9%` faster
+- Luce decode is about `34.7%` faster
+- Luce total `520 + 128` latency is about `27.3%` lower
 
 ## Current conclusion
 
