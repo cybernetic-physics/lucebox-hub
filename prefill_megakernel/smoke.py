@@ -71,6 +71,7 @@ def random_weights():
 def main():
     torch.manual_seed(0)
     S = int(sys.argv[1]) if len(sys.argv) > 1 else 16
+    assert S % 16 == 0, "S must be a multiple of 16"
     print(f"S = {S}")
     w = random_weights()
     m = PrefillMegakernel(w)

@@ -50,7 +50,7 @@ def bench(S, n_warmup=3, n_iter=10):
 
 def main():
     print(f"{'S':>5}  {'existing (ms)':>15}  {'megakernel (ms)':>17}  {'speedup':>8}")
-    for S in [8, 16, 32, 64, 128]:
+    for S in [16, 32, 64, 128, 256]:
         ex, mk = bench(S)
         print(f"{S:>5}  {ex:>15.2f}  {mk:>17.2f}  {ex/mk:>7.2f}x")
 

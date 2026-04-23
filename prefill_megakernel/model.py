@@ -165,6 +165,10 @@ class PrefillMegakernel:
     def forward(self, token_ids: torch.Tensor) -> int:
         assert token_ids.dim() == 1
         S = int(token_ids.shape[0])
+        assert S % 16 == 0, (
+            f"S={S} must be a multiple of 16 (WMMA tile requirement). "
+            "Pad your prompt to the next multiple of 16 before calling."
+        )
         self._alloc_for_S(S)
         ids = token_ids.to(device="cuda", dtype=torch.int32).contiguous()
         _op(

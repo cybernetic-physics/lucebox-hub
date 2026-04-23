@@ -60,29 +60,45 @@ math issue; both kernels agree on well-conditioned inputs.
 
 ## Walltime on B200
 
+WMMA tensor-core GEMMs (bf16 16×16×16 tiles, f32 accumulation):
+
 ```
    S    existing (ms)    megakernel (ms)    speedup
-   8             4.60               4.86      0.95x
-  16             3.79               8.43      0.45x
-  32             5.01              15.80      0.32x
-  64             7.50              30.68      0.24x
- 128            12.19              60.79      0.20x
+  16             7.89              10.42      0.76x
+  32             5.07              11.61      0.44x
+  64             7.71              13.97      0.55x
+ 128            12.16              19.35      0.63x
+ 256            21.75              31.62      0.69x
 ```
 
-**The megakernel is slower.** This is honest — expected, even — and
-explains why prefill in this repo was originally *not* a megakernel:
+The first revision of this megakernel used naive warp-per-output-element
+FMA GEMMs and ran at **0.20× of cuBLAS at S=128**. Switching the GEMM
+primitive to `nvcuda::wmma` tiles lifted that to **0.63×** — a ~3× speedup
+at S=128 and ~4× at S=256, purely from the GEMM change.
 
-- GEMMs in this kernel are naive FMA (one warp per output element, bf16
-  loads + f32 accumulate). No tensor cores.
-- cuBLAS bf16 GEMMs on B200 hit ~1.5 PFLOPS via WGMMA tensor cores. My
-  naive GEMM is a small fraction of that.
-- With 480 kernel launches × ~2 μs each = ~1 ms of pure launch overhead,
-  the megakernel erases that cost — but the ~11 ms of GEMM work that
-  cuBLAS handles goes from 11 ms to ~60 ms when done by a naive kernel.
-  That's the whole gap.
+We're still not beating cuBLAS. The remaining ~30–50% gap comes from:
 
-At small S (8), launch overhead nearly dominates and the two are within a
-rounding error. At large S, GEMM throughput dominates and cuBLAS wins.
+1. **1 block per SM** — WMMA's per-thread register footprint pushed
+   occupancy below 2 blocks/SM, so `__launch_bounds__(512, 1)` and
+   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` clamp the cooperative
+   launch to 148 blocks. cuBLAS can dispatch separate launches with
+   higher per-SM occupancy.
+2. **No shared-memory tile re-use** — each WMMA call loads X and W
+   directly from global. cuBLAS tiles X across multiple N tiles and
+   keeps it in shared.
+3. **DeltaNet recurrence serializes across 16 heads** — the other 132
+   SMs idle during DN phases.
+4. **No WGMMA** — Blackwell-native warp-group MMA is ~2× faster per
+   warp than WMMA. Requires async restructuring.
+
+Those are all orthogonal optimization passes inside the megakernel
+structure — no architectural changes needed.
+
+### S % 16 requirement
+
+WMMA tiles are 16 rows wide, so the kernel now requires `S % 16 == 0`.
+`PrefillMegakernel.forward()` asserts this. Pad your prompt to the next
+multiple of 16 before calling (see `smoke.py` / `test_vs_existing_prefill.py`).
 
 ## Why ship it slower
 

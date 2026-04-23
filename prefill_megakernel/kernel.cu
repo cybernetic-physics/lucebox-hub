@@ -19,9 +19,11 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
+#include <mma.h>
 #include <cmath>
 
 namespace cg = cooperative_groups;
+namespace wmma = nvcuda::wmma;
 
 // ============================================================================
 // Model constants — Qwen 3.5-0.8B
@@ -197,101 +199,103 @@ __device__ void phase_rmsnorm(
 }
 
 // ============================================================================
-// GEMM primitive: Y[S, N] = X[S, K] @ W[N, K]^T  (bf16 in, bf16 out, f32 acc)
-// One warp per output element. Work distributed round-robin across grid.
+// GEMM primitives: tensor-core WMMA 16×16×16 bf16 tiles with f32 accumulation.
 //
-// K must be a multiple of 8. For K=1024 this runs at ~15% of peak bf16 (no
-// tensor cores, naive fma) — fine for a first correct megakernel. Tensor-core
-// tiling is a separate optimization pass.
+// Output layout: Y[S, N] = X[S, K] @ W[N, K]^T  (W stored row-major).
+// Each warp computes one 16×16 output tile. With NW=16 warps/block and 148
+// blocks on B200, the grid holds 2368 warps — each owns one tile and strides
+// through the (S/16)*(N/16) output grid.
+//
+// Preconditions (enforced by caller):
+//   - S % 16 == 0   (pad tokens to multiple of 16 in Python)
+//   - K % 16 == 0   (true for every K in Qwen 3.5-0.8B — HIDDEN/INTER/FA_Q_SIZE/DN_V_SIZE)
+//   - N % 16 == 0   (true for every output projection in Qwen 3.5-0.8B)
 // ============================================================================
 
-__device__ void gemm_bf16_bf16(
+template <typename T>
+__device__ void gemm_wmma_core(
     const __nv_bfloat16 *__restrict__ X, int K,
     const __nv_bfloat16 *__restrict__ W,
-    __nv_bfloat16 *__restrict__ Y,
+    T *__restrict__ Y,                      // bf16 or float
+    const __nv_bfloat16 *__restrict__ R,    // optional residual (bf16) - nullptr if none
     int S, int N)
 {
-    int total = S * N;
-    int warp_id_block = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int warps_per_grid = gridDim.x * NW;
-    int warp_id_grid = blockIdx.x * NW + warp_id_block;
+    const int warp_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps_grid = gridDim.x * NW;
+    const int warp_grid = blockIdx.x * NW + warp_block;
+    const int tiles_M = S >> 4;
+    const int tiles_N = N >> 4;
+    const int total_tiles = tiles_M * tiles_N;
 
-    for (int idx = warp_id_grid; idx < total; idx += warps_per_grid) {
-        int s = idx / N;
-        int n = idx % N;
-        const __nv_bfloat16 *x = X + s * K;
-        const __nv_bfloat16 *w = W + n * K;
-        float acc = 0.0f;
+    // Shared memory f32 tile per warp for store_matrix_sync -> bf16 conversion.
+    extern __shared__ float s_tiles_raw[];
+    float *s_tile = s_tiles_raw + warp_block * 256;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+
+    for (int t = warp_grid; t < total_tiles; t += warps_grid) {
+        int tm = t / tiles_N;
+        int tn = t % tiles_N;
+        int s_start = tm << 4;
+        int n_start = tn << 4;
+
+        wmma::fill_fragment(c_frag, 0.0f);
         #pragma unroll 4
-        for (int k = lane * 8; k < K; k += WARP_SIZE * 8) {
-            uint4 wu = load_128(reinterpret_cast<const uint4 *>(w + k));
-            acc += dot8_bf16(wu, x + k);
+        for (int k = 0; k < K; k += 16) {
+            wmma::load_matrix_sync(a_frag, X + s_start * K + k, K);
+            // W[N,K] row-major tile starting at W + n_start*K + k.
+            // We want B = W^T's 16×16 tile: B[k_i, n_j] = W[n_j, k_i].
+            // Passing col_major with stride K says "column j starts at offset j*K",
+            // i.e. column j of B is row j of W — exactly what we want.
+            wmma::load_matrix_sync(b_frag, W + n_start * K + k, K);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
-        acc = warp_reduce_sum(acc);
-        if (lane == 0) Y[idx] = __float2bfloat16(acc);
+
+        // Store f32 accumulator to shared, then convert to the output dtype.
+        wmma::store_matrix_sync(s_tile, c_frag, 16, wmma::mem_row_major);
+        // 32 lanes cooperatively write 256 elements.
+        #pragma unroll
+        for (int i = lane; i < 256; i += 32) {
+            int r = i >> 4;
+            int c = i & 15;
+            int out_s = s_start + r;
+            int out_n = n_start + c;
+            int idx = out_s * N + out_n;
+            float v = s_tile[i];
+            if (R != nullptr) {
+                v += __bfloat162float(R[idx]);
+            }
+            if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+                Y[idx] = __float2bfloat16(v);
+            } else {
+                Y[idx] = v;
+            }
+        }
     }
 }
 
-// GEMM variant: Y[S, N] accumulator in f32
-__device__ void gemm_bf16_f32(
-    const __nv_bfloat16 *__restrict__ X, int K,
-    const __nv_bfloat16 *__restrict__ W,
-    float *__restrict__ Y,
-    int S, int N)
+__device__ __forceinline__ void gemm_bf16_bf16(
+    const __nv_bfloat16 *X, int K, const __nv_bfloat16 *W,
+    __nv_bfloat16 *Y, int S, int N)
 {
-    int total = S * N;
-    int warp_id_block = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int warps_per_grid = gridDim.x * NW;
-    int warp_id_grid = blockIdx.x * NW + warp_id_block;
-
-    for (int idx = warp_id_grid; idx < total; idx += warps_per_grid) {
-        int s = idx / N;
-        int n = idx % N;
-        const __nv_bfloat16 *x = X + s * K;
-        const __nv_bfloat16 *w = W + n * K;
-        float acc = 0.0f;
-        #pragma unroll 4
-        for (int k = lane * 8; k < K; k += WARP_SIZE * 8) {
-            uint4 wu = load_128(reinterpret_cast<const uint4 *>(w + k));
-            acc += dot8_bf16(wu, x + k);
-        }
-        acc = warp_reduce_sum(acc);
-        if (lane == 0) Y[idx] = acc;
-    }
+    gemm_wmma_core<__nv_bfloat16>(X, K, W, Y, nullptr, S, N);
 }
 
-// GEMM + residual add: Y[S, N] += proj + res  (both bf16)
-__device__ void gemm_bf16_add_residual(
-    const __nv_bfloat16 *__restrict__ X, int K,
-    const __nv_bfloat16 *__restrict__ W,
-    const __nv_bfloat16 *__restrict__ R,   // residual
-    __nv_bfloat16 *__restrict__ Y,
-    int S, int N)
+__device__ __forceinline__ void gemm_bf16_f32(
+    const __nv_bfloat16 *X, int K, const __nv_bfloat16 *W,
+    float *Y, int S, int N)
 {
-    int total = S * N;
-    int warp_id_block = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int warps_per_grid = gridDim.x * NW;
-    int warp_id_grid = blockIdx.x * NW + warp_id_block;
+    gemm_wmma_core<float>(X, K, W, Y, nullptr, S, N);
+}
 
-    for (int idx = warp_id_grid; idx < total; idx += warps_per_grid) {
-        int s = idx / N;
-        int n = idx % N;
-        const __nv_bfloat16 *x = X + s * K;
-        const __nv_bfloat16 *w = W + n * K;
-        float acc = 0.0f;
-        #pragma unroll 4
-        for (int k = lane * 8; k < K; k += WARP_SIZE * 8) {
-            uint4 wu = load_128(reinterpret_cast<const uint4 *>(w + k));
-            acc += dot8_bf16(wu, x + k);
-        }
-        acc = warp_reduce_sum(acc);
-        if (lane == 0) {
-            Y[idx] = __float2bfloat16(acc + __bfloat162float(R[idx]));
-        }
-    }
+__device__ __forceinline__ void gemm_bf16_add_residual(
+    const __nv_bfloat16 *X, int K, const __nv_bfloat16 *W,
+    const __nv_bfloat16 *R, __nv_bfloat16 *Y, int S, int N)
+{
+    gemm_wmma_core<__nv_bfloat16>(X, K, W, Y, R, S, N);
 }
 
 // ============================================================================
@@ -792,7 +796,7 @@ __device__ void phase_lm_final_reduce(
 // Megakernel entry point.
 // ============================================================================
 
-extern "C" __global__ void prefill_megakernel(
+extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakernel(
     const int *__restrict__ token_ids,      // [S]
     int       *__restrict__ out_token,       // [1]
     // Weights
@@ -984,7 +988,28 @@ extern "C" void launch_prefill_megakernel(
     int S, int max_seq,
     cudaStream_t stream)
 {
-    dim3 grid(PM_NUM_BLOCKS);
+    // Dynamic shared memory: NW warps × 16×16 f32 tile = 16 * 256 * 4 = 16 KB.
+    constexpr size_t smem_bytes = (size_t)NW * 256 * sizeof(float);
+
+    // Cooperative launch requires ALL blocks concurrently resident.
+    // Query occupancy (WMMA register pressure can drop it below 1/SM) and
+    // clamp. Printed on first call for visibility.
+    static int safe_num_blocks = 0;
+    if (safe_num_blocks == 0) {
+        int dev;
+        cudaGetDevice(&dev);
+        int sm_count;
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+        int blocks_per_sm = 0;
+        cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, (void *)prefill_megakernel,
+            PM_BLOCK_SIZE, smem_bytes);
+        safe_num_blocks = sm_count * blocks_per_sm;
+        (void)err;
+        if (safe_num_blocks < 1) safe_num_blocks = 1;
+        if (safe_num_blocks > PM_NUM_BLOCKS) safe_num_blocks = PM_NUM_BLOCKS;
+    }
+    dim3 grid(safe_num_blocks);
     dim3 block(PM_BLOCK_SIZE);
 
     void *args[] = {
@@ -1003,5 +1028,5 @@ extern "C" void launch_prefill_megakernel(
     };
 
     cudaLaunchCooperativeKernel(
-        (void *)prefill_megakernel, grid, block, args, 0, stream);
+        (void *)prefill_megakernel, grid, block, args, smem_bytes, stream);
 }
