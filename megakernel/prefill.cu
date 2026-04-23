@@ -207,12 +207,12 @@ pf_deltanet_recurrence(
         }
         __syncthreads();
 
-        // L2 normalize
+        // L2 normalize q (warp 0), L2 normalize k (warp 1), and beta/decay
+        // scalars (warp 2 lane 0). All three operate on disjoint shared
+        // targets, so they can run in parallel behind a single sync.
         if(wid==0){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_q[i]*s_q[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f)*Q_SCALE;n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_q[i]*=n;}
         if(wid==1){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_k[i]*s_k[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f);n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_k[i]*=n;}
-        __syncthreads();
-
-        if(tid==0){s_beta=1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));float x=alpha_proj[t*DN_HEADS+h]+dt_b;float sp=(x>20.f)?x:logf(1.f+expf(x));s_decay=expf(-expf(a_log_val)*sp);}
+        if(wid==2 && lid==0){s_beta=1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));float x=alpha_proj[t*DN_HEADS+h]+dt_b;float sp=(x>20.f)?x:logf(1.f+expf(x));s_decay=expf(-expf(a_log_val)*sp);}
         __syncthreads();
         float beta = s_beta, decay = s_decay;
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;

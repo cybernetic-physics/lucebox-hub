@@ -483,7 +483,10 @@ __device__ void phase_deltanet_recurrence(
         }
         __syncthreads();
 
-        // L2 normalize q and k.
+        // L2 normalize q (warp 0), L2 normalize k (warp 1), beta/decay
+        // scalars (warp 2 lane 0) — all disjoint targets, one sync fences
+        // the three in parallel (saves one sync per step vs the old
+        // two-phase normalize→beta/decay sequence).
         if (wid == 0) {
             float sq = 0; for (int i = lid; i < DN_KEY; i += 32) sq += s_q[i] * s_q[i];
             sq = mega_warp_sum(sq);
@@ -498,9 +501,7 @@ __device__ void phase_deltanet_recurrence(
             n = __shfl_sync(0xffffffff, n, 0);
             for (int i = lid; i < DN_KEY; i += 32) s_k[i] *= n;
         }
-        __syncthreads();
-
-        if (tid == 0) {
+        if (wid == 2 && lid == 0) {
             s_beta = 1.f / (1.f + expf(-beta_proj[t * DN_HEADS + h]));
             float x = alpha_proj[t * DN_HEADS + h] + dt_b;
             float sp = (x > 20.f) ? x : logf(1.f + expf(x));
