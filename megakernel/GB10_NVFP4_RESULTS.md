@@ -165,14 +165,14 @@ env HF_HOME=/home/sparkz/hf_cache \
 
 Validated result:
 
-- `pp520 = 20224 tok/s`
-- `tg128 = 182 tok/s`
-- prompt time: `25.7 ms`
-- decode time: `701.5 ms`
+- `pp520 = 19479 tok/s`
+- `tg128 = 183 tok/s`
+- prompt time: `26.7 ms`
+- decode time: `699.5 ms`
 
 Approximate combined `520 + 128` latency:
 
-- `727.2 ms`
+- `726.2 ms`
 
 ### Focused pp / tg harness
 
@@ -296,15 +296,15 @@ Result:
 
 | workload | Luce NVFP4 | llama.cpp BF16 | winner |
 | --- | ---: | ---: | --- |
-| `pp520` | `20224 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
-| `tg128` | `182 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
-| combined `520 + 128` latency | `727.2 ms` | `1012.9 ms` | `Luce NVFP4` |
+| `pp520` | `19479 tok/s` | `14150.99 tok/s` | `Luce NVFP4` |
+| `tg128` | `183 tok/s` | `135.10 tok/s` | `Luce NVFP4` |
+| combined `520 + 128` latency | `726.2 ms` | `1012.9 ms` | `Luce NVFP4` |
 
 Relative to the clean refreshed `llama.cpp` run:
 
-- Luce prompt ingest is about `42.9%` faster
-- Luce decode is about `34.7%` faster
-- Luce total `520 + 128` latency is about `28.2%` lower
+- Luce prompt ingest is about `37.6%` faster
+- Luce decode is about `35.5%` faster
+- Luce total `520 + 128` latency is about `28.3%` lower
 
 ## Current conclusion
 
