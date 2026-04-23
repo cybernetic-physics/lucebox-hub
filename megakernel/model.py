@@ -37,13 +37,15 @@ _decode_nvfp4 = None
 _decode_many_nvfp4 = None
 _prefill_bf16 = None
 _prefill_bf16_nvfp4_lm = None
+_prefill_megakernel_nvfp4 = None
 _quantize_nvfp4_out = None
 _quantize_nvfp4_lm_out = None
 
 
 def _load_op():
     global _decode, _decode_nvfp4, _decode_many_nvfp4
-    global _prefill_bf16, _prefill_bf16_nvfp4_lm, _quantize_nvfp4_out, _quantize_nvfp4_lm_out
+    global _prefill_bf16, _prefill_bf16_nvfp4_lm, _prefill_megakernel_nvfp4
+    global _quantize_nvfp4_out, _quantize_nvfp4_lm_out
     if _decode is None:
         import qwen35_megakernel_bf16_C
         ops = torch.ops.qwen35_megakernel_bf16_C
@@ -52,6 +54,7 @@ def _load_op():
         _decode_many_nvfp4 = ops.decode_many_nvfp4
         _prefill_bf16 = ops.prefill_bf16
         _prefill_bf16_nvfp4_lm = ops.prefill_bf16_nvfp4_lm
+        _prefill_megakernel_nvfp4 = ops.prefill_megakernel_nvfp4
         _quantize_nvfp4_out = ops.quantize_nvfp4_out
         _quantize_nvfp4_lm_out = ops.quantize_nvfp4_lm_out
 
@@ -69,6 +72,15 @@ def _resolve_backend(backend):
         return "nvfp4" if major >= 12 else "bf16"
 
     return backend
+
+
+def _resolve_prefill_mode():
+    return os.environ.get("MEGAKERNEL_PREFILL_MODE", "hybrid")
+
+
+def _resolve_prefill_graph():
+    value = os.environ.get("MEGAKERNEL_PREFILL_GRAPH", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
 
 
 def _quantize_matrix_nvfp4(weight, group_size):
@@ -347,6 +359,12 @@ class Decoder:
         self.backend = _resolve_backend(backend)
         self.backend_label = "NVFP4 decode" if self.backend == "nvfp4" else "BF16"
         self._nvfp4_group_size = nvfp4_group_size
+        self._prefill_mode = _resolve_prefill_mode()
+        self._prefill_graph_enabled = (
+            self.backend == "nvfp4"
+            and self._prefill_mode == "hybrid"
+            and _resolve_prefill_graph()
+        )
 
         if weights is None:
             weights, tokenizer = load_weights(
@@ -411,6 +429,106 @@ class Decoder:
         self._block_max_idxs = torch.empty(1024, **i32)
         self._lm_sync_counter = torch.zeros(1, **u32)
         self._out_token = torch.empty(1, **i32)
+        self._prefill_buffers = None
+        self._prefill_buffer_tokens = 0
+        self._prefill_graph_cache = {}
+
+    def _ensure_prefill_buffers(self, max_tokens: int):
+        if self._prefill_buffers is not None and self._prefill_buffer_tokens >= max_tokens:
+            return self._prefill_buffers
+
+        bf16 = dict(dtype=torch.bfloat16, device="cuda")
+        f32 = dict(dtype=torch.float32, device="cuda")
+        i32 = dict(dtype=torch.int32, device="cuda")
+        mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
+        self._prefill_buffers = dict(
+            hidden=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+            residual=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+            normalized=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+            proj_buf=torch.empty(max_tokens * mx, **bf16),
+            proj_buf2=torch.empty(max_tokens * mx, **bf16),
+            attn_buf=torch.empty(max_tokens * max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
+            mlp_buf=torch.empty(max_tokens * INTERMEDIATE_SIZE, **bf16),
+            dn_out_buf=torch.empty(max_tokens * DN_V_SIZE, **bf16),
+            beta_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+            alpha_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+            final_normed=torch.empty(HIDDEN_SIZE, **bf16),
+            hidden_bf16_out=torch.empty(HIDDEN_SIZE, **bf16),
+            lm_bmv=torch.empty(1024, **f32),
+            lm_bmi=torch.empty(1024, **i32),
+        )
+        self._prefill_buffer_tokens = max_tokens
+        return self._prefill_buffers
+
+    def _reset_runtime_state(self):
+        self._position = 0
+        self._fa_k_cache.zero_()
+        self._fa_v_cache.zero_()
+        self._dn_states.zero_()
+        self._conv_bufs.zero_()
+
+    def _run_prefill_bf16_nvfp4_lm(self, token_ids: torch.Tensor, buffers):
+        _prefill_bf16_nvfp4_lm(
+            self._out_token,
+            token_ids,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._lm_head_weight_packed,
+            self._lm_head_scales,
+            self._fa_k_cache,
+            self._fa_v_cache,
+            self._dn_states,
+            self._conv_bufs,
+            buffers["hidden"],
+            buffers["residual"],
+            buffers["normalized"],
+            buffers["proj_buf"],
+            buffers["proj_buf2"],
+            buffers["attn_buf"],
+            buffers["mlp_buf"],
+            buffers["dn_out_buf"],
+            buffers["beta_buf"],
+            buffers["alpha_buf"],
+            buffers["final_normed"],
+            buffers["hidden_bf16_out"],
+            buffers["lm_bmv"],
+            buffers["lm_bmi"],
+            self._lm_hidden_bf16,
+            self._lm_hidden_packed,
+            self._lm_hidden_scales,
+            self._lm_logits_f16,
+        )
+        self._hidden.copy_(buffers["hidden_bf16_out"])
+
+    def _build_prefill_graph(self, prompt_len: int):
+        buffers = self._ensure_prefill_buffers(prompt_len)
+        static_ids = torch.empty(prompt_len, dtype=torch.int32, device="cuda")
+        warmup_stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            self._reset_runtime_state()
+            static_ids.zero_()
+            self._run_prefill_bf16_nvfp4_lm(static_ids, buffers)
+        warmup_stream.synchronize()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        with torch.cuda.graph(graph):
+            self._reset_runtime_state()
+            self._run_prefill_bf16_nvfp4_lm(static_ids, buffers)
+
+        state = {"graph": graph, "token_ids": static_ids, "buffers": buffers}
+        self._prefill_graph_cache[prompt_len] = state
+        return state
+
+    def _prefill_graph_state(self, prompt_len: int):
+        state = self._prefill_graph_cache.get(prompt_len)
+        if state is None:
+            state = self._build_prefill_graph(prompt_len)
+        return state
 
     def step(self, token_id: int) -> int:
         """Decode one token. Returns next token id."""
@@ -479,12 +597,64 @@ class Decoder:
         self._position += num_steps
         return output_tokens
 
+    def prefill_tokens(self, token_ids: torch.Tensor) -> int:
+        """Run prompt prefill and return the first generated token id."""
+        if token_ids.device.type != "cuda" or token_ids.dtype != torch.int32 or token_ids.dim() != 1:
+            raise TypeError("token_ids must be a 1D CUDA int32 tensor")
+        prompt_len = int(token_ids.numel())
+        if self.backend == "nvfp4" and self._prefill_mode == "raw":
+            self.reset()
+            _prefill_megakernel_nvfp4(
+                self._out_token,
+                token_ids,
+                self._embed_weight,
+                self._layer_weights_packed_nvfp4,
+                self._final_norm_weight,
+                self._lm_head_weight_packed,
+                self._lm_head_scales,
+                self._lm_hidden_bf16,
+                self._lm_hidden_packed,
+                self._lm_hidden_scales,
+                self._lm_logits_f16,
+                self._fa_k_cache,
+                self._fa_v_cache,
+                self._dn_states,
+                self._conv_bufs,
+                self._hidden,
+                self._activations,
+                self._residual,
+                self._qkv_scratch,
+                self._kv_scratch,
+                self._attn_out,
+                self._mlp_inter,
+                self._z_scratch,
+                self._beta_scratch,
+                self._alpha_scratch,
+                self._normalized,
+                self._barrier_counter,
+                self._barrier_generation,
+                self._block_max_vals,
+                self._block_max_idxs,
+                self._lm_sync_counter,
+                MAX_SEQ_LEN,
+                self._nvfp4_group_size,
+            )
+        elif self.backend == "nvfp4":
+            if self._prefill_graph_enabled:
+                state = self._prefill_graph_state(prompt_len)
+                state["token_ids"].copy_(token_ids)
+                state["graph"].replay()
+            else:
+                self.reset()
+                buffers = self._ensure_prefill_buffers(prompt_len)
+                self._run_prefill_bf16_nvfp4_lm(token_ids, buffers)
+        else:
+            raise RuntimeError("prefill_tokens megakernel path is only implemented for the NVFP4 backend")
+        self._position = prompt_len
+        return self._out_token.item()
+
     def reset(self):
-        self._position = 0
-        self._fa_k_cache.zero_()
-        self._fa_v_cache.zero_()
-        self._dn_states.zero_()
-        self._conv_bufs.zero_()
+        self._reset_runtime_state()
 
     def generate(self, prompt: str, max_tokens: int = 100) -> str:
         self.reset()
