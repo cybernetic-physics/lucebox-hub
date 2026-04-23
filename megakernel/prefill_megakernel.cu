@@ -512,20 +512,31 @@ __device__ void phase_deltanet_recurrence(
         float beta = s_beta, decay = s_decay;
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
 
+        // Cache per-lane s_k / s_q into registers once per step so the
+        // CPW=8 inner-loop iterations read from registers instead of
+        // shared memory.
+        float sk_cache[RPL];
+        float sq_cache[RPL];
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++) {
+            sk_cache[ii] = s_k[lid + ii * 32];
+            sq_cache[ii] = s_q[lid + ii * 32];
+        }
+
+        #pragma unroll
         for (int jj = 0; jj < CPW; jj++) {
             int j = wid * CPW + jj;
             float kv = 0;
-            for (int ii = 0; ii < RPL; ii++) {
-                kv += sreg[jj * RPL + ii] * s_k[lid + ii * 32];
-            }
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj * RPL + ii] * sk_cache[ii];
             kv = mega_warp_sum(kv);
             kv = __shfl_sync(0xffffffff, kv, 0);
             float delta = (s_v[j] - decay * kv) * beta;
             float attn = 0;
+            #pragma unroll
             for (int ii = 0; ii < RPL; ii++) {
-                sreg[jj * RPL + ii] = decay * sreg[jj * RPL + ii]
-                                      + s_k[lid + ii * 32] * delta;
-                attn += sreg[jj * RPL + ii] * s_q[lid + ii * 32];
+                sreg[jj * RPL + ii] = decay * sreg[jj * RPL + ii] + sk_cache[ii] * delta;
+                attn += sreg[jj * RPL + ii] * sq_cache[ii];
             }
             attn = mega_warp_sum(attn);
             if (lid == 0) s_out[j] = attn;
