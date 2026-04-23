@@ -499,6 +499,7 @@ static __device__ void matvec_down_residual_nvfp4(
             const uint8_t *w_row = weight.data + m * row_bytes;
             const __half *s_row = weight.scales + m * row_scales;
             float sum = 0.0f;
+#pragma unroll 4
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint32_t packed = load_32bit(reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
                 int scale_idx = k / group_size;
@@ -540,6 +541,7 @@ static __device__ void matvec_o_residual_nvfp4(
             const uint8_t *w_row = weight.data + m * row_bytes;
             const __half *s_row = weight.scales + m * row_scales;
             float sum = 0.0f;
+#pragma unroll 4
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint32_t packed = load_32bit(reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
                 int scale_idx = k / group_size;
@@ -1103,6 +1105,7 @@ __global__ void lm_head_reduce_kernel(
 
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 decode_kernel_nvfp4(
+    const int *__restrict__ input_token_ptr,
     const __nv_bfloat16 *__restrict__ embed_weight,
     const __nv_bfloat16 *__restrict__ final_norm_weight,
     const LayerWeightsNVFP4 *__restrict__ layer_weights,
@@ -1123,7 +1126,7 @@ decode_kernel_nvfp4(
     float *__restrict__ g_normalized,
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_generation,
-    int input_token_id, int position, int max_seq_len)
+    int position, int max_seq_len)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -1135,6 +1138,7 @@ decode_kernel_nvfp4(
     __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
     __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
 
+    int input_token_id = __ldg(input_token_ptr);
     const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
     int fa_kv_stride = FA_NUM_KV_HEADS * max_seq_len * FA_HEAD_DIM;
     int dn_state_stride = DN_NUM_HEADS * DN_KEY_DIM * DN_VALUE_DIM;
@@ -1303,8 +1307,9 @@ extern "C" void launch_quantize_nvfp4_out(
         rows, cols, group_size);
 }
 
-extern "C" void launch_decode_nvfp4(
-    int input_token_id, int *output_token_id,
+static void launch_decode_step_nvfp4(
+    int num_blocks, int lm_blocks,
+    const int *input_token_ptr, int *output_token_id,
     const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
     const void *final_norm_weight,
     const void *lm_head_weight_packed, const void *lm_head_scales,
@@ -1319,8 +1324,8 @@ extern "C" void launch_decode_nvfp4(
     unsigned int *lm_sync_counter,
     int position, int max_seq_len, int group_size, cudaStream_t stream)
 {
-    int num_blocks = decode_launch_blocks();
     void *decode_args[] = {
+        (void *)&input_token_ptr,
         (void *)&embed_weight,
         (void *)&final_norm_weight,
         (void *)&layer_weights,
@@ -1341,7 +1346,6 @@ extern "C" void launch_decode_nvfp4(
         (void *)&g_normalized,
         (void *)&barrier_counter,
         (void *)&barrier_generation,
-        (void *)&input_token_id,
         (void *)&position,
         (void *)&max_seq_len,
     };
@@ -1353,7 +1357,6 @@ extern "C" void launch_decode_nvfp4(
         0,
         stream);
 
-    int lm_blocks = lm_launch_blocks();
     lm_head_kernel_nvfp4<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const uint8_t *)lm_head_weight_packed,
@@ -1366,4 +1369,120 @@ extern "C" void launch_decode_nvfp4(
         block_max_idxs,
         output_token_id,
         lm_blocks);
+}
+
+extern "C" void launch_decode_nvfp4(
+    const int *input_token_ptr, int *output_token_id,
+    const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
+    const void *final_norm_weight,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_activations, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
+    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_alpha_scratch, void *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_generation,
+    float *block_max_vals, int *block_max_idxs,
+    unsigned int *lm_sync_counter,
+    int position, int max_seq_len, int group_size, cudaStream_t stream)
+{
+    int num_blocks = decode_launch_blocks();
+    int lm_blocks = lm_launch_blocks();
+    launch_decode_step_nvfp4(
+        num_blocks,
+        lm_blocks,
+        input_token_ptr,
+        output_token_id,
+        embed_weight,
+        layer_weights,
+        final_norm_weight,
+        lm_head_weight_packed,
+        lm_head_scales,
+        fa_k_cache,
+        fa_v_cache,
+        dn_states,
+        conv_bufs,
+        hidden_buffer,
+        g_activations,
+        g_residual,
+        g_qkv_scratch,
+        g_kv_scratch,
+        g_attn_out,
+        g_mlp_inter,
+        g_z_scratch,
+        g_beta_scratch,
+        g_alpha_scratch,
+        g_normalized,
+        barrier_counter,
+        barrier_generation,
+        block_max_vals,
+        block_max_idxs,
+        lm_sync_counter,
+        position,
+        max_seq_len,
+        group_size,
+        stream);
+}
+
+extern "C" void launch_decode_many_nvfp4(
+    int *token_buffer, int *output_tokens, int steps,
+    const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
+    const void *final_norm_weight,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_activations, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
+    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_alpha_scratch, void *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_generation,
+    float *block_max_vals, int *block_max_idxs,
+    unsigned int *lm_sync_counter,
+    int position, int max_seq_len, int group_size, cudaStream_t stream)
+{
+    int num_blocks = decode_launch_blocks();
+    int lm_blocks = lm_launch_blocks();
+    for (int step = 0; step < steps; ++step) {
+        launch_decode_step_nvfp4(
+            num_blocks,
+            lm_blocks,
+            token_buffer,
+            token_buffer,
+            embed_weight,
+            layer_weights,
+            final_norm_weight,
+            lm_head_weight_packed,
+            lm_head_scales,
+            fa_k_cache,
+            fa_v_cache,
+            dn_states,
+            conv_bufs,
+            hidden_buffer,
+            g_activations,
+            g_residual,
+            g_qkv_scratch,
+            g_kv_scratch,
+            g_attn_out,
+            g_mlp_inter,
+            g_z_scratch,
+            g_beta_scratch,
+            g_alpha_scratch,
+            g_normalized,
+            barrier_counter,
+            barrier_generation,
+            block_max_vals,
+            block_max_idxs,
+            lm_sync_counter,
+            position + step,
+            max_seq_len,
+            group_size,
+            stream);
+        cudaMemcpyAsync(
+            output_tokens + step,
+            token_buffer,
+            sizeof(int),
+            cudaMemcpyDeviceToDevice,
+            stream);
+    }
 }

@@ -30,17 +30,19 @@ NVFP4_GROUP_SIZE = 32
 
 _decode = None
 _decode_nvfp4 = None
+_decode_many_nvfp4 = None
 _prefill_bf16 = None
 _quantize_nvfp4_out = None
 
 
 def _load_op():
-    global _decode, _decode_nvfp4, _prefill_bf16, _quantize_nvfp4_out
+    global _decode, _decode_nvfp4, _decode_many_nvfp4, _prefill_bf16, _quantize_nvfp4_out
     if _decode is None:
         import qwen35_megakernel_bf16_C
         ops = torch.ops.qwen35_megakernel_bf16_C
         _decode = ops.decode
         _decode_nvfp4 = ops.decode_nvfp4
+        _decode_many_nvfp4 = ops.decode_many_nvfp4
         _prefill_bf16 = ops.prefill_bf16
         _quantize_nvfp4_out = ops.quantize_nvfp4_out
 
@@ -407,6 +409,34 @@ class Decoder:
             )
         self._position += 1
         return self._out_token.item()
+
+    def step_many(self, token_id: int, num_steps: int) -> torch.Tensor:
+        """Decode multiple NVFP4 steps without per-token host/device synchronization."""
+        if self.backend != "nvfp4":
+            raise RuntimeError("step_many is only available for the NVFP4 backend")
+        if num_steps < 0:
+            raise ValueError("num_steps must be non-negative")
+        if num_steps == 0:
+            return torch.empty(0, dtype=torch.int32, device="cuda")
+
+        output_tokens = torch.empty(num_steps, dtype=torch.int32, device="cuda")
+        _decode_many_nvfp4(
+            output_tokens, self._out_token, token_id,
+            self._embed_weight, self._layer_weights_packed_nvfp4,
+            self._final_norm_weight, self._lm_head_weight_packed, self._lm_head_scales,
+            self._fa_k_cache, self._fa_v_cache,
+            self._dn_states, self._conv_bufs,
+            self._hidden, self._activations, self._residual,
+            self._qkv_scratch, self._kv_scratch, self._attn_out,
+            self._mlp_inter, self._z_scratch, self._beta_scratch,
+            self._alpha_scratch, self._normalized,
+            self._barrier_counter, self._barrier_generation,
+            self._block_max_vals, self._block_max_idxs,
+            self._lm_sync_counter,
+            self._position, MAX_SEQ_LEN, self._nvfp4_group_size,
+        )
+        self._position += num_steps
+        return output_tokens
 
     def reset(self):
         self._position = 0

@@ -140,6 +140,18 @@ def benchmark_decode(decoder, prompt_ids, gen_tokens, tokenizer, buffers, prefil
     ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
     first = run_prefill(decoder, ids_t, len(prompt_ids), buffers, prefill_op)
 
+    if decoder.backend == "nvfp4":
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        timed_ids_dev = decoder.step_many(first, gen_tokens)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        timed_ids = timed_ids_dev.cpu().tolist()
+        if tokenizer.eos_token_id in timed_ids:
+            timed_ids = timed_ids[:timed_ids.index(tokenizer.eos_token_id)]
+        tps = (len(timed_ids) / elapsed) if timed_ids else 0.0
+        return first, elapsed, tps, timed_ids
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     nid = first

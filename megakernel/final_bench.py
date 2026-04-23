@@ -147,19 +147,29 @@ def benchmark_megakernel(decoder, tokenizer, prompt_ids, args):
     decoded_ids = [first]
     eos = tokenizer.eos_token_id
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    nid = first
-    timed_ids = []
-    for _ in range(args.gen_tokens):
-        nid = decoder.step(nid)
-        if nid == eos:
-            break
-        timed_ids.append(nid)
-    torch.cuda.synchronize()
+    if decoder.backend == "nvfp4":
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        timed_ids_dev = decoder.step_many(first, args.gen_tokens)
+        torch.cuda.synchronize()
+        our_tg_ms = (time.perf_counter() - t0) * 1000.0
+        timed_ids = timed_ids_dev.cpu().tolist()
+        if eos in timed_ids:
+            timed_ids = timed_ids[:timed_ids.index(eos)]
+    else:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        nid = first
+        timed_ids = []
+        for _ in range(args.gen_tokens):
+            nid = decoder.step(nid)
+            if nid == eos:
+                break
+            timed_ids.append(nid)
+        torch.cuda.synchronize()
+        our_tg_ms = (time.perf_counter() - t0) * 1000.0
 
     decoded_ids.extend(timed_ids)
-    our_tg_ms = (time.perf_counter() - t0) * 1000.0
     our_tg_tps = (len(timed_ids) / our_tg_ms * 1000.0) if timed_ids else 0.0
     our_text = tokenizer.decode(decoded_ids, skip_special_tokens=True)
 
