@@ -1,6 +1,7 @@
 #include <Python.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -21,11 +22,28 @@ struct LayerWeights {
     void *ptrs[14];
 };
 
+// Must mirror LoraSet in kernel.cu exactly.
+struct LoraSet {
+    const __nv_bfloat16 *fa_q_A,    *fa_q_B;
+    const __nv_bfloat16 *fa_k_A,    *fa_k_B;
+    const __nv_bfloat16 *fa_v_A,    *fa_v_B;
+    const __nv_bfloat16 *fa_o_A,    *fa_o_B;
+    const __nv_bfloat16 *fa_gate_A, *fa_gate_B;
+    const __nv_bfloat16 *fa_up_A,   *fa_up_B;
+    const __nv_bfloat16 *fa_down_A, *fa_down_B;
+    const __nv_bfloat16 *dn_qkv_A,  *dn_qkv_B;
+    const __nv_bfloat16 *dn_z_A,    *dn_z_B;
+    const __nv_bfloat16 *dn_out_A,  *dn_out_B;
+    const __nv_bfloat16 *dn_gate_A, *dn_gate_B;
+    const __nv_bfloat16 *dn_up_A,   *dn_up_B;
+    const __nv_bfloat16 *dn_down_A, *dn_down_B;
+};
+
 extern "C" void launch_prefill_megakernel(
     const int *token_ids, int *out_token,
     const void *embed, const LayerWeights *layers,
     const void *final_norm_w, const void *lm_head_w,
-    const void *lora_a_q_all, const void *lora_b_q_all,
+    LoraSet lora,
     int lora_rank, float lora_scaling, float *lora_h_ws,
     void *fa_k_cache, void *fa_v_cache,
     float *dn_states, float *conv_bufs,
@@ -38,11 +56,19 @@ extern "C" void launch_prefill_megakernel(
     int S, int max_seq,
     cudaStream_t stream);
 
+static const __nv_bfloat16 *bf16_ptr_or_null(const torch::Tensor &t) {
+    if (!t.defined() || t.numel() == 0) return nullptr;
+    TORCH_CHECK(t.scalar_type() == torch::kBFloat16, "LoRA tensor must be bf16");
+    return (const __nv_bfloat16 *)t.data_ptr();
+}
+
 void train_mega_forward(
     torch::Tensor out_token, torch::Tensor token_ids,
     torch::Tensor embed, torch::Tensor layers_packed,
     torch::Tensor final_norm_w, torch::Tensor lm_head_w,
-    torch::Tensor lora_a_q, torch::Tensor lora_b_q,
+    // LoRA tensors as one flat list, all bf16 or empty.
+    // Order: fa_{q,k,v,o,gate,up,down} × {A, B}, dn_{qkv,z,out,gate,up,down} × {A, B}.
+    torch::TensorList lora_tensors,
     int64_t lora_rank, double lora_scaling, torch::Tensor lora_h_ws,
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
@@ -52,18 +78,35 @@ void train_mega_forward(
     torch::Tensor beta_buf, torch::Tensor alpha_buf,
     torch::Tensor final_normed,
     torch::Tensor lm_bmv, torch::Tensor lm_bmi,
-    int64_t max_seq, bool use_lora)
+    int64_t max_seq)
 {
     int S = (int)token_ids.size(0);
-    const void *a_ptr = use_lora ? lora_a_q.data_ptr() : nullptr;
-    const void *b_ptr = use_lora ? lora_b_q.data_ptr() : nullptr;
+
+    LoraSet lora{};
+    TORCH_CHECK(lora_tensors.size() == 26,
+        "Expected 26 LoRA tensors (7 FA + 6 DN projections × A, B). Got ", lora_tensors.size());
+    #define SET(idx, name) lora.name = bf16_ptr_or_null(lora_tensors[idx])
+    SET(0,  fa_q_A);    SET(1,  fa_q_B);
+    SET(2,  fa_k_A);    SET(3,  fa_k_B);
+    SET(4,  fa_v_A);    SET(5,  fa_v_B);
+    SET(6,  fa_o_A);    SET(7,  fa_o_B);
+    SET(8,  fa_gate_A); SET(9,  fa_gate_B);
+    SET(10, fa_up_A);   SET(11, fa_up_B);
+    SET(12, fa_down_A); SET(13, fa_down_B);
+    SET(14, dn_qkv_A);  SET(15, dn_qkv_B);
+    SET(16, dn_z_A);    SET(17, dn_z_B);
+    SET(18, dn_out_A);  SET(19, dn_out_B);
+    SET(20, dn_gate_A); SET(21, dn_gate_B);
+    SET(22, dn_up_A);   SET(23, dn_up_B);
+    SET(24, dn_down_A); SET(25, dn_down_B);
+    #undef SET
 
     launch_prefill_megakernel(
         (const int *)token_ids.data_ptr(), (int *)out_token.data_ptr(),
         embed.data_ptr(),
         reinterpret_cast<const LayerWeights *>(layers_packed.data_ptr()),
         final_norm_w.data_ptr(), lm_head_w.data_ptr(),
-        a_ptr, b_ptr,
+        lora,
         (int)lora_rank, (float)lora_scaling, (float *)lora_h_ws.data_ptr(),
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         (float *)dn_states.data_ptr(), (float *)conv_bufs.data_ptr(),
@@ -77,11 +120,41 @@ void train_mega_forward(
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
+// ---------------------------------------------------------------------------
+// Fused multi-param AdamW — single kernel dispatch updates every LoRA param.
+// ---------------------------------------------------------------------------
+extern "C" void launch_fused_adamw(
+    void *params_bf16, float *m, float *v, const float *grad,
+    long long numel, int step,
+    float lr, float beta1, float beta2, float eps, float wd,
+    cudaStream_t stream);
+
+void fused_adamw_step(
+    torch::Tensor params,
+    torch::Tensor m, torch::Tensor v,
+    torch::Tensor grad,
+    int64_t step,
+    double lr, double beta1, double beta2, double eps, double wd)
+{
+    TORCH_CHECK(params.scalar_type() == torch::kBFloat16);
+    TORCH_CHECK(m.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(v.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(grad.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(params.numel() == m.numel() && m.numel() == v.numel()
+                && v.numel() == grad.numel());
+    launch_fused_adamw(
+        params.data_ptr(), (float *)m.data_ptr(), (float *)v.data_ptr(),
+        (const float *)grad.data_ptr(),
+        (long long)params.numel(), (int)step,
+        (float)lr, (float)beta1, (float)beta2, (float)eps, (float)wd,
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
 TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
     ops.def("train_mega_forward(Tensor out_token, Tensor token_ids, "
             "Tensor embed, Tensor layers_packed, "
             "Tensor final_norm_w, Tensor lm_head_w, "
-            "Tensor lora_a_q, Tensor lora_b_q, "
+            "Tensor[] lora_tensors, "
             "int lora_rank, float lora_scaling, Tensor lora_h_ws, "
             "Tensor fa_k_cache, Tensor fa_v_cache, "
             "Tensor dn_states, Tensor conv_bufs, "
@@ -91,7 +164,12 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
             "Tensor beta_buf, Tensor alpha_buf, "
             "Tensor final_normed, "
             "Tensor lm_bmv, Tensor lm_bmi, "
-            "int max_seq, bool use_lora) -> ()");
+            "int max_seq) -> ()");
     ops.impl("train_mega_forward", torch::kCUDA, &train_mega_forward);
+
+    ops.def("fused_adamw_step(Tensor(a!) params, Tensor(b!) m, Tensor(c!) v, "
+            "Tensor grad, int step, float lr, float beta1, float beta2, "
+            "float eps, float wd) -> ()");
+    ops.impl("fused_adamw_step", torch::kCUDA, &fused_adamw_step);
 }
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

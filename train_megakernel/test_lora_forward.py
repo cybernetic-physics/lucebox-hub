@@ -1,8 +1,9 @@
 """Forward-path sanity check for the LoRA-extended megakernel.
 
-Checks:
-  1. With LoRA weights all zero, output == baseline prefill megakernel.
-  2. With nonzero LoRA A/B weights, output differs from baseline.
+Exercises all 13 trainable linears (7 FA + 6 DN) with three-way check:
+  1. Baseline: LoRA disabled → same as prefill_megakernel_C.prefill_bf16.
+  2. LoRA enabled but A=B=0 → same as baseline (no-op).
+  3. LoRA enabled with boosted nonzero weights → diverges from baseline.
 """
 
 from __future__ import annotations
@@ -17,19 +18,36 @@ sys.path.insert(0, "/root/lucebox-hub-b200-train/train_megakernel")
 import prefill_megakernel_C  # noqa: F401
 import train_megakernel_C    # noqa: F401
 
-from model import (  # reuse prefill_megakernel's Python helpers
-    NUM_LAYERS, HIDDEN, VOCAB, MAX_SEQ_LEN, LAYER_TYPE, N_FA,
+from model import (
+    NUM_LAYERS, HIDDEN, VOCAB, MAX_SEQ_LEN, LAYER_TYPE, N_FA, N_DN,
     FA_QPROJ_SIZE, FA_KV_SIZE, FA_HEAD_DIM, FA_KV_HEADS, FA_Q_SIZE,
-    DN_CONV_CH, DN_V_SIZE, DN_HEADS, DN_VAL, DN_CONV_K, DN_KEY, INTER, N_DN,
+    DN_CONV_CH, DN_V_SIZE, DN_HEADS, DN_VAL, DN_CONV_K, DN_KEY, INTER,
     PrefillMegakernel,
 )
 from smoke import random_weights
 
+# LoRA projection specs (input dim, output dim) — must match kernel order.
+FA_SHAPES = [
+    ("fa_q",    HIDDEN,      FA_QPROJ_SIZE),
+    ("fa_k",    HIDDEN,      FA_KV_SIZE),
+    ("fa_v",    HIDDEN,      FA_KV_SIZE),
+    ("fa_o",    FA_Q_SIZE,   HIDDEN),
+    ("fa_gate", HIDDEN,      INTER),
+    ("fa_up",   HIDDEN,      INTER),
+    ("fa_down", INTER,       HIDDEN),
+]
+DN_SHAPES = [
+    ("dn_qkv",  HIDDEN,      DN_CONV_CH),
+    ("dn_z",    HIDDEN,      DN_V_SIZE),
+    ("dn_out",  DN_V_SIZE,   HIDDEN),
+    ("dn_gate", HIDDEN,      INTER),
+    ("dn_up",   HIDDEN,      INTER),
+    ("dn_down", INTER,       HIDDEN),
+]
+
 
 def _pack_layer_weights(layer_data):
-    ptr_size = 8
-    max_ptrs = 14
-    header = 16
+    ptr_size = 8; max_ptrs = 14; header = 16
     struct_size = header + max_ptrs * ptr_size
     buf = bytearray(NUM_LAYERS * struct_size)
     for i in range(NUM_LAYERS):
@@ -43,7 +61,33 @@ def _pack_layer_weights(layer_data):
     return torch.frombuffer(buf, dtype=torch.uint8).cuda()
 
 
-def run_train_mega(weights, tokens, lora_a_q, lora_b_q, use_lora, lora_rank, lora_scaling):
+def build_lora_tensors(rank, init_scale, n_fa=N_FA, n_dn=N_DN, device="cuda"):
+    """Return 26 tensors (A, B for each of 13 trainable linears)."""
+    tensors = []
+    gen = torch.Generator(device="cpu").manual_seed(123)
+    for name, k_in, k_out in FA_SHAPES:
+        A = (torch.randn(n_fa, k_in, rank, generator=gen) * init_scale).to(device=device, dtype=torch.bfloat16)
+        B = (torch.randn(n_fa, rank, k_out, generator=gen) * init_scale).to(device=device, dtype=torch.bfloat16)
+        tensors.extend([A, B])
+    for name, k_in, k_out in DN_SHAPES:
+        A = (torch.randn(n_dn, k_in, rank, generator=gen) * init_scale).to(device=device, dtype=torch.bfloat16)
+        B = (torch.randn(n_dn, rank, k_out, generator=gen) * init_scale).to(device=device, dtype=torch.bfloat16)
+        tensors.extend([A, B])
+    return tensors
+
+
+def zero_lora_tensors(rank):
+    tensors = []
+    for _, k_in, k_out in FA_SHAPES:
+        tensors.append(torch.zeros(N_FA, k_in, rank, device="cuda", dtype=torch.bfloat16))
+        tensors.append(torch.zeros(N_FA, rank, k_out, device="cuda", dtype=torch.bfloat16))
+    for _, k_in, k_out in DN_SHAPES:
+        tensors.append(torch.zeros(N_DN, k_in, rank, device="cuda", dtype=torch.bfloat16))
+        tensors.append(torch.zeros(N_DN, rank, k_out, device="cuda", dtype=torch.bfloat16))
+    return tensors
+
+
+def run_train_mega(weights, tokens, lora_tensors, lora_rank, lora_scaling):
     S = int(tokens.shape[0])
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
     f32 = dict(dtype=torch.float32, device="cuda")
@@ -78,7 +122,7 @@ def run_train_mega(weights, tokens, lora_a_q, lora_b_q, use_lora, lora_rank, lor
         out_token, tokens.to(dtype=torch.int32, device="cuda").contiguous(),
         weights["embed_weight"], layers_packed,
         weights["final_norm_weight"], weights["lm_head_weight"],
-        lora_a_q, lora_b_q,
+        lora_tensors,
         lora_rank, lora_scaling, lora_h_ws,
         fa_k_cache, fa_v_cache, dn_states, conv_bufs,
         hidden, residual, normalized,
@@ -86,7 +130,7 @@ def run_train_mega(weights, tokens, lora_a_q, lora_b_q, use_lora, lora_rank, lor
         beta_buf, alpha_buf,
         final_normed,
         lm_bmv, lm_bmi,
-        MAX_SEQ_LEN, use_lora,
+        MAX_SEQ_LEN,
     )
     return int(out_token.item())
 
@@ -98,36 +142,25 @@ def main():
     w = random_weights()
     tokens = torch.randint(0, VOCAB, (S,), dtype=torch.int32, device="cuda")
 
-    lora_a_zero = torch.zeros(N_FA, HIDDEN, LORA_R, device="cuda", dtype=torch.bfloat16)
-    lora_b_zero = torch.zeros(N_FA, LORA_R, FA_QPROJ_SIZE, device="cuda", dtype=torch.bfloat16)
-    # Use boosted init so LoRA residual is large enough to move the random-weight argmax.
-    lora_a_nz = (torch.randn(N_FA, HIDDEN, LORA_R) * 0.5).to(device="cuda", dtype=torch.bfloat16)
-    lora_b_nz = (torch.randn(N_FA, LORA_R, FA_QPROJ_SIZE) * 0.5).to(device="cuda", dtype=torch.bfloat16)
-
-    # Baseline: run with use_lora=False (should match prefill_megakernel output)
     base = PrefillMegakernel(w).forward(tokens)
 
-    # Path A: train_megakernel with LoRA DISABLED (skip LoRA compute)
-    a = run_train_mega(w, tokens, lora_a_zero, lora_b_zero, False, LORA_R, 1.0)
+    # Zero LoRA everywhere
+    zeros = zero_lora_tensors(LORA_R)
+    a = run_train_mega(w, tokens, zeros, LORA_R, 1.0)
 
-    # Path B: train_megakernel with LoRA ENABLED but weights zero
-    b = run_train_mega(w, tokens, lora_a_zero, lora_b_zero, True, LORA_R, 1.0)
+    # Non-zero LoRA everywhere (boosted init so it moves argmax)
+    nonzero = build_lora_tensors(LORA_R, init_scale=0.2)
+    b = run_train_mega(w, tokens, nonzero, LORA_R, 1.0)
 
-    # Path C: train_megakernel with LoRA ENABLED + nonzero weights
-    c = run_train_mega(w, tokens, lora_a_nz, lora_b_nz, True, LORA_R, 1.0)
-
-    print(f"baseline prefill_megakernel  next_token = {base}")
-    print(f"train_mega use_lora=False    next_token = {a}  (expect == baseline)")
-    print(f"train_mega use_lora=True A=B=0 next_token = {b}  (expect == baseline)")
-    print(f"train_mega use_lora=True A,B≠0 next_token = {c}  (expect ≠ baseline)")
+    print(f"baseline prefill_megakernel         next_token = {base}")
+    print(f"train_mega A=B=0  (all 13 linears)  next_token = {a}  (expect == baseline)")
+    print(f"train_mega A,B≠0 (all 13 linears)   next_token = {b}  (expect ≠ baseline)")
 
     ok = True
     if a != base:
-        print("  FAIL: use_lora=False diverges from baseline"); ok = False
-    if b != base:
-        print("  FAIL: use_lora=True with zero weights diverges from baseline"); ok = False
-    if c == base:
-        print("  FAIL: use_lora=True with nonzero weights matches baseline (LoRA not applied?)"); ok = False
+        print("  FAIL: zero LoRA diverges from baseline"); ok = False
+    if b == base:
+        print("  FAIL: nonzero LoRA matches baseline (LoRA not applied?)"); ok = False
     print("OK" if ok else "CORRECTNESS FAIL")
     sys.exit(0 if ok else 1)
 

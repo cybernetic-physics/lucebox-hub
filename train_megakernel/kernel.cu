@@ -364,20 +364,22 @@ __device__ void gemm_wmma_core(
 
 // ============================================================================
 // LoRA forward phases. For a LoRA-adapted linear y = x @ Wᵀ + s·(x @ A) @ B:
-//   phase_lora_h computes the rank-R hidden:   lora_h[s, r] = Σ_h x[s, h] * A[h, r]
+//   phase_lora_h computes the rank-R hidden:   lora_h[s, r] = Σ_k x[s, k] * A[k, r]
 //   phase_lora_b_add adds to the base proj:    proj[s, n] += s·Σ_r lora_h[s, r] * B[r, n]
 //
-// LoRA rank is small (8–32 typical) so a simple one-thread-per-element scheme
-// is fine — these phases are a tiny fraction of the total GEMM work.
-// A layout: [HIDDEN, LORA_R] row-major.
-// B layout: [LORA_R, N]      row-major.
+// A layout: [K_in, LORA_R] row-major.
+// B layout: [LORA_R, K_out] row-major.
+//
+// Generic over K_in (input dim) — caller passes it so one kernel covers
+// q/k/v (K_in=HIDDEN), o (K_in=FA_Q_SIZE), down (K_in=INTER), DN out
+// (K_in=DN_V_SIZE) etc.
 // ============================================================================
 
 __device__ void phase_lora_h(
-    const __nv_bfloat16 *__restrict__ X,        // [S, HIDDEN]
-    const __nv_bfloat16 *__restrict__ A,        // [HIDDEN, LORA_R]
-    float *__restrict__ lora_h,                  // [S, LORA_R]
-    int S, int LORA_R)
+    const __nv_bfloat16 *__restrict__ X,
+    const __nv_bfloat16 *__restrict__ A,
+    float *__restrict__ lora_h,
+    int S, int K_in, int LORA_R)
 {
     int total = S * LORA_R;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -385,15 +387,34 @@ __device__ void phase_lora_h(
     for (int idx = tid; idx < total; idx += stride) {
         int s = idx / LORA_R;
         int r = idx % LORA_R;
-        const __nv_bfloat16 *x_row = X + (size_t)s * HIDDEN;
+        const __nv_bfloat16 *x_row = X + (size_t)s * K_in;
         float acc = 0.0f;
         #pragma unroll 4
-        for (int h = 0; h < HIDDEN; h++) {
+        for (int h = 0; h < K_in; h++) {
             acc += __bfloat162float(x_row[h]) * __bfloat162float(A[h * LORA_R + r]);
         }
         lora_h[idx] = acc;
     }
 }
+
+// Pointer bundle for every trainable LoRA A/B pair. Each element points at
+// the start of a [N_layers_of_this_type, K_in, R] or [N_layers_of_this_type, R, K_out]
+// contiguous buffer. Nullable (disables LoRA on that specific linear).
+struct LoraSet {
+    const __nv_bfloat16 *fa_q_A,    *fa_q_B;
+    const __nv_bfloat16 *fa_k_A,    *fa_k_B;
+    const __nv_bfloat16 *fa_v_A,    *fa_v_B;
+    const __nv_bfloat16 *fa_o_A,    *fa_o_B;
+    const __nv_bfloat16 *fa_gate_A, *fa_gate_B;
+    const __nv_bfloat16 *fa_up_A,   *fa_up_B;
+    const __nv_bfloat16 *fa_down_A, *fa_down_B;
+    const __nv_bfloat16 *dn_qkv_A,  *dn_qkv_B;
+    const __nv_bfloat16 *dn_z_A,    *dn_z_B;
+    const __nv_bfloat16 *dn_out_A,  *dn_out_B;
+    const __nv_bfloat16 *dn_gate_A, *dn_gate_B;
+    const __nv_bfloat16 *dn_up_A,   *dn_up_B;
+    const __nv_bfloat16 *dn_down_A, *dn_down_B;
+};
 
 __device__ void phase_lora_b_add(
     const float *__restrict__ lora_h,            // [S, LORA_R]
@@ -945,10 +966,9 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
     const LayerWeights  *__restrict__ layers,
     const __nv_bfloat16 *__restrict__ final_norm_w,
     const __nv_bfloat16 *__restrict__ lm_head_w,
-    // LoRA weights for q_proj (per-FA-layer). NULL to disable.
-    // Layout: lora_a_q_all is [N_FA, HIDDEN, LORA_R], lora_b_q_all is [N_FA, LORA_R, FA_QPROJ_SIZE].
-    const __nv_bfloat16 *__restrict__ lora_a_q_all,
-    const __nv_bfloat16 *__restrict__ lora_b_q_all,
+    // LoRA configuration for all trainable linears (pass NULL pointers to disable
+    // per linear). Pointer layouts encoded per LoraSet member comment.
+    LoraSet lora,
     int lora_rank,
     float lora_scaling,
     float *__restrict__ lora_h_ws,            // [S, LORA_R] scratch
@@ -1010,16 +1030,35 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
             const __nv_bfloat16 *up_w    = (const __nv_bfloat16 *)lw.ptrs[12];
             const __nv_bfloat16 *down_w  = (const __nv_bfloat16 *)lw.ptrs[13];
 
-            // QKV projection -> proj_buf [S, DN_CONV_CH]
+            // Macro: apply LoRA for one linear. X is the input; Y_BUF is the
+            // output buffer to accumulate into; A_ALL / B_ALL are the packed
+            // per-layer weight arrays (nullable). K_IN is the input feature
+            // dimension, K_OUT the output feature dimension.
+            #define APPLY_LORA(X, Y_BUF, A_ALL, B_ALL, LAYER_IDX, K_IN, K_OUT) \
+                if ((A_ALL) != nullptr && (B_ALL) != nullptr) {                \
+                    const __nv_bfloat16 *__A = (A_ALL)                         \
+                        + (size_t)(LAYER_IDX) * (K_IN) * lora_rank;            \
+                    const __nv_bfloat16 *__B = (B_ALL)                         \
+                        + (size_t)(LAYER_IDX) * lora_rank * (K_OUT);           \
+                    phase_lora_h((X), __A, lora_h_ws, S, (K_IN), lora_rank);   \
+                    grid.sync();                                               \
+                    phase_lora_b_add(lora_h_ws, __B, (Y_BUF), S,               \
+                                     (K_OUT), lora_rank, lora_scaling);        \
+                    grid.sync();                                               \
+                }
+
+            // QKV / Z / beta / alpha projections
             gemm_bf16_bf16(normalized, HIDDEN, qkv_w, proj_buf, S, DN_CONV_CH);
-            // Z projection -> proj_buf2 [S, DN_V_SIZE]
             gemm_bf16_bf16(normalized, HIDDEN, z_w, proj_buf2, S, DN_V_SIZE);
-            // Beta/Alpha matvecs -> beta_buf/alpha_buf [S, DN_HEADS]
             phase_dn_beta_alpha_matvec(normalized, beta_w,  beta_buf,  S);
             phase_dn_beta_alpha_matvec(normalized, alpha_w, alpha_buf, S);
             grid.sync();
 
-            // Recurrence: 1 block per head; other blocks idle during this phase.
+            // LoRA: qkv, z
+            APPLY_LORA(normalized, proj_buf,  lora.dn_qkv_A, lora.dn_qkv_B, dn_idx, HIDDEN, DN_CONV_CH);
+            APPLY_LORA(normalized, proj_buf2, lora.dn_z_A,   lora.dn_z_B,   dn_idx, HIDDEN, DN_V_SIZE);
+
+            // Recurrence (operates on proj_buf / proj_buf2 which now include LoRA)
             phase_dn_recurrence(
                 proj_buf, proj_buf2, beta_buf, alpha_buf,
                 conv_w, a_log, dt_bias, dn_norm,
@@ -1031,6 +1070,9 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
             // Out projection + residual add
             gemm_bf16_add_residual(dn_out_buf, DN_V_SIZE, out_w, residual, hidden, S, HIDDEN);
             grid.sync();
+            // LoRA on out_proj: add scaling*(dn_out @ A) @ B to hidden directly
+            // (math-equivalent to LoRA-before-residual because residual is linear).
+            APPLY_LORA(dn_out_buf, hidden, lora.dn_out_A, lora.dn_out_B, dn_idx, DN_V_SIZE, HIDDEN);
 
             // Post-attn RMSNorm
             phase_rmsnorm(hidden, post_norm, normalized, residual, S, HIDDEN);
@@ -1040,6 +1082,8 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
             gemm_bf16_bf16(normalized, HIDDEN, gate_w, proj_buf,  S, INTER);
             gemm_bf16_bf16(normalized, HIDDEN, up_w,   proj_buf2, S, INTER);
             grid.sync();
+            APPLY_LORA(normalized, proj_buf,  lora.dn_gate_A, lora.dn_gate_B, dn_idx, HIDDEN, INTER);
+            APPLY_LORA(normalized, proj_buf2, lora.dn_up_A,   lora.dn_up_B,   dn_idx, HIDDEN, INTER);
 
             // silu(gate) * up
             phase_silu_mul(proj_buf, proj_buf2, mlp_buf, S * INTER);
@@ -1048,6 +1092,7 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
             // down + residual
             gemm_bf16_add_residual(mlp_buf, INTER, down_w, residual, hidden, S, HIDDEN);
             grid.sync();
+            APPLY_LORA(mlp_buf, hidden, lora.dn_down_A, lora.dn_down_B, dn_idx, INTER, HIDDEN);
 
             dn_idx++;
         } else {
@@ -1069,18 +1114,10 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
             gemm_bf16_bf16(normalized, HIDDEN, v_w, attn_buf,  S, FA_KV_SIZE);
             grid.sync();
 
-            // ---- LoRA on q_proj (optional) ----
-            if (lora_a_q_all != nullptr) {
-                const __nv_bfloat16 *A_fa = lora_a_q_all
-                    + (size_t)fa_idx * HIDDEN * lora_rank;
-                const __nv_bfloat16 *B_fa = lora_b_q_all
-                    + (size_t)fa_idx * lora_rank * FA_QPROJ_SIZE;
-                phase_lora_h(normalized, A_fa, lora_h_ws, S, lora_rank);
-                grid.sync();
-                phase_lora_b_add(lora_h_ws, B_fa, proj_buf, S, FA_QPROJ_SIZE,
-                                 lora_rank, lora_scaling);
-                grid.sync();
-            }
+            // LoRA: q, k, v
+            APPLY_LORA(normalized, proj_buf,  lora.fa_q_A, lora.fa_q_B, fa_idx, HIDDEN, FA_QPROJ_SIZE);
+            APPLY_LORA(normalized, proj_buf2, lora.fa_k_A, lora.fa_k_B, fa_idx, HIDDEN, FA_KV_SIZE);
+            APPLY_LORA(normalized, attn_buf,  lora.fa_v_A, lora.fa_v_B, fa_idx, HIDDEN, FA_KV_SIZE);
 
             // QK norm + RoPE + KV cache write
             phase_fa_qk_norm_rope(
@@ -1090,33 +1127,37 @@ extern "C" __global__ void __launch_bounds__(PM_BLOCK_SIZE, 1) prefill_megakerne
                 S, max_seq);
             grid.sync();
 
-            // Causal attention (reads k/v from the fresh proj buffers, not cache;
-            // matches prefill.cu semantics — cache is written for downstream decode).
+            // Causal attention
             phase_fa_causal_attn(proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
             grid.sync();
 
             // O projection + residual add
             gemm_bf16_add_residual(dn_out_buf, FA_Q_SIZE, o_w, residual, hidden, S, HIDDEN);
             grid.sync();
+            APPLY_LORA(dn_out_buf, hidden, lora.fa_o_A, lora.fa_o_B, fa_idx, FA_Q_SIZE, HIDDEN);
 
             // Post-attn norm
             phase_rmsnorm(hidden, post_norm, normalized, residual, S, HIDDEN);
             grid.sync();
 
-            // gate/up/silu/down
+            // gate/up
             gemm_bf16_bf16(normalized, HIDDEN, gate_w, proj_buf,  S, INTER);
             gemm_bf16_bf16(normalized, HIDDEN, up_w,   proj_buf2, S, INTER);
             grid.sync();
+            APPLY_LORA(normalized, proj_buf,  lora.fa_gate_A, lora.fa_gate_B, fa_idx, HIDDEN, INTER);
+            APPLY_LORA(normalized, proj_buf2, lora.fa_up_A,   lora.fa_up_B,   fa_idx, HIDDEN, INTER);
 
             phase_silu_mul(proj_buf, proj_buf2, mlp_buf, S * INTER);
             grid.sync();
 
             gemm_bf16_add_residual(mlp_buf, INTER, down_w, residual, hidden, S, HIDDEN);
             grid.sync();
+            APPLY_LORA(mlp_buf, hidden, lora.fa_down_A, lora.fa_down_B, fa_idx, INTER, HIDDEN);
 
             fa_idx++;
         }
     }
+    #undef APPLY_LORA
 
     // ------ final norm (last token only) -----------------------------------
     phase_final_norm_last(hidden, final_norm_w, final_normed, S);
@@ -1138,7 +1179,7 @@ extern "C" void launch_prefill_megakernel(
     const void *embed,
     const LayerWeights *layers,
     const void *final_norm_w, const void *lm_head_w,
-    const void *lora_a_q_all, const void *lora_b_q_all,
+    LoraSet lora,
     int lora_rank, float lora_scaling, float *lora_h_ws,
     void *fa_k_cache, void *fa_v_cache,
     float *dn_states, float *conv_bufs,
@@ -1195,7 +1236,7 @@ extern "C" void launch_prefill_megakernel(
         (void *)&token_ids, (void *)&out_token,
         (void *)&embed, (void *)&layers,
         (void *)&final_norm_w, (void *)&lm_head_w,
-        (void *)&lora_a_q_all, (void *)&lora_b_q_all,
+        (void *)&lora,
         (void *)&lora_rank, (void *)&lora_scaling, (void *)&lora_h_ws,
         (void *)&fa_k_cache, (void *)&fa_v_cache,
         (void *)&dn_states, (void *)&conv_bufs,
@@ -1210,4 +1251,54 @@ extern "C" void launch_prefill_megakernel(
 
     cudaLaunchCooperativeKernel(
         (void *)prefill_megakernel, grid, block, args, smem_bytes, stream);
+}
+
+// ============================================================================
+// Fused AdamW — single kernel updates an arbitrary-size flat parameter
+// buffer. The training wrapper can call it once on a concatenated view of
+// every LoRA A/B pair to get a single-dispatch optimizer step.
+// ============================================================================
+
+extern "C" __global__ void fused_adamw_kernel(
+    __nv_bfloat16 *__restrict__ params,    // bf16 parameters, updated in place
+    float *__restrict__ m,                  // fp32 first-moment state
+    float *__restrict__ v,                  // fp32 second-moment state
+    const float *__restrict__ grad,         // fp32 gradients
+    long long numel, int step,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bias_correction1, float bias_correction2)
+{
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = tid; i < numel; i += stride) {
+        float g = grad[i];
+        float mi = beta1 * m[i] + (1.0f - beta1) * g;
+        float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
+        m[i] = mi;
+        v[i] = vi;
+        float m_hat = mi / bias_correction1;
+        float v_hat = vi / bias_correction2;
+        float p = __bfloat162float(params[i]);
+        p -= lr * (m_hat / (sqrtf(v_hat) + eps) + wd * p);
+        params[i] = __float2bfloat16(p);
+    }
+}
+
+extern "C" void launch_fused_adamw(
+    void *params_bf16, float *m, float *v, const float *grad,
+    long long numel, int step,
+    float lr, float beta1, float beta2, float eps, float wd,
+    cudaStream_t stream)
+{
+    const float bc1 = 1.0f - powf(beta1, (float)step);
+    const float bc2 = 1.0f - powf(beta2, (float)step);
+
+    int block_size = 256;
+    int grid_size = (int)((numel + block_size - 1) / block_size);
+    if (grid_size > 65535 * 2) grid_size = 65535 * 2;   // cap for large models
+    if (grid_size < 1) grid_size = 1;
+
+    fused_adamw_kernel<<<grid_size, block_size, 0, stream>>>(
+        (__nv_bfloat16 *)params_bf16, m, v, grad,
+        numel, step, lr, beta1, beta2, eps, wd, bc1, bc2);
 }
