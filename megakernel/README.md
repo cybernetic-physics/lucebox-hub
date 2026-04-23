@@ -109,12 +109,29 @@ As more models go hybrid (and they will, because linear attention scales better)
 ```bash
 git clone https://github.com/Luce-Org/luce-megakernel
 cd luce-megakernel
-pip install -e .
+pip install -e . --no-build-isolation
 python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
 
+## GB10 / DGX Spark backend
+
+This repo now includes a second decode backend aimed at NVIDIA GB10 / Blackwell:
+
+- Prefill stays on the existing BF16 + cuBLAS path.
+- Decode can switch to a CUDA NVFP4 backend that packs the large decode-only weights into group-scaled E2M1 FP4.
+- Torch is still used for loading weights and binding the extension, but the hot path remains in `.cu`.
+
+Backend selection:
+
+```bash
+MEGAKERNEL_BACKEND=nvfp4 python final_bench.py
+MEGAKERNEL_BACKEND=bf16  python final_bench.py
+```
+
+On GB10, `Decoder()` defaults to the NVFP4 decode backend automatically.
+
 **Requirements:**
-- Built and benchmarked on NVIDIA RTX 3090 (2020); portable to other Ampere+ (sm_86+) NVIDIA GPUs with minor tuning
+- Original BF16 path was built around NVIDIA RTX 3090; the repo now also includes a GB10-targeted NVFP4 decode backend
 - CUDA 12+
 - PyTorch 2.0+
 - ~1.5 GB VRAM for BF16 weights

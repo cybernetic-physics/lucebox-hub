@@ -23,6 +23,8 @@ from model import (
     FA_Q_SIZE,
     HIDDEN_SIZE,
     INTERMEDIATE_SIZE,
+    PREFILL_PROJ_FUSED_SIZE,
+    PREFILL_PROJ_SCRATCH_SIZE,
 )
 
 
@@ -59,13 +61,12 @@ def alloc_prefill_buffers(max_tokens):
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
     f32 = dict(dtype=torch.float32, device="cuda")
     i32 = dict(dtype=torch.int32, device="cuda")
-    mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
     return dict(
         hidden=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
         residual=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
         normalized=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
-        proj_buf=torch.empty(max_tokens * mx, **bf16),
-        proj_buf2=torch.empty(max_tokens * mx, **bf16),
+        proj_buf=torch.empty(max_tokens * PREFILL_PROJ_FUSED_SIZE, **bf16),
+        proj_buf2=torch.empty(max_tokens * PREFILL_PROJ_SCRATCH_SIZE, **bf16),
         attn_buf=torch.empty(max_tokens * max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
         mlp_buf=torch.empty(max_tokens * INTERMEDIATE_SIZE, **bf16),
         dn_out_buf=torch.empty(max_tokens * DN_V_SIZE, **bf16),
@@ -81,51 +82,21 @@ def alloc_prefill_buffers(max_tokens):
 def get_prefill_op(decoder):
     ops = torch.ops.qwen35_megakernel_bf16_C
     if decoder.backend == "nvfp4":
-        return ops.prefill_bf16_nvfp4_lm
+        return ops.prefill_megakernel_nvfp4
     return ops.prefill_bf16
 
 
 def run_prefill(decoder, ids_t, prompt_len, buffers, prefill_op):
     decoder.reset()
     if decoder.backend == "nvfp4":
-        prefill_op(
-            decoder._out_token,
-            ids_t,
-            decoder._embed_weight,
-            decoder._layer_weights_packed,
-            decoder._final_norm_weight,
-            decoder._lm_head_weight,
-            decoder._lm_head_weight_packed,
-            decoder._lm_head_scales,
-            decoder._fa_k_cache,
-            decoder._fa_v_cache,
-            decoder._dn_states,
-            decoder._conv_bufs,
-            buffers["hidden"],
-            buffers["residual"],
-            buffers["normalized"],
-            buffers["proj_buf"],
-            buffers["proj_buf2"],
-            buffers["attn_buf"],
-            buffers["mlp_buf"],
-            buffers["dn_out_buf"],
-            buffers["beta_buf"],
-            buffers["alpha_buf"],
-            buffers["final_normed"],
-            buffers["hidden_bf16_out"],
-            buffers["lm_bmv"],
-            buffers["lm_bmi"],
-            decoder._lm_hidden_bf16,
-            decoder._lm_hidden_packed,
-            decoder._lm_hidden_scales,
-            decoder._lm_logits_f16,
-        )
+        return decoder.prefill_tokens(ids_t)
     else:
         prefill_op(
             decoder._out_token,
             ids_t,
             decoder._embed_weight,
             decoder._layer_weights_packed,
+            decoder._prefill_fused_weights_packed,
             decoder._final_norm_weight,
             decoder._lm_head_weight,
             decoder._fa_k_cache,

@@ -10,6 +10,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 // =============================================================================
 // Model constants
 // =============================================================================
@@ -932,7 +934,17 @@ extern "C" void launch_decode(
     unsigned int *lm_sync_counter,
     int position, int max_seq_len, cudaStream_t stream)
 {
-    decode_kernel<<<NUM_BLOCKS, BLOCK_SIZE, 0, stream>>>(
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device);
+
+    int active_decode_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_decode_blocks, decode_kernel, BLOCK_SIZE, 0);
+    int decode_blocks = std::max(1, active_decode_blocks * prop.multiProcessorCount);
+
+    decode_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
         (const __nv_bfloat16 *)embed_weight,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)lm_head_weight,
@@ -950,10 +962,15 @@ extern "C" void launch_decode(
 
     cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
 
-    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+    int active_lm_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_lm_blocks, lm_head_kernel, LM_BLOCK_SIZE, 0);
+    int resident_lm_blocks = std::max(1, active_lm_blocks * prop.multiProcessorCount);
+    int lm_blocks = std::min(1024, std::max(resident_lm_blocks, prop.multiProcessorCount * 8));
+
+    lm_head_kernel<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter);
 }
-

@@ -1656,6 +1656,104 @@ decode_kernel_nvfp4(
     }
 }
 
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+prefill_kernel_nvfp4(
+    const int *__restrict__ token_ids,
+    int seq_len,
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const LayerWeightsNVFP4 *__restrict__ layer_weights,
+    __nv_bfloat16 *__restrict__ fa_k_cache,
+    __nv_bfloat16 *__restrict__ fa_v_cache,
+    float *__restrict__ dn_states,
+    float *__restrict__ conv_bufs,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_qkv_scratch,
+    float *__restrict__ g_kv_scratch,
+    float *__restrict__ g_attn_out,
+    float *__restrict__ g_mlp_inter,
+    float *__restrict__ g_z_scratch,
+    float *__restrict__ g_beta_scratch,
+    float *__restrict__ g_alpha_scratch,
+    float *__restrict__ g_normalized,
+    int max_seq_len)
+{
+    int block_id = blockIdx.x;
+    AtomicGridSync grid{};
+
+    __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
+    __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
+
+    int fa_kv_stride = FA_NUM_KV_HEADS * max_seq_len * FA_HEAD_DIM;
+    int dn_state_stride = DN_NUM_HEADS * DN_KEY_DIM * DN_VALUE_DIM;
+
+    for (int position = 0; position < seq_len; ++position) {
+        int input_token_id = __ldg(token_ids + position);
+        const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+
+        int dn_layer_idx = 0;
+        int fa_layer_idx = 0;
+
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+            const LayerWeightsNVFP4 &weights = layer_weights[layer];
+
+            if (LAYER_TYPE[layer] == 0) {
+                DeltaNetWeightsNVFP4 dn_weights = make_deltanet_weights(weights);
+                deltanet_layer_nvfp4(
+                    grid, dn_weights, layer_input,
+                    g_residual, g_activations, g_qkv_scratch, g_z_scratch,
+                    g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
+                    dn_states + dn_layer_idx * dn_state_stride,
+                    conv_bufs, hidden_buffer, dn_layer_idx, weights.group_size, shmem_bf16);
+                dn_layer_idx++;
+            } else {
+                FullAttnWeightsNVFP4 fa_weights = make_full_attn_weights(weights);
+                full_attention_layer_nvfp4(
+                    grid, fa_weights, layer_input,
+                    fa_k_cache + fa_layer_idx * fa_kv_stride,
+                    fa_v_cache + fa_layer_idx * fa_kv_stride,
+                    g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
+                    g_attn_out, g_mlp_inter, hidden_buffer,
+                    position, max_seq_len, weights.group_size, shmem_bf16);
+                fa_layer_idx++;
+            }
+        }
+    }
+
+    if (block_id == 0) {
+        __shared__ float smem_reduce[NUM_WARPS];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        float local_sum_sq = 0.0f;
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            float v = __bfloat162float(hidden_buffer[i]);
+            local_sum_sq += v * v;
+        }
+        local_sum_sq = warp_reduce_sum(local_sum_sq);
+        if (lane_id == 0) {
+            smem_reduce[warp_id] = local_sum_sq;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float sum = (lane_id < NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0) {
+                smem_reduce[0] = rsqrtf(sum / HIDDEN_SIZE + RMS_EPS);
+            }
+        }
+        __syncthreads();
+        float rstd = smem_reduce[0];
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            float v = __bfloat162float(hidden_buffer[i]);
+            float wt = __bfloat162float(__ldg(final_norm_weight + i));
+            g_normalized[i] = v * rstd * (1.0f + wt);
+        }
+    }
+}
+
 __device__ __forceinline__ unsigned int quantize_fp4_code(float x) {
     float ax = fabsf(x);
     unsigned int mag = 0;
@@ -1725,6 +1823,23 @@ static int decode_launch_blocks() {
     int active_blocks = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, decode_kernel_nvfp4, BLOCK_SIZE, 0);
     return std::max(1, active_blocks * prop.multiProcessorCount);
+}
+
+static int prefill_launch_blocks() {
+    if (const char *override_blocks = std::getenv("MEGAKERNEL_PREFILL_BLOCKS")) {
+        int value = std::atoi(override_blocks);
+        if (value > 0) {
+            return value;
+        }
+    }
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device);
+    int active_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, prefill_kernel_nvfp4, BLOCK_SIZE, 0);
+    int resident = std::max(1, active_blocks * prop.multiProcessorCount);
+    return std::min(resident, 24);
 }
 
 static int lm_launch_blocks() {
@@ -1827,6 +1942,60 @@ extern "C" bool launch_lm_head_cublaslt_bf16_top1(
     return true;
 }
 
+static void launch_lm_head_from_f32_normalized(
+    int lm_blocks,
+    const float *normalized,
+    int *output_token_id,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
+    float *block_max_vals, int *block_max_idxs,
+    int group_size,
+    cudaStream_t stream)
+{
+    int prepare_threads = 256;
+    int prepare_blocks = (LM_HEAD_TC_N * HIDDEN_SIZE + prepare_threads - 1) / prepare_threads;
+    prepare_lm_hidden_bf16_kernel<<<prepare_blocks, prepare_threads, 0, stream>>>(
+        normalized,
+        (__nv_bfloat16 *)lm_hidden_bf16);
+    cudaMemsetAsync(lm_hidden_scales, 0, LM_HEAD_HIDDEN_SCALE_BYTES, stream);
+    launch_quantize_nvfp4_lm_out(
+        lm_hidden_bf16,
+        LM_HEAD_TC_N,
+        HIDDEN_SIZE,
+        lm_hidden_packed,
+        lm_hidden_scales,
+        stream);
+
+    bool used_cublaslt = launch_lm_head_cublaslt(
+        (const uint8_t *)lm_head_weight_packed,
+        (const uint8_t *)lm_head_scales,
+        (const uint8_t *)lm_hidden_packed,
+        (const uint8_t *)lm_hidden_scales,
+        (__half *)lm_logits_f16,
+        stream);
+    if (lm_debug_enabled()) {
+        std::fprintf(stderr, "lm_head_cublaslt: used=%d\n", int(used_cublaslt));
+    }
+    if (used_cublaslt) {
+        lm_head_argmax_half_kernel<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
+            (const __half *)lm_logits_f16,
+            block_max_vals,
+            block_max_idxs);
+    } else {
+        lm_head_kernel_nvfp4<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
+            normalized,
+            (const uint8_t *)lm_head_weight_packed,
+            (const uint8_t *)lm_head_scales,
+            block_max_vals, block_max_idxs,
+            group_size);
+    }
+    lm_head_reduce_kernel<<<1, LM_BLOCK_SIZE, 0, stream>>>(
+        block_max_vals,
+        block_max_idxs,
+        output_token_id,
+        lm_blocks);
+}
+
 static void launch_decode_step_nvfp4(
     int num_blocks, int lm_blocks,
     const int *input_token_ptr, int *output_token_id,
@@ -1877,50 +2046,16 @@ static void launch_decode_step_nvfp4(
         decode_args,
         0,
         stream);
-
-    int prepare_threads = 256;
-    int prepare_blocks = (LM_HEAD_TC_N * HIDDEN_SIZE + prepare_threads - 1) / prepare_threads;
-    prepare_lm_hidden_bf16_kernel<<<prepare_blocks, prepare_threads, 0, stream>>>(
+    launch_lm_head_from_f32_normalized(
+        lm_blocks,
         (const float *)g_normalized,
-        (__nv_bfloat16 *)lm_hidden_bf16);
-    cudaMemsetAsync(lm_hidden_scales, 0, LM_HEAD_HIDDEN_SCALE_BYTES, stream);
-    launch_quantize_nvfp4_lm_out(
-        lm_hidden_bf16,
-        LM_HEAD_TC_N,
-        HIDDEN_SIZE,
-        lm_hidden_packed,
-        lm_hidden_scales,
-        stream);
-
-    bool used_cublaslt = launch_lm_head_cublaslt(
-        (const uint8_t *)lm_head_weight_packed,
-        (const uint8_t *)lm_head_scales,
-        (const uint8_t *)lm_hidden_packed,
-        (const uint8_t *)lm_hidden_scales,
-        (__half *)lm_logits_f16,
-        stream);
-    if (lm_debug_enabled()) {
-        std::fprintf(stderr, "lm_head_cublaslt: used=%d\n", int(used_cublaslt));
-    }
-    if (used_cublaslt) {
-        lm_head_argmax_half_kernel<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
-            (const __half *)lm_logits_f16,
-            block_max_vals,
-            block_max_idxs);
-    } else {
-        lm_head_kernel_nvfp4<<<lm_blocks, LM_BLOCK_SIZE, 0, stream>>>(
-            (const float *)g_normalized,
-            (const uint8_t *)lm_head_weight_packed,
-            (const uint8_t *)lm_head_scales,
-            block_max_vals, block_max_idxs,
-            group_size);
-    }
-    (void)lm_sync_counter;
-    lm_head_reduce_kernel<<<1, LM_BLOCK_SIZE, 0, stream>>>(
-        block_max_vals,
-        block_max_idxs,
         output_token_id,
-        lm_blocks);
+        lm_head_weight_packed, lm_head_scales,
+        lm_hidden_bf16, lm_hidden_packed, lm_hidden_scales, lm_logits_f16,
+        block_max_vals, block_max_idxs,
+        group_size,
+        stream);
+    (void)lm_sync_counter;
 }
 
 extern "C" void launch_decode_nvfp4(
@@ -1978,6 +2113,71 @@ extern "C" void launch_decode_nvfp4(
         lm_sync_counter,
         position,
         max_seq_len,
+        group_size,
+        stream);
+}
+
+extern "C" void launch_prefill_megakernel_nvfp4(
+    const int *token_ids, int seq_len, int *output_token_id,
+    const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
+    const void *final_norm_weight,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_activations, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
+    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_alpha_scratch, void *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_generation,
+    float *block_max_vals, int *block_max_idxs,
+    unsigned int *lm_sync_counter,
+    int max_seq_len, int group_size, cudaStream_t stream)
+{
+    (void)barrier_counter;
+    (void)barrier_generation;
+    (void)lm_sync_counter;
+
+    int num_blocks = prefill_launch_blocks();
+    int lm_blocks = lm_launch_blocks();
+    void *prefill_args[] = {
+        (void *)&token_ids,
+        (void *)&seq_len,
+        (void *)&embed_weight,
+        (void *)&final_norm_weight,
+        (void *)&layer_weights,
+        (void *)&fa_k_cache,
+        (void *)&fa_v_cache,
+        (void *)&dn_states,
+        (void *)&conv_bufs,
+        (void *)&hidden_buffer,
+        (void *)&g_activations,
+        (void *)&g_residual,
+        (void *)&g_qkv_scratch,
+        (void *)&g_kv_scratch,
+        (void *)&g_attn_out,
+        (void *)&g_mlp_inter,
+        (void *)&g_z_scratch,
+        (void *)&g_beta_scratch,
+        (void *)&g_alpha_scratch,
+        (void *)&g_normalized,
+        (void *)&max_seq_len,
+    };
+    cudaLaunchCooperativeKernel(
+        (void *)prefill_kernel_nvfp4,
+        dim3(num_blocks),
+        dim3(BLOCK_SIZE),
+        prefill_args,
+        0,
+        stream);
+
+    launch_lm_head_from_f32_normalized(
+        lm_blocks,
+        (const float *)g_normalized,
+        output_token_id,
+        lm_head_weight_packed, lm_head_scales,
+        lm_hidden_bf16, lm_hidden_packed, lm_hidden_scales, lm_logits_f16,
+        block_max_vals, block_max_idxs,
         group_size,
         stream);
 }
