@@ -55,6 +55,7 @@ extern "C" void launch_decode_nvfp4(
     const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
     const void *final_norm_weight,
     const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
     void *fa_k_cache, void *fa_v_cache,
     void *dn_states, void *conv_bufs,
     void *hidden_buffer, void *g_activations, void *g_residual,
@@ -70,11 +71,16 @@ extern "C" void launch_quantize_nvfp4_out(
     const void *weight, int rows, int cols, int group_size,
     void *packed_out, void *scales_out, cudaStream_t stream);
 
+extern "C" void launch_quantize_nvfp4_lm_out(
+    const void *weight, int rows, int cols,
+    void *packed_out, void *scales_out, cudaStream_t stream);
+
 extern "C" void launch_decode_many_nvfp4(
     int *token_buffer, int *output_tokens, int steps,
     const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
     const void *final_norm_weight,
     const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
     void *fa_k_cache, void *fa_v_cache,
     void *dn_states, void *conv_bufs,
     void *hidden_buffer, void *g_activations, void *g_residual,
@@ -134,6 +140,7 @@ void decode_nvfp4(
     torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
     torch::Tensor final_norm_weight,
     torch::Tensor lm_head_weight_packed, torch::Tensor lm_head_scales,
+    torch::Tensor lm_hidden_bf16, torch::Tensor lm_hidden_packed, torch::Tensor lm_hidden_scales, torch::Tensor lm_logits_f16,
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
     torch::Tensor hidden_buffer, torch::Tensor activations, torch::Tensor residual,
@@ -153,6 +160,7 @@ void decode_nvfp4(
         reinterpret_cast<const LayerWeightsNVFP4*>(layer_weights_packed.data_ptr()),
         final_norm_weight.data_ptr(),
         lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(), lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         dn_states.data_ptr(), conv_bufs.data_ptr(),
         hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
@@ -173,6 +181,7 @@ void decode_many_nvfp4(
     torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
     torch::Tensor final_norm_weight,
     torch::Tensor lm_head_weight_packed, torch::Tensor lm_head_scales,
+    torch::Tensor lm_hidden_bf16, torch::Tensor lm_hidden_packed, torch::Tensor lm_hidden_scales, torch::Tensor lm_logits_f16,
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
     torch::Tensor hidden_buffer, torch::Tensor activations, torch::Tensor residual,
@@ -202,6 +211,7 @@ void decode_many_nvfp4(
         reinterpret_cast<const LayerWeightsNVFP4*>(layer_weights_packed.data_ptr()),
         final_norm_weight.data_ptr(),
         lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(), lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         dn_states.data_ptr(), conv_bufs.data_ptr(),
         hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
@@ -244,6 +254,40 @@ void quantize_nvfp4_out(
 
     launch_quantize_nvfp4_out(
         weight.data_ptr(), rows, cols, (int)group_size,
+        packed_out.data_ptr(), scales_out.data_ptr(),
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void quantize_nvfp4_lm_out(
+    torch::Tensor packed_out,
+    torch::Tensor scales_out,
+    torch::Tensor weight)
+{
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(weight.dim() == 2, "weight must be a 2D [out_dim, in_dim] tensor");
+    TORCH_CHECK(weight.scalar_type() == torch::kBFloat16, "weight must be bfloat16");
+
+    auto rows = static_cast<int>(weight.size(0));
+    auto cols = static_cast<int>(weight.size(1));
+    TORCH_CHECK((rows % 128) == 0, "out_dim must be divisible by 128");
+    TORCH_CHECK((cols % 64) == 0, "in_dim must be divisible by 64");
+    TORCH_CHECK(packed_out.is_cuda() && packed_out.is_contiguous(), "packed_out must be contiguous CUDA");
+    TORCH_CHECK(scales_out.is_cuda() && scales_out.is_contiguous(), "scales_out must be contiguous CUDA");
+    TORCH_CHECK(packed_out.scalar_type() == torch::kUInt8, "packed_out must be uint8");
+    TORCH_CHECK(scales_out.scalar_type() == torch::kUInt8, "scales_out must be uint8");
+    TORCH_CHECK(
+        packed_out.numel() == (int64_t)rows * (cols / 2),
+        "packed_out has the wrong size");
+
+    int scale_tiles = cols / 64;
+    int expected_scales = (rows / 128) * scale_tiles * 512;
+    TORCH_CHECK(
+        scales_out.numel() == expected_scales,
+        "scales_out has the wrong size");
+
+    launch_quantize_nvfp4_lm_out(
+        weight.data_ptr(), rows, cols,
         packed_out.data_ptr(), scales_out.data_ptr(),
         c10::cuda::getCurrentCUDAStream().stream());
 }
@@ -309,6 +353,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("decode_nvfp4(Tensor output_token, int input_token_id, "
             "Tensor embed_weight, Tensor layer_weights_packed, "
             "Tensor final_norm_weight, Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, Tensor lm_hidden_scales, Tensor lm_logits_f16, "
             "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
             "Tensor hidden_buffer, Tensor activations, Tensor residual, "
             "Tensor qkv_scratch, Tensor kv_scratch, Tensor attn_out, "
@@ -322,6 +367,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("decode_many_nvfp4(Tensor output_tokens, Tensor token_buffer, int input_token_id, "
             "Tensor embed_weight, Tensor layer_weights_packed, "
             "Tensor final_norm_weight, Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, Tensor lm_hidden_scales, Tensor lm_logits_f16, "
             "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
             "Tensor hidden_buffer, Tensor activations, Tensor residual, "
             "Tensor qkv_scratch, Tensor kv_scratch, Tensor attn_out, "
@@ -345,6 +391,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def("quantize_nvfp4_out(Tensor packed_out, Tensor scales_out, Tensor weight, int group_size) -> ()");
     ops.impl("quantize_nvfp4_out", torch::kCUDA, &quantize_nvfp4_out);
+
+    ops.def("quantize_nvfp4_lm_out(Tensor packed_out, Tensor scales_out, Tensor weight) -> ()");
+    ops.impl("quantize_nvfp4_lm_out", torch::kCUDA, &quantize_nvfp4_lm_out);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
