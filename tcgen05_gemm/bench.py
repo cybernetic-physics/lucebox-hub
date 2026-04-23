@@ -4,7 +4,7 @@ import time
 import torch
 import tcgen05_gemm_C  # noqa: F401
 
-M, N, K = 128, 256, 64
+M, N, K = 128, 4096, 256
 
 
 def bench_tcgen05(A, B, n_warmup=100, n_iter=1000):

@@ -18,10 +18,12 @@
 
 constexpr int M = 128;
 constexpr int N = 256;
-constexpr int K = 64;           // bf16 elements; row width = 128 bytes (one 128B super-block)
-constexpr int K_BYTES = K * 2;  // 128 bytes
+constexpr int K = 256;          // bf16 elements; multi K-tile layout
+constexpr int K_TILE = 64;      // bf16 per K-tile (= 128 bytes, one 128B super-block)
+constexpr int K_TILES = K / K_TILE;
 constexpr int MMA_K = 16;       // bf16 K per tcgen05.mma call
-constexpr int K_STEPS = K / MMA_K;   // 4
+constexpr int K_STEPS = K / MMA_K;
+constexpr int MMAS_PER_TILE = K_TILE / MMA_K;    // 4
 
 // desc_encode matches gau-nernst: 14-bit field, value >> 4.
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
@@ -38,16 +40,25 @@ __device__ __forceinline__ uint64_t make_desc(uint32_t smem_addr) {
          | (2ULL << 61);       // 128B swizzle
 }
 
+// Per-block tile dimensions (fixed). Grid dim controls output N tiling.
+//   blockIdx.x: which N-tile this block owns.
+//   Output C[M, N_TOTAL] — M=128 fixed, N_TOTAL = gridDim.x * N.
 extern "C" __global__ void tcgen05_gemm_one_tile(
-    const __nv_bfloat16 *__restrict__ A,   // [M=128, K=64]
-    const __nv_bfloat16 *__restrict__ B,   // [N=256, K=64]
-    float               *__restrict__ C)   // [M=128, N=256] fp32
+    const __nv_bfloat16 *__restrict__ A,      // [M=128, K]
+    const __nv_bfloat16 *__restrict__ B_all,  // [N_TOTAL, K]
+    float               *__restrict__ C_all,  // [M, N_TOTAL] fp32
+    int N_TOTAL)
 {
-    // 128B-aligned shared buffers: A 16 KB + B 32 KB = 48 KB, in dynamic shared
-    // to stay under the PTXAS static-shared 48 KB compile-time limit.
+    const int block_n_idx = blockIdx.x;
+    const int n_offset = block_n_idx * N;
+    const __nv_bfloat16 *B = B_all + (size_t)n_offset * K;
+    float               *C = C_all + (size_t)n_offset;  // will write stride N_TOTAL
+    // K-tile-major layout: K_TILES copies of [M × K_TILE] and [N × K_TILE],
+    // each swizzled per-tile. For K=128 (2 K-tiles): A = 32 KB, B = 64 KB.
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     __nv_bfloat16 *s_A = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
-    __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(smem_raw + M * K * sizeof(__nv_bfloat16));
+    __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(
+        smem_raw + K_TILES * M * K_TILE * sizeof(__nv_bfloat16));
     __shared__ uint32_t tmem_slot;
     __shared__ uint64_t mma_mbar;
 
@@ -73,55 +84,57 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
     __syncthreads();
     const uint32_t taddr = tmem_slot;
 
-    // --------- 3. Load A, B to shared via cp.async WITH 128B swizzle applied.
-    // Raw row-major must be rearranged: for row r and 16-byte chunk index
-    // chunk_idx, the swizzled physical chunk position is chunk_idx ^ (r & 7).
-    // Each row has 128 bytes = 8 chunks of 16 bytes (= 8 bf16 elements).
-    // So row r, bf16 offset c (where c is a multiple of 8):
-    //   chunk = c >> 3
-    //   swizzled_chunk = chunk ^ (r & 7)
-    //   write to s_*[r * K + (swizzled_chunk << 3)]
-    // 128B swizzle applies within each 128-byte super-block independently.
-    // In bf16 units: 128 bytes = 64 bf16, 8 chunks of 8 bf16 each.
-    auto swz_offset = [](int r, int c_bf16) -> int {
-        int super_idx = c_bf16 >> 6;                 // which 128B super-block
-        int local_c   = c_bf16 & 63;                 // bf16 offset within super
-        int local_chunk = local_c >> 3;              // 8-bf16-wide chunk (0..7)
-        int sw_chunk   = local_chunk ^ (r & 7);      // XOR swizzle
-        int sw_local_c = (sw_chunk << 3) | (local_c & 7);
-        return (super_idx << 6) | sw_local_c;
+    // --------- 3. Load A, B to shared in K-TILE-MAJOR layout with 128B swizzle.
+    // For a row-major source A[M, K] bf16, we rearrange into K_TILES copies of
+    // [M × K_TILE bf16], each copy swizzled by (row & 7). Global bf16 offset
+    // c ∈ [0, K) split as (k_tile = c / K_TILE, local_c = c % K_TILE), then
+    // the swizzled in-tile position is (row * K_TILE + (chunk^(r&7)) << 3).
+    //
+    // Standard 128B swizzle for 8×16B chunks within a 128B row.
+    auto swz_offset = [](int r, int local_c) -> int {
+        int chunk    = local_c >> 3;            // 0..7 chunks of 8 bf16 each
+        int sw_chunk = chunk ^ (r & 7);
+        return (sw_chunk << 3) | (local_c & 7);
     };
 
-    // A: 128 rows × 8 chunks = 1024 loads.
+    // A: M * K bf16 total = (M * K / 8) loads of 8 bf16 each.
     {
-        for (int it = 0; it < 2; it++) {
+        constexpr int A_TOTAL = M * K / 8;   // 8 bf16 per cp.async
+        constexpr int A_ITERS = (A_TOTAL + 511) / 512;
+        for (int it = 0; it < A_ITERS; it++) {
             int i = tid + it * 512;
-            int r = i / 8;
-            int c = (i % 8) * 8;                      // bf16 offset: 0, 8, 16, ..., 56
-            if (r < M) {
-                int sw_c = swz_offset(r, c);
-                __nv_bfloat16 *dst = s_A + r * K + sw_c;
-                const __nv_bfloat16 *src = A + r * K + c;
-                uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                             :: "r"(smem_addr), "l"(src));
-            }
+            if (i >= A_TOTAL) break;
+            int r = i / (K / 8);               // row in [0, M)
+            int c_chunk = i % (K / 8);         // chunk in [0, K/8)
+            int c = c_chunk * 8;               // bf16 offset in [0, K)
+            int k_tile = c / K_TILE;
+            int local_c = c % K_TILE;
+            int sw_local_c = swz_offset(r, local_c);
+            __nv_bfloat16 *dst = s_A + k_tile * M * K_TILE + r * K_TILE + sw_local_c;
+            const __nv_bfloat16 *src = A + r * K + c;
+            uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_addr), "l"(src));
         }
     }
-    // B: 256 rows × 8 chunks = 2048 loads.
+    // B: N * K bf16 total = (N * K / 8) loads.
     {
-        for (int it = 0; it < 4; it++) {
+        constexpr int B_TOTAL = N * K / 8;
+        constexpr int B_ITERS = (B_TOTAL + 511) / 512;
+        for (int it = 0; it < B_ITERS; it++) {
             int i = tid + it * 512;
-            int r = i / 8;
-            int c = (i % 8) * 8;
-            if (r < N) {
-                int sw_c = swz_offset(r, c);
-                __nv_bfloat16 *dst = s_B + r * K + sw_c;
-                const __nv_bfloat16 *src = B + r * K + c;
-                uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                             :: "r"(smem_addr), "l"(src));
-            }
+            if (i >= B_TOTAL) break;
+            int r = i / (K / 8);
+            int c_chunk = i % (K / 8);
+            int c = c_chunk * 8;
+            int k_tile = c / K_TILE;
+            int local_c = c % K_TILE;
+            int sw_local_c = swz_offset(r, local_c);
+            __nv_bfloat16 *dst = s_B + k_tile * N * K_TILE + r * K_TILE + sw_local_c;
+            const __nv_bfloat16 *src = B + r * K + c;
+            uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_addr), "l"(src));
         }
     }
     asm volatile("cp.async.commit_group;\n");
@@ -155,10 +168,19 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;\n"
                 :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc));
         }
-        // Remaining K-steps accumulate into same TMEM accumulator.
+        // Remaining K-steps. K-tile-major: each K_TILE (64 bf16 = 128 bytes)
+        // is one contiguous 128B-swizzled block of M*128 or N*128 bytes.
+        // Within one tile, MMA_K=16 advances are 32 bytes. Between tiles,
+        // jump by M*K_TILE*2 bytes for A and N*K_TILE*2 for B.
         for (int ks = 1; ks < K_STEPS; ks++) {
-            uint32_t a_smem = a_smem_base + (uint32_t)(ks * MMA_K * 2);
-            uint32_t b_smem = b_smem_base + (uint32_t)(ks * MMA_K * 2);
+            int k_tile_idx = ks / MMAS_PER_TILE;
+            int k_in_tile  = ks % MMAS_PER_TILE;
+            uint32_t a_smem = a_smem_base
+                + (uint32_t)(k_tile_idx * M * K_TILE * 2)   // bytes to next K-tile of A
+                + (uint32_t)(k_in_tile * MMA_K * 2);         // within tile
+            uint32_t b_smem = b_smem_base
+                + (uint32_t)(k_tile_idx * N * K_TILE * 2)
+                + (uint32_t)(k_in_tile * MMA_K * 2);
             uint64_t a_desc = make_desc(a_smem);
             uint64_t b_desc = make_desc(b_smem);
             asm volatile(
@@ -220,7 +242,7 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
             asm volatile("tcgen05.wait::ld.sync.aligned;\n");
             int out_row = row_offset + lane;
             if (out_row < M) {
-                float *dst = C + out_row * N + n_off;
+                float *dst = C + out_row * N_TOTAL + n_off;
                 dst[0] = t0; dst[1] = t1; dst[2] = t2; dst[3] = t3;
                 dst[4] = t4; dst[5] = t5; dst[6] = t6; dst[7] = t7;
             }
@@ -237,19 +259,17 @@ extern "C" __global__ void tcgen05_gemm_one_tile(
 }
 
 extern "C" void launch_tcgen05_gemm_one_tile(
-    const void *A, const void *B, void *C, cudaStream_t stream)
+    const void *A, const void *B, void *C, int N_TOTAL, cudaStream_t stream)
 {
-    // Shared usage: s_A 16 KB + s_B 32 KB + a few bytes for slots = ~48 KB.
-    // Opt into the higher per-block shared memory bucket.
     static bool cfg = false;
     if (!cfg) {
         cudaFuncSetAttribute((void *)tcgen05_gemm_one_tile,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);
         cfg = true;
     }
-    dim3 grid(1);
-    dim3 block(512);   // 16 warps — still 4 warps handle the readback
+    dim3 grid(N_TOTAL / N);
+    dim3 block(512);
     constexpr size_t smem_bytes = (M + N) * K * sizeof(__nv_bfloat16);
     tcgen05_gemm_one_tile<<<grid, block, smem_bytes, stream>>>(
-        (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C);
+        (const __nv_bfloat16 *)A, (const __nv_bfloat16 *)B, (float *)C, N_TOTAL);
 }
