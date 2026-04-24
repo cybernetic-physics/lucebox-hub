@@ -7,6 +7,10 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+// ATen / torch for sdpa (cuDNN FlashAttention at large S).
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,6 +95,54 @@ __global__ void pf_add_residual_bf16(const __nv_bfloat16 *a, const __nv_bfloat16
 __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 *up, __nv_bfloat16 *out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
+}
+
+// Extract the Q-only half of Qwen3.5's gated [S, H, 2*D] FA projection
+// output into a dense [S, H, D] bf16 buffer, so sdpa / cuDNN FA can run.
+// The source was written by pf_qk_norm_rope into proj_buf (post-RoPE,
+// post-QK-norm values at offset 0..D of each head's 2*D slot).
+__global__ void pf_fa_extract_q_dense(
+    const __nv_bfloat16 *q_interleaved,   // [S, FA_Q_HEADS, 2*FA_HEAD_DIM]
+    __nv_bfloat16 *q_dense,                // [S, FA_Q_HEADS, FA_HEAD_DIM]
+    int S)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    if (i >= total) return;
+    int d = i % FA_HEAD_DIM;
+    int hd = i / FA_HEAD_DIM;
+    int h = hd % FA_Q_HEADS;
+    int s = hd / FA_Q_HEADS;
+    q_dense[i] = q_interleaved[s * FA_Q_HEADS * 2 * FA_HEAD_DIM
+                               + h * 2 * FA_HEAD_DIM + d];
+}
+
+// Apply Qwen3.5's gated-attention output gate and write to the final
+// per-position dense output. Gate values live in the second half of
+// each head's slot in q_interleaved (same layout pf_qk_norm_rope left
+// there — untouched by the rope rewrite).
+//
+// out[s, h, d] = attn_out[s, h, d] * sigmoid(gate[s, h, d])
+__global__ void pf_fa_apply_gate_bf16(
+    const __nv_bfloat16 *attn_out,        // [S, FA_Q_HEADS, FA_HEAD_DIM]
+    const __nv_bfloat16 *q_interleaved,   // [S, FA_Q_HEADS, 2*FA_HEAD_DIM]
+    __nv_bfloat16 *out,                    // [S, FA_Q_HEADS, FA_HEAD_DIM]
+    int S)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    if (i >= total) return;
+    int d = i % FA_HEAD_DIM;
+    int hd = i / FA_HEAD_DIM;
+    int h = hd % FA_Q_HEADS;
+    int s = hd / FA_Q_HEADS;
+    const __nv_bfloat16 *g_src = q_interleaved
+        + s * FA_Q_HEADS * 2 * FA_HEAD_DIM
+        + h * 2 * FA_HEAD_DIM + FA_HEAD_DIM + d;
+    float g = __bfloat162float(*g_src);
+    float gsig = 1.0f / (1.0f + expf(-g));
+    float a = __bfloat162float(attn_out[i]);
+    out[i] = __float2bfloat16(a * gsig);
 }
 
 // ===== DeltaNet per-step prep kernel =====
@@ -1013,6 +1065,11 @@ static void prefill_bf16_body(
     // DISTINCT from proj_buf so blocks in pf_dn_prep don't race on reads
     // of the raw qkv values at (t-3..t-1) positions — see pf_dn_prep docs.
     __nv_bfloat16 *dn_qkv_prepped_scratch,
+    // Scratch for the sdpa-based FA attention path. Sized [S, FA_Q_SIZE] bf16.
+    // fa_q_dense holds the de-interleaved Q; fa_sdpa_out holds cuDNN FA's
+    // output before we apply the Qwen3.5 gated-attention gate.
+    __nv_bfloat16 *fa_q_dense_scratch,
+    __nv_bfloat16 *fa_sdpa_out_scratch,
     cudaStream_t stream)
 {
     int bk = (S*HIDDEN+255)/256;
@@ -1026,7 +1083,11 @@ static void prefill_bf16_body(
             lora_layer_ptr_b((B_BASE), (LAYER_IDX), (K_OUT), lora_rank),           \
             (Y), lora_h_ws, S, (K_OUT), (K_IN), lora_rank, lora_scaling)
 
-    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    // KV-cache stride MUST match the fa_k_cache / fa_v_cache tensor the
+    // caller allocated. We use 32768 = 32 k context, which also matches
+    // the pf_qk_norm_rope stride arg below.
+    constexpr int PREFILL_KV_MAX = 32768;
+    int fa_stride = FA_KV_HEADS * PREFILL_KV_MAX * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
     int fa_idx = 0, dn_idx = 0;
 
@@ -1164,10 +1225,66 @@ static void prefill_bf16_body(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, PREFILL_KV_MAX);
 
-            pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
-                proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+            // Dense Q → [S, FA_Q_HEADS, FA_HEAD_DIM] bf16 (strip out the
+            // gate half of the q_proj output so cuDNN FA sees a packed
+            // tensor). Then call at::scaled_dot_product_attention, which
+            // routes to cuDNN FlashAttention-2 on sm_100. Using sdpa
+            // makes attention O(S * d) in memory (no materialized S×S
+            // matrix) and uses bf16 tensor cores — scalar pf_causal_attn
+            // saturates launch/bf16-scalar throughput beyond S≈8k.
+            {
+                int blocks_q = (S * FA_Q_SIZE + 255) / 256;
+                pf_fa_extract_q_dense<<<blocks_q, 256, 0, stream>>>(
+                    proj_buf, fa_q_dense_scratch, S);
+
+                auto opts = torch::TensorOptions()
+                    .dtype(torch::kBFloat16).device(torch::kCUDA);
+
+                // Q: already [S, H, D] contiguous in q_dense.
+                auto q_t = torch::from_blob(
+                    (void *)fa_q_dense_scratch,
+                    {1, S, (int64_t)FA_Q_HEADS, (int64_t)FA_HEAD_DIM},
+                    opts).transpose(1, 2);   // [1, H, S, D]
+
+                // K/V: strided view of the per-layer KV cache slice.
+                // Layout: [FA_KV_HEADS, PREFILL_KV_MAX, FA_HEAD_DIM].
+                // We view the first S rows as [1, FA_KV_HEADS, S, FA_HEAD_DIM]
+                // with strides that skip the unused tail of MAX_SEQ rows.
+                int64_t kv_head_stride = (int64_t)PREFILL_KV_MAX * FA_HEAD_DIM;
+                auto k_t = torch::from_blob(
+                    (void *)(fa_k_cache + fa_idx * fa_stride),
+                    {1, (int64_t)FA_KV_HEADS, S, (int64_t)FA_HEAD_DIM},
+                    {0, kv_head_stride, (int64_t)FA_HEAD_DIM, 1},
+                    opts);
+                auto v_t = torch::from_blob(
+                    (void *)(fa_v_cache + fa_idx * fa_stride),
+                    {1, (int64_t)FA_KV_HEADS, S, (int64_t)FA_HEAD_DIM},
+                    {0, kv_head_stride, (int64_t)FA_HEAD_DIM, 1},
+                    opts);
+
+                // sdpa: causal, GQA (8 Q heads × 2 KV heads).
+                auto o_t = at::scaled_dot_product_attention(
+                    q_t, k_t, v_t,
+                    /*attn_mask=*/c10::nullopt,
+                    /*dropout_p=*/0.0,
+                    /*is_causal=*/true,
+                    /*scale=*/c10::nullopt,
+                    /*enable_gqa=*/true);   // [1, H, S, D]
+
+                // Into our contiguous scratch laid out as [1, S, H, D].
+                auto out_view = torch::from_blob(
+                    (void *)fa_sdpa_out_scratch,
+                    {1, S, (int64_t)FA_Q_HEADS, (int64_t)FA_HEAD_DIM},
+                    opts);
+                out_view.copy_(o_t.transpose(1, 2).contiguous());
+
+                // Apply Qwen3.5 attention-output gate (sigmoid on the
+                // gate half that pf_qk_norm_rope left intact in proj_buf).
+                pf_fa_apply_gate_bf16<<<blocks_q, 256, 0, stream>>>(
+                    fa_sdpa_out_scratch, proj_buf, dn_out_buf, S);
+            }
 
             cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
             APPLY_LORA(lora.fa_o_A, lora.fa_o_B, dn_out_buf, proj_buf, FA_Q_SIZE, HIDDEN, fa_idx);
@@ -1308,6 +1425,22 @@ extern "C" void launch_prefill_bf16(
         dn_qkv_prepped_capacity = need_bytes;
     }
 
+    // Internal scratch for the sdpa-based FA attention path:
+    //   q_dense   [S, FA_Q_HEADS,     FA_HEAD_DIM] bf16
+    //   sdpa_out  [S, FA_Q_HEADS,     FA_HEAD_DIM] bf16
+    // At S=32k this is 2 * 32k * 8 * 256 * 2 = 128 MB total. Grow-as-needed.
+    static __nv_bfloat16 *fa_q_dense = nullptr;
+    static __nv_bfloat16 *fa_sdpa_out = nullptr;
+    static size_t fa_scratch_capacity = 0;
+    size_t fa_need = (size_t)seq_len * FA_Q_SIZE * sizeof(__nv_bfloat16);
+    if (fa_need > fa_scratch_capacity) {
+        if (fa_q_dense)  cudaFree(fa_q_dense);
+        if (fa_sdpa_out) cudaFree(fa_sdpa_out);
+        cudaMalloc(&fa_q_dense,  fa_need);
+        cudaMalloc(&fa_sdpa_out, fa_need);
+        fa_scratch_capacity = fa_need;
+    }
+
     bool disable_graph = std::getenv("MEGAKERNEL_PREFILL_NOGRAPH") != nullptr;
 
     PrefillGraphKey key{};
@@ -1391,7 +1524,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, fa_q_dense, fa_sdpa_out, stream);  // to body
         if (hit) hit->eager_runs++;
         return;
     }
@@ -1414,7 +1547,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, fa_q_dense, fa_sdpa_out, stream);  // to body
         return;
     }
 
@@ -1444,7 +1577,7 @@ extern "C" void launch_prefill_bf16(
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, capture_stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, fa_q_dense, fa_sdpa_out, capture_stream);
     {
         cudaGraph_t graph = nullptr;
         err = cudaStreamEndCapture(capture_stream, &graph);
@@ -1492,7 +1625,7 @@ fallback_eager:
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, fa_q_dense, fa_sdpa_out, stream);
     if (hit) {
         hit->eager_runs++;  // stay in warmup until capture finally works
     }
