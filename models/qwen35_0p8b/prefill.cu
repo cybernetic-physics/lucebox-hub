@@ -353,45 +353,17 @@ pf_deltanet_recurrence_vsplit_prepped(
     int k_base = DN_QK_SIZE + h * DN_KEY;
     int v_base_gch = 2 * DN_QK_SIZE + h * DN_VAL;
 
-    // Software-pipelined recurrence: prefetch step t+1's q/k while
-    // compute for step t runs, so the ~400-cycle global-load latency
-    // overlaps with the warp-reduce / state-update compute. The
-    // recurrence is the 72%-of-total hot kernel at S=32k; without
-    // this the loop is latency-bound on the serial q/k loads.
-
-    // Prologue: load t=0.
-    float sk_next[RPL], sq_next[RPL];
-    {
-        const __nv_bfloat16 *q_row = qkv_proj_prepped + 0 * DN_CONV_CH + q_base;
-        const __nv_bfloat16 *k_row = qkv_proj_prepped + 0 * DN_CONV_CH + k_base;
-        #pragma unroll
-        for (int ii = 0; ii < RPL; ii++) {
-            sk_next[ii] = __bfloat162float(__ldg(k_row + lid + ii*32));
-            sq_next[ii] = __bfloat162float(__ldg(q_row + lid + ii*32));
-        }
-    }
-
     for (int t = 0; t < S; t++) {
+        const __nv_bfloat16 *q_row = qkv_proj_prepped + t * DN_CONV_CH + q_base;
+        const __nv_bfloat16 *k_row = qkv_proj_prepped + t * DN_CONV_CH + k_base;
         const __nv_bfloat16 *v_row = qkv_proj_prepped + t * DN_CONV_CH + v_base_gch;
 
-        // Promote prefetched values to active for this step.
+        // Each lane loads its 4-element slice of q and k from global.
         float sk_cache[RPL], sq_cache[RPL];
         #pragma unroll
         for (int ii = 0; ii < RPL; ii++) {
-            sk_cache[ii] = sk_next[ii];
-            sq_cache[ii] = sq_next[ii];
-        }
-
-        // Kick off load of t+1's q/k BEFORE starting compute — lets the
-        // memory subsystem run the load while compute proceeds in regs.
-        if (t + 1 < S) {
-            const __nv_bfloat16 *q_row_n = qkv_proj_prepped + (t+1) * DN_CONV_CH + q_base;
-            const __nv_bfloat16 *k_row_n = qkv_proj_prepped + (t+1) * DN_CONV_CH + k_base;
-            #pragma unroll
-            for (int ii = 0; ii < RPL; ii++) {
-                sk_next[ii] = __bfloat162float(__ldg(k_row_n + lid + ii*32));
-                sq_next[ii] = __bfloat162float(__ldg(q_row_n + lid + ii*32));
-            }
+            sk_cache[ii] = __bfloat162float(k_row[lid + ii*32]);
+            sq_cache[ii] = __bfloat162float(q_row[lid + ii*32]);
         }
 
         float beta  = beta_buf_prepped [t * DN_HEADS + h];
