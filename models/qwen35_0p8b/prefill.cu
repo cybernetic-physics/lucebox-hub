@@ -118,15 +118,16 @@ __global__ void pf_fa_extract_q_dense(
 }
 
 // Apply Qwen3.5's gated-attention output gate and write to the final
-// per-position dense output. Gate values live in the second half of
-// each head's slot in q_interleaved (same layout pf_qk_norm_rope left
-// there — untouched by the rope rewrite).
+// per-position dense output. Reads sdpa's native [1, H, S, D] layout
+// directly — avoids a transpose+contiguous 128 MB copy at S=32k × 6
+// FA layers.
 //
-// out[s, h, d] = attn_out[s, h, d] * sigmoid(gate[s, h, d])
+// out[s, h, d] = attn_out_BHSD[h, s, d] * sigmoid(gate[s, h, d])
+// gate lives in the second half of each head's slot in q_interleaved.
 __global__ void pf_fa_apply_gate_bf16(
-    const __nv_bfloat16 *attn_out,        // [S, FA_Q_HEADS, FA_HEAD_DIM]
-    const __nv_bfloat16 *q_interleaved,   // [S, FA_Q_HEADS, 2*FA_HEAD_DIM]
-    __nv_bfloat16 *out,                    // [S, FA_Q_HEADS, FA_HEAD_DIM]
+    const __nv_bfloat16 *attn_out_BHSD,   // [1, H, S, D] as left by sdpa
+    const __nv_bfloat16 *q_interleaved,   // [S, H, 2*D]
+    __nv_bfloat16 *out,                    // [S, H, D] final dense output
     int S)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -136,12 +137,16 @@ __global__ void pf_fa_apply_gate_bf16(
     int hd = i / FA_HEAD_DIM;
     int h = hd % FA_Q_HEADS;
     int s = hd / FA_Q_HEADS;
+    // Read attn_out from [H, S, D] layout.
+    const __nv_bfloat16 *a_src = attn_out_BHSD
+        + h * S * FA_HEAD_DIM + s * FA_HEAD_DIM + d;
+    // Read gate from interleaved [S, H, 2D] layout (second half).
     const __nv_bfloat16 *g_src = q_interleaved
         + s * FA_Q_HEADS * 2 * FA_HEAD_DIM
         + h * 2 * FA_HEAD_DIM + FA_HEAD_DIM + d;
     float g = __bfloat162float(*g_src);
     float gsig = 1.0f / (1.0f + expf(-g));
-    float a = __bfloat162float(attn_out[i]);
+    float a = __bfloat162float(*a_src);
     out[i] = __float2bfloat16(a * gsig);
 }
 
@@ -1271,19 +1276,15 @@ static void prefill_bf16_body(
                     /*dropout_p=*/0.0,
                     /*is_causal=*/true,
                     /*scale=*/c10::nullopt,
-                    /*enable_gqa=*/true);   // [1, H, S, D]
+                    /*enable_gqa=*/true);   // [1, H, S, D] contiguous
+                auto o_cont = o_t.contiguous();  // cheap no-op if already
 
-                // Into our contiguous scratch laid out as [1, S, H, D].
-                auto out_view = torch::from_blob(
-                    (void *)fa_sdpa_out_scratch,
-                    {1, S, (int64_t)FA_Q_HEADS, (int64_t)FA_HEAD_DIM},
-                    opts);
-                out_view.copy_(o_t.transpose(1, 2).contiguous());
-
-                // Apply Qwen3.5 attention-output gate (sigmoid on the
-                // gate half that pf_qk_norm_rope left intact in proj_buf).
+                // Apply Qwen3.5 attention-output gate — gate kernel reads
+                // sdpa's native [H, S, D] layout directly (no transpose,
+                // no intermediate copy) and writes dense [S, H, D] out.
                 pf_fa_apply_gate_bf16<<<blocks_q, 256, 0, stream>>>(
-                    fa_sdpa_out_scratch, proj_buf, dn_out_buf, S);
+                    reinterpret_cast<const __nv_bfloat16*>(o_cont.data_ptr()),
+                    proj_buf, dn_out_buf, S);
             }
 
             cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
