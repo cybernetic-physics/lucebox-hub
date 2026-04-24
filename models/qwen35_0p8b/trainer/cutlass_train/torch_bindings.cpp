@@ -93,11 +93,12 @@ TORCH_LIBRARY(cutlass_train_C, ops) {
         double scale, bool causal) {
             TORCH_CHECK(Q.scalar_type() == torch::kBFloat16);
             TORCH_CHECK(logsumexp.scalar_type() == torch::kFloat32);
+            // Inputs are in torch-sdpa-native [B, H, S, D] layout.
             int B_ = (int)Q.size(0);
-            int S = (int)Q.size(1);
-            int Hq = (int)Q.size(2);
-            int D = (int)Q.size(3);
-            int Hk = (int)K.size(2);
+            int Hq = (int)Q.size(1);
+            int S  = (int)Q.size(2);
+            int D  = (int)Q.size(3);
+            int Hk = (int)K.size(1);
             cudaError_t err = cutlass_fmha_bwd_sm100(
                 (const __nv_bfloat16*)Q.data_ptr(),
                 (const __nv_bfloat16*)K.data_ptr(),

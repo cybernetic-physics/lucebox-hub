@@ -45,36 +45,41 @@ using BwdOp = cutlass::fmha::device::Sm100FmhaBwd<
     /*IsMla=*/ false, ActiveMask>;
 
 
-// --- Stride builders (match kernel Argument types; see fmha_device_bwd.hpp
-//     lines 102-121). Q/dQ/O/dO and K/V/dK/dV have different shapes in
-//     the GQA dim ("H_R" stride = _0 for K/V since the same K/V head is
-//     shared across H_R query heads).
+// --- Stride builders matching example 77's memory layout convention:
+//     Q, O, dO, dQ in [B, H_K, H_R, S, D]   (equivalent to [B, H, S, D]
+//     where H = H_K * H_R and head index h = h_k * H_R + h_r).
+//     K, V, dK, dV in [B, H_K, S, D]   (GQA: no H_R dim; shared across H_R
+//     query heads, encoded as _0 stride in the H_R slot).
+//     LSE in [B, H_K, H_R, S].
+//
+//     This IS the layout torch's F.scaled_dot_product_attention uses
+//     (input shape [B, H, S, D]), so calling the kernel from torch is
+//     direct — no permute/copy needed.
+//
+//     Reference: cutlass/examples/77_blackwell_fmha/77_blackwell_fmha_bwd.cu
+//     lines 609-613.
 
 static auto make_stride_qod(int S, int Hq, int Hk, int D, int B) {
     int H_R = Hq / Hk;
-    int pos_stride = Hq * D;
-    int hr_stride  = D;
-    int hk_stride  = H_R * D;
-    int b_stride   = (B == 1) ? 0 : Hq * D * S;
-    return make_stride(pos_stride, _1{},
-                       make_stride(make_stride(hr_stride, hk_stride), b_stride));
+    // Stride<int, _1, Stride<Stride<int, int>, int>>
+    //   = (pos_stride, _1, ((H_R_stride, H_K_stride), B_stride))
+    return make_stride(D, _1{},
+                       make_stride(make_stride(D * S, D * S * H_R),
+                                   (B == 1) ? 0 : D * S * H_R * Hk));
 }
 
 static auto make_stride_kv(int S, int Hk, int D, int B) {
-    int pos_stride = Hk * D;
-    int hk_stride  = D;
-    int b_stride   = (B == 1) ? 0 : Hk * D * S;
-    return make_stride(pos_stride, _1{},
-                       make_stride(make_stride(_0{}, hk_stride), b_stride));
+    // GQA: H_R slot has static _0 stride (K/V shared across H_R copies).
+    return make_stride(D, _1{},
+                       make_stride(make_stride(_0{}, D * S),
+                                   (B == 1) ? 0 : D * S * Hk));
 }
 
 static auto make_stride_lse(int S, int Hq, int Hk, int B) {
     int H_R = Hq / Hk;
-    int hr_stride = S;
-    int hk_stride = H_R * S;
-    int b_stride  = (B == 1) ? 0 : Hq * S;
     return make_stride(_1{},
-                       make_stride(make_stride(hr_stride, hk_stride), b_stride));
+                       make_stride(make_stride(S, S * H_R),
+                                   (B == 1) ? 0 : S * H_R * Hk));
 }
 
 

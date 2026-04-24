@@ -17,48 +17,32 @@ import cutlass_train_C  # noqa: F401
 
 
 def run_torch_sdpa(Q, K, V, dO, scale):
-    """Forward + autograd backward via cuDNN FA-2. Also returns O and LSE
-    we'd need to save during our forward (extracted from autograd internals
-    is hard; for test purposes we just return what backward computes).
-    """
+    """Forward + autograd backward via cuDNN FA-2. All inputs are
+    [B, H, S, D] already (torch sdpa native layout; also what CUTLASS
+    example 77 expects)."""
     Qt = Q.detach().requires_grad_(True)
     Kt = K.detach().requires_grad_(True)
     Vt = V.detach().requires_grad_(True)
-    # [B, H, S, D] layout expected by sdpa.
-    Qp = Qt.permute(0, 2, 1, 3).contiguous()
-    Kp = Kt.permute(0, 2, 1, 3).contiguous()
-    Vp = Vt.permute(0, 2, 1, 3).contiguous()
     Op = F.scaled_dot_product_attention(
-        Qp, Kp, Vp, is_causal=True, enable_gqa=True, scale=scale)
-    # dO in the same layout
-    dOp = dO.permute(0, 2, 1, 3).contiguous()
-    Op.backward(dOp)
-    # Map outputs back to [B, S, H, D] layout.
-    O = Op.permute(0, 2, 1, 3).contiguous().detach()
-    dQ = Qt.grad
-    dK = Kt.grad
-    dV = Vt.grad
-    return O, dQ, dK, dV
+        Qt, Kt, Vt, is_causal=True, enable_gqa=True, scale=scale)
+    Op.backward(dO)
+    O = Op.detach()
+    return O, Qt.grad, Kt.grad, Vt.grad
 
 
 def compute_lse_reference(Q, K, scale):
-    """LSE = log-sum-exp over keys for each query row (after scale + causal
-    mask). fp32 for stability. Returns [B, Hq, S]."""
-    B, S, Hq, D = Q.shape
-    Hk = K.shape[2]
+    """[B, Hq, S] LSE of scaled causal scores. Inputs [B, H, S, D]."""
+    B, Hq, S, D = Q.shape
+    Hk = K.shape[1]
     H_R = Hq // Hk
-    # Expand K to match Q's head count for simple matmul.
-    K_expanded = K.repeat_interleave(H_R, dim=2)   # [B, S, Hq, D]
-    Qf = Q.to(torch.float32).permute(0, 2, 1, 3)    # [B, Hq, S, D]
-    Kf = K_expanded.to(torch.float32).permute(0, 2, 1, 3)  # [B, Hq, S, D]
-    scores = torch.matmul(Qf, Kf.transpose(-1, -2)) * scale   # [B, Hq, S, S]
-    # Causal mask
+    K_expanded = K.repeat_interleave(H_R, dim=1)                # [B, Hq, S, D]
+    Qf = Q.to(torch.float32)
+    Kf = K_expanded.to(torch.float32)
+    scores = torch.matmul(Qf, Kf.transpose(-1, -2)) * scale       # [B, Hq, S, S]
     mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=Q.device),
                       diagonal=1)
     scores.masked_fill_(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-    # LSE over last dim
-    lse = torch.logsumexp(scores, dim=-1)           # [B, Hq, S]
-    return lse
+    return torch.logsumexp(scores, dim=-1)
 
 
 def main():
@@ -73,10 +57,11 @@ def main():
     scale = 1.0 / math.sqrt(D)
 
     dev = "cuda"
-    Q  = (torch.randn(B, S, Hq, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
-    K  = (torch.randn(B, S, Hk, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
-    V  = (torch.randn(B, S, Hk, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
-    dO = (torch.randn(B, S, Hq, D, dtype=torch.float32, device=dev) * 0.1).to(torch.bfloat16)
+    # [B, H, S, D] torch sdpa layout — matches CUTLASS example 77.
+    Q  = (torch.randn(B, Hq, S, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
+    K  = (torch.randn(B, Hk, S, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
+    V  = (torch.randn(B, Hk, S, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
+    dO = (torch.randn(B, Hq, S, D, dtype=torch.float32, device=dev) * 0.1).to(torch.bfloat16)
 
     O_ref, dQ_ref, dK_ref, dV_ref = run_torch_sdpa(Q, K, V, dO, scale)
     LSE = compute_lse_reference(Q, K, scale)   # [B, Hq, S] fp32
