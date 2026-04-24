@@ -38,6 +38,7 @@ extern "C" cudaError_t cutlass_gemm_bf16_sm100_rowmajor(
 
 extern "C" cudaError_t cutlass_fmha_bwd_sm100(
     const __nv_bfloat16 *Q, const __nv_bfloat16 *K, const __nv_bfloat16 *V,
+    const __nv_bfloat16 *O,
     const __nv_bfloat16 *dO,
     const float *logsumexp,
     __nv_bfloat16 *dQ, __nv_bfloat16 *dK, __nv_bfloat16 *dV,
@@ -81,30 +82,29 @@ TORCH_LIBRARY(cutlass_train_C, ops) {
                         cudaGetErrorString(err));
         });
 
-    ops.def("fa_bwd(Tensor Q, Tensor K, Tensor V, Tensor dO, "
-            "Tensor? logsumexp, "
+    ops.def("fa_bwd(Tensor Q, Tensor K, Tensor V, Tensor O, Tensor dO, "
+            "Tensor logsumexp, "
             "Tensor(a!) dQ, Tensor(b!) dK, Tensor(c!) dV, "
             "float scale, bool causal) -> ()");
     ops.impl("fa_bwd", torch::kCUDA, +[](
-        torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor dO,
-        c10::optional<torch::Tensor> logsumexp,
+        torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+        torch::Tensor O, torch::Tensor dO, torch::Tensor logsumexp,
         torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV,
         double scale, bool causal) {
             TORCH_CHECK(Q.scalar_type() == torch::kBFloat16);
+            TORCH_CHECK(logsumexp.scalar_type() == torch::kFloat32);
             int B_ = (int)Q.size(0);
             int S = (int)Q.size(1);
             int Hq = (int)Q.size(2);
             int D = (int)Q.size(3);
             int Hk = (int)K.size(2);
-            const float *lse = logsumexp.has_value()
-                ? (const float*)logsumexp->data_ptr()
-                : nullptr;
             cudaError_t err = cutlass_fmha_bwd_sm100(
                 (const __nv_bfloat16*)Q.data_ptr(),
                 (const __nv_bfloat16*)K.data_ptr(),
                 (const __nv_bfloat16*)V.data_ptr(),
+                (const __nv_bfloat16*)O.data_ptr(),
                 (const __nv_bfloat16*)dO.data_ptr(),
-                lse,
+                (const float*)logsumexp.data_ptr(),
                 (__nv_bfloat16*)dQ.data_ptr(),
                 (__nv_bfloat16*)dK.data_ptr(),
                 (__nv_bfloat16*)dV.data_ptr(),

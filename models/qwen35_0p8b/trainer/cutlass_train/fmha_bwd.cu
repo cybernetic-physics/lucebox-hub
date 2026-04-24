@@ -1,96 +1,147 @@
 /**
- * CUTLASS sm_100 FMHA backward for Qwen3.5-0.8B full-attention layers.
+ * CUTLASS sm_100 FMHA backward for Qwen3.5-0.8B FA layers.
  *
- * Target kernel:
- *   cutlass::fmha::device::Sm100FmhaBwd<
- *       ProblemShape, Element, ElementAccumulator,
- *       TileShape, kIsMla, ActiveMask>
- *   from /root/cutlass/examples/77_blackwell_fmha/device/fmha_device_bwd.hpp
+ * Qwen3.5-0.8B FA shapes per layer:
+ *   Hq = 8, Hk = 2 (GQA 4:1), D = 256, D_VO = 256, bf16, causal.
  *
- * Needed instantiation (our Qwen3.5-0.8B FA layer):
- *   Element            = cutlass::bfloat16_t   (NOT fp16 — example uses half_t)
- *   ElementAccumulator = float
- *   ProblemShape       = cute::tuple<int, int, int, int,
- *                            cute::tuple<cute::tuple<int,int>, int>>
- *                        = (Q, K, D, D_VO, ((H_R, H_K), B))
- *                        = (S, S, 256, 256, ((4, 2), 1))
- *     where H_R = Hq/Hk = 4 (GQA ratio), H_K = Hk = 2, B = 1.
- *   TileShape          = Shape<_128, _128, _128>  (Blackwell recipe)
- *   kIsMla             = false
- *   ActiveMask         = cutlass::fmha::collective::CausalMask
+ * Wraps cutlass::fmha::device::Sm100FmhaBwd from examples/77_blackwell_fmha/
+ * with bf16 Element. Produces dQ, dK, dV for causal GQA attention.
  *
- * Strides (from example lines 419-423):
- *   StrideQ   = Stride<int, _1, Stride<Stride<int, int>, int>>  // Q D ((H_R,H_K),B)
- *   StrideK   = Stride<int, _1, Stride<Stride<_0, int>, int>>   // GQA: K head is shared
- *                                                                  across H_R Q heads, stride 0
- *   StrideV   = StrideK
- *   StrideO   = StrideQ
- *   StrideLSE = Stride<_1, Stride<Stride<int, int>, int>>       // Q ((H_R,H_K),B)
- *
- * Required inputs (arguments struct, from example lines 688-703):
- *   Q, K, V          — from our forward (saved / live in fa_k/v_cache)
- *   O                — forward output (our `dn_out_buf` after gate)
- *   LSE              — log-sum-exp from forward softmax, PER QUERY ROW.
- *                      Our current forward DOES NOT save LSE; we'd need
- *                      to either:
- *                        (a) save LSE as a new [1, Hq, S] fp32 slab
- *                            during prefill_bf16_with_lora, OR
- *                        (b) recompute LSE via a separate pass (costs
- *                            one softmax.fwd per FA layer, ~1ms at 32k).
- *   dO               — grad from upstream (o_proj bwd)
- *   dQ, dK, dV       — outputs
- *   softmax_scale    = 1 / sqrt(D)
- *   hw_info          — SM count / runtime hints
- *
- * Porting the example's half_t path to bf16:
- *   The Sm100FmhaBwd kernel should support bf16 via the standard CUTLASS
- *   Element<->tensor-core dispatch, but the example only instantiates
- *   fp16/fp8. Substitute Element = cutlass::bfloat16_t and the tcgen05
- *   MMA dispatch should pick up bf16 automatically. If the compile fails
- *   (template deduction), we have two fallbacks:
- *     1. Do attention at fp16: cast Q/K/V/dO from bf16 → fp16 at launch,
- *        run the stock fp16 kernel, cast dQ/dK/dV back. Small accuracy
- *        hit vs bf16 in practice.
- *     2. Instantiate a fresh specialization of
- *        collective/sm100_fmha_bwd_kernel_tma_warpspecialized.hpp
- *        templated on bf16. Comments in that file note bf16 should just
- *        work via the existing MMA atom table.
- *
- * Time estimate: 1–2 days of focused CUTLASS 3.x work.
- *
- * Current state: TODO, returns cudaErrorNotSupported. Download-side of
- * the API (torch binding) is wired in torch_bindings.cpp so upstream
- * code can dispatch around it while this lands.
+ * Required forward artifacts (caller must save during fwd):
+ *   O    : [B, S, Hq, D]   bf16    — attention output
+ *   LSE  : [B, Hq, S]      fp32    — per-row log-sum-exp of scores
+ *                                     after scaling but before softmax
  */
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// CUTLASS FMHA backward headers (from examples/77_blackwell_fmha).
-// NOTE: these paths are resolved via CMake include dirs.
-// #include <device/fmha_device_bwd.hpp>
-// #include <kernel/sm100_fmha_bwd_kernel_tma_warpspecialized.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/kernel_hardware_info.h>
+#include <cute/tensor.hpp>
+#include <cute/layout.hpp>
+
+// Order matters: fmha_fusion defines CausalMask / VariableLength that
+// the kernel header uses internally.
+#include "collective/fmha_fusion.hpp"
+#include "device/fmha_device_bwd.hpp"
+
+using namespace cute;
+
+using Element       = cutlass::bfloat16_t;
+using ElementAccum  = float;
+
+// ProblemShape = (Q, K, D, D_VO, ((H_R, H_K), B))
+using ProblemShape = cute::tuple<
+    int, int, int, int,
+    cute::tuple<cute::tuple<int, int>, int>>;
+
+using TileShape  = Shape<_128, _128, _128>;
+using ActiveMask = cutlass::fmha::collective::CausalMask<true>;
+
+using BwdOp = cutlass::fmha::device::Sm100FmhaBwd<
+    ProblemShape, Element, ElementAccum, TileShape,
+    /*IsMla=*/ false, ActiveMask>;
+
+
+// --- Stride builders (match kernel Argument types; see fmha_device_bwd.hpp
+//     lines 102-121). Q/dQ/O/dO and K/V/dK/dV have different shapes in
+//     the GQA dim ("H_R" stride = _0 for K/V since the same K/V head is
+//     shared across H_R query heads).
+
+static auto make_stride_qod(int S, int Hq, int Hk, int D, int B) {
+    int H_R = Hq / Hk;
+    int pos_stride = Hq * D;
+    int hr_stride  = D;
+    int hk_stride  = H_R * D;
+    int b_stride   = (B == 1) ? 0 : Hq * D * S;
+    return make_stride(pos_stride, _1{},
+                       make_stride(make_stride(hr_stride, hk_stride), b_stride));
+}
+
+static auto make_stride_kv(int S, int Hk, int D, int B) {
+    int pos_stride = Hk * D;
+    int hk_stride  = D;
+    int b_stride   = (B == 1) ? 0 : Hk * D * S;
+    return make_stride(pos_stride, _1{},
+                       make_stride(make_stride(_0{}, hk_stride), b_stride));
+}
+
+static auto make_stride_lse(int S, int Hq, int Hk, int B) {
+    int H_R = Hq / Hk;
+    int hr_stride = S;
+    int hk_stride = H_R * S;
+    int b_stride  = (B == 1) ? 0 : Hq * S;
+    return make_stride(_1{},
+                       make_stride(make_stride(hr_stride, hk_stride), b_stride));
+}
+
 
 extern "C" cudaError_t cutlass_fmha_bwd_sm100(
-    const __nv_bfloat16 *Q,        // [B, S, Hq, D]
-    const __nv_bfloat16 *K,        // [B, S, Hk, D]
-    const __nv_bfloat16 *V,        // [B, S, Hk, D]
-    const __nv_bfloat16 *dO,       // [B, S, Hq, D]
-    const float *logsumexp,        // [B, Hq, S] from forward (if available)
-    __nv_bfloat16 *dQ,             // [B, S, Hq, D]
-    __nv_bfloat16 *dK,             // [B, S, Hk, D]
-    __nv_bfloat16 *dV,             // [B, S, Hk, D]
+    const __nv_bfloat16 *Q,
+    const __nv_bfloat16 *K,
+    const __nv_bfloat16 *V,
+    const __nv_bfloat16 *O,            // forward output
+    const __nv_bfloat16 *dO,
+    const float *logsumexp,            // [B, Hq, S] from forward softmax
+    __nv_bfloat16 *dQ,
+    __nv_bfloat16 *dK,
+    __nv_bfloat16 *dV,
     int batch, int S, int Hq, int Hk, int D,
     float scale,
     bool causal,
     cudaStream_t stream)
 {
-    // TODO: instantiate the sm100 FMHA bwd kernel with our shapes.
-    // See examples/77_blackwell_fmha/77_blackwell_fmha_bwd.cu for the
-    // template specialization pattern.
-    (void)Q; (void)K; (void)V; (void)dO; (void)logsumexp;
-    (void)dQ; (void)dK; (void)dV;
-    (void)batch; (void)S; (void)Hq; (void)Hk; (void)D;
-    (void)scale; (void)causal; (void)stream;
-    return cudaErrorNotSupported;
+    if (!causal)           return cudaErrorNotSupported;
+    if (Hq % Hk != 0)      return cudaErrorInvalidValue;
+    if (D != 128 && D != 256) return cudaErrorInvalidValue;
+
+    int H_R = Hq / Hk;
+
+    ProblemShape ps = make_tuple(
+        S,                   // Q
+        S,                   // K
+        D,                   // D
+        D,                   // D_VO (== D for us)
+        make_tuple(make_tuple(H_R, Hk), batch));
+
+    typename BwdOp::Arguments args{
+        ps,
+        reinterpret_cast<const Element*>(Q),  make_stride_qod(S, Hq, Hk, D, batch),
+        reinterpret_cast<const Element*>(K),  make_stride_kv (S, Hk,    D, batch),
+        reinterpret_cast<const Element*>(V),  make_stride_kv (S, Hk,    D, batch),
+        reinterpret_cast<const Element*>(O),  make_stride_qod(S, Hq, Hk, D, batch),
+        logsumexp,                            make_stride_lse(S, Hq, Hk,  batch),
+        reinterpret_cast<const Element*>(dO), make_stride_qod(S, Hq, Hk, D, batch),
+        reinterpret_cast<Element*>(dQ),       make_stride_qod(S, Hq, Hk, D, batch),
+        reinterpret_cast<Element*>(dK),       make_stride_kv (S, Hk,    D, batch),
+        reinterpret_cast<Element*>(dV),       make_stride_kv (S, Hk,    D, batch),
+        scale,
+        cutlass::KernelHardwareInfo{}
+    };
+
+    BwdOp op;
+    if (op.can_implement(args) != cutlass::Status::kSuccess) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    size_t ws_bytes = BwdOp::get_workspace_size(args);
+    static void *ws_ptr = nullptr;
+    static size_t ws_cap = 0;
+    if (ws_bytes > ws_cap) {
+        if (ws_ptr) cudaFree(ws_ptr);
+        if (cudaMalloc(&ws_ptr, ws_bytes) != cudaSuccess) {
+            return cudaErrorMemoryAllocation;
+        }
+        ws_cap = ws_bytes;
+    }
+
+    if (op.initialize(args, ws_ptr, stream) != cutlass::Status::kSuccess) {
+        return cudaErrorInvalidValue;
+    }
+    if (op.run(stream) != cutlass::Status::kSuccess) {
+        return cudaErrorLaunchFailure;
+    }
+    return cudaSuccess;
 }
