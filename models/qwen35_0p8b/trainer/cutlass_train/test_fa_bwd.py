@@ -17,32 +17,40 @@ import cutlass_train_C  # noqa: F401
 
 
 def run_torch_sdpa(Q, K, V, dO, scale):
-    """Forward + autograd backward via cuDNN FA-2. All inputs are
-    [B, H, S, D] already (torch sdpa native layout; also what CUTLASS
-    example 77 expects)."""
-    Qt = Q.detach().requires_grad_(True)
-    Kt = K.detach().requires_grad_(True)
-    Vt = V.detach().requires_grad_(True)
-    Op = F.scaled_dot_product_attention(
-        Qt, Kt, Vt, is_causal=True, enable_gqa=True, scale=scale)
-    Op.backward(dO)
-    O = Op.detach()
-    return O, Qt.grad, Kt.grad, Vt.grad
-
-
-def compute_lse_reference(Q, K, scale):
-    """[B, Hq, S] LSE of scaled causal scores. Inputs [B, H, S, D]."""
+    """Reference bwd via explicit K/V expansion + sum-reduce across the
+    H_R group — sidesteps any GQA grad-path subtlety in torch. Inputs
+    are [B, H, S, D]; dK/dV returned are [B, Hk, S, D] matching the
+    CUTLASS kernel's expectation."""
     B, Hq, S, D = Q.shape
     Hk = K.shape[1]
     H_R = Hq // Hk
-    K_expanded = K.repeat_interleave(H_R, dim=1)                # [B, Hq, S, D]
-    Qf = Q.to(torch.float32)
-    Kf = K_expanded.to(torch.float32)
-    scores = torch.matmul(Qf, Kf.transpose(-1, -2)) * scale       # [B, Hq, S, S]
-    mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=Q.device),
-                      diagonal=1)
-    scores.masked_fill_(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-    return torch.logsumexp(scores, dim=-1)
+    Qt = Q.detach().requires_grad_(True)
+    # Expand K/V to per-Q-head copies ourselves so we control the grad
+    # accumulation.
+    Ke = K.detach().repeat_interleave(H_R, dim=1).requires_grad_(True)
+    Ve = V.detach().repeat_interleave(H_R, dim=1).requires_grad_(True)
+    Op = F.scaled_dot_product_attention(
+        Qt, Ke, Ve, is_causal=True, scale=scale)
+    Op.backward(dO)
+    # Sum per-Q-head grads back into per-Hk-head grads.
+    dKe = Ke.grad.view(B, Hk, H_R, S, D).sum(dim=2)
+    dVe = Ve.grad.view(B, Hk, H_R, S, D).sum(dim=2)
+    return Op.detach(), Qt.grad, dKe, dVe
+
+
+def flash_fwd_with_lse(Q, K, V, scale):
+    """Forward via torch's flash-attn low-level op that exposes LSE.
+    Returns (O, LSE_fp32) both bit-exact from the fused kernel — no
+    math fallback, no GQA broadcast emulation."""
+    B, Hq, S, D = Q.shape
+    Hk = K.shape[1]
+    Ke = K.repeat_interleave(Hq // Hk, dim=1) if Hq != Hk else K
+    Ve = V.repeat_interleave(Hq // Hk, dim=1) if Hq != Hk else V
+    r = torch.ops.aten._scaled_dot_product_flash_attention(
+        Q, Ke, Ve, 0.0, True, False, scale=scale)  # dropout, is_causal, return_debug_mask
+    O   = r[0]                              # [B, Hq, S, D] bf16
+    LSE = r[1]                              # [B, Hq, S]    fp32
+    return O, LSE
 
 
 def main():
@@ -63,8 +71,11 @@ def main():
     V  = (torch.randn(B, Hk, S, D, dtype=torch.float32, device=dev) * 0.5).to(torch.bfloat16)
     dO = (torch.randn(B, Hq, S, D, dtype=torch.float32, device=dev) * 0.1).to(torch.bfloat16)
 
-    O_ref, dQ_ref, dK_ref, dV_ref = run_torch_sdpa(Q, K, V, dO, scale)
-    LSE = compute_lse_reference(Q, K, scale)   # [B, Hq, S] fp32
+    # Reference backward (for comparing dQ/dK/dV) via autograd.
+    _, dQ_ref, dK_ref, dV_ref = run_torch_sdpa(Q, K, V, dO, scale)
+    # O and LSE fed INTO cutlass bwd come from the same flash kernel so
+    # they're numerically self-consistent (not a math fallback).
+    O_ref, LSE = flash_fwd_with_lse(Q, K, V, scale)
 
     dQ = torch.zeros_like(Q)
     dK = torch.zeros_like(K)

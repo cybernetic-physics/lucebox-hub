@@ -111,6 +111,11 @@ extern "C" cudaError_t cutlass_fmha_bwd_sm100(
         D,                   // D_VO (== D for us)
         make_tuple(make_tuple(H_R, Hk), batch));
 
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;   // relies on CUDA_VISIBLE_DEVICES for selection
+    hw_info.sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
     typename BwdOp::Arguments args{
         ps,
         reinterpret_cast<const Element*>(Q),  make_stride_qod(S, Hq, Hk, D, batch),
@@ -123,7 +128,7 @@ extern "C" cudaError_t cutlass_fmha_bwd_sm100(
         reinterpret_cast<Element*>(dK),       make_stride_kv (S, Hk,    D, batch),
         reinterpret_cast<Element*>(dV),       make_stride_kv (S, Hk,    D, batch),
         scale,
-        cutlass::KernelHardwareInfo{}
+        hw_info
     };
 
     BwdOp op;
