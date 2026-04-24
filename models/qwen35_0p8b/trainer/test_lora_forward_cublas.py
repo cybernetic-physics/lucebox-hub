@@ -46,7 +46,7 @@ def run_cublas_lora(weights, tokens, lora_tensors, lora_rank, lora_scaling):
 
     layers_packed = _pack_pf_layer_weights(weights["layer_data"])
 
-    fa_k_cache = torch.zeros(N_FA, FA_KV_HEADS, 2048, FA_HEAD_DIM, **bf16)
+    fa_k_cache = torch.zeros(N_FA, FA_KV_HEADS, 32768, FA_HEAD_DIM, **bf16)
     fa_v_cache = torch.zeros_like(fa_k_cache)
     dn_states = torch.zeros(N_DN, DN_HEADS, DN_KEY, DN_VAL, **f32)
     conv_bufs = torch.zeros(N_DN, DN_CONV_CH, DN_CONV_K, **f32)
