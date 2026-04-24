@@ -188,37 +188,69 @@ null-check per projection per layer — within noise.
 
 The `tcgen05_gemm/` sandbox is retired at `experiments/tcgen05_gemm/`.
 
-### Phase 4 — rl/backend integration (1-2 days)
+### Phase 4 — rl/backend integration ✅ **done** (2026-04-24)
 
-Concrete file layout (to add, keyed to the protocol impl in
-`~/rl/backend/src/tinker_backend/runtimes/lora_trainer.py`):
+`LoraMegakernelTrainer` in `models/qwen35_0p8b/trainer/rl_trainer.py`.
+Satisfies `Sampler + Trainer + CheckpointStore` protocols from
+`~/rl/backend/src/tinker_backend/runtimes/base.py`:
 
 ```
-models/qwen35_0p8b/trainer/
-  rl_trainer.py      ← LoraMegakernelTrainer(Sampler, Trainer, CheckpointStore)
-    class _Session:      # per-model_id state, analogous to _TrainingSession
-      - weights:          dict[str, Tensor]           (Qwen weights, bf16, cuda)
-      - lora_a, lora_b:   dict[str, Tensor]           (26 projections × 2 adapters)
-      - adamw_m, adamw_v: flat fp32 buffers           (one pair per adapter)
-      - step: int
-    def sample(...):     # prefill via prefill_bf16_with_lora, then Decoder.step loop
-    def forward(...):    # prefill_bf16_train_step with saves off; gather logprobs
-    def forward_backward(...): # train_step with saves ON, call _backward helper
-    def optim_step(...): # launch_fused_adamw over the flat A/B buffers
-    def save_checkpoint(...): # PEFT adapter dir
-    def load_weights(...):    # load PEFT adapter dir
+register_model(model_id, rank, train_mlp, train_attn, ...)
+  -> builds a PEFT-wrapped copy of HF Qwen3.5-0.8B per model_id,
+     creates a torch.optim.AdamW over the LoRA params
+
+forward(model_id, data, "cross_entropy") -> logprobs + loss
+forward_backward(model_id, data, "cross_entropy") -> same + bwd
+optim_step(model_id, adam_params) -> applies step, bumps session.step
+
+sample(prompt_tokens, max_tokens, ...)
+  -> uses our cuBLAS+graph prefill + cooperative decode kernel
+     (megakernel Decoder) — 11x faster than HF PyTorch on gen=64
+
+save_checkpoint(model_id, ...)
+  -> PEFT adapter_model.safetensors + adapter_config.json +
+     manifest.json; drop-in loadable by SGLang --load-lora-adapter
+     and HF PEFT
+
+load_weights(model_id, artifact_path) -> rehydrates LoRA params via
+     peft.set_peft_model_state_dict; optimizer state optional
 ```
 
-- Checkpoint format: PEFT-compatible adapter dir
-  (`adapter_config.json` + `adapter_model.safetensors`) per the
-  existing `LORA_TRAINING_DECISION.md` — so checkpoints load into
-  SGLang and HF-PEFT unchanged.
-- Optimizer state persist: safetensors of the flat m/v buffers.
-- Register in rl/backend's runtime registry; existing
-  `LoRATrainer` stays as the CPU-torch fallback for tests.
-- Reuse `model.load_weights` from `models/qwen35_0p8b/model.py` for
-  the frozen base; adapters live in separate contiguous per-projection
-  bf16 buffers so AdamW is one fused kernel over the flat range.
+End-to-end test (`trainer/test_rl_trainer_e2e.py`) exercises the full
+lifecycle:
+1. register_model(rank=8, all attn+mlp)
+2. 5 training steps on a 4-prompt batch: loss 1.19 → 0.0014
+3. sample 30 tokens via megakernel: coherent continuation
+4. save_checkpoint + load_weights: max |logp_before - logp_after|
+   = 0.00e+00 (bit-exact roundtrip)
+5. unload_model + forward() rejected
+
+Today's backend is HF+PEFT + torch.optim.AdamW for the training
+path (forward+bwd+step), our kernel for sampling. The Trainer API
+lets us swap in custom FA/DN backward and fused AdamW later without
+changing the public surface.
+
+### Phase 5 — end-to-end bench + 3× claim (in progress)
+
+`bench_trainer_vs_sglang_torch.py` measures three stages vs a
+HF/torch reference RL loop (stand-in for SGLang + torch-PEFT):
+
+| stage                                    | incumbent | ours    | speedup |
+|:-----------------------------------------|:---------:|:-------:|:-------:|
+| (A) sample 64 tokens (greedy)            | 2275 ms   |  206 ms | **11.0×** |
+| (B) training step (batch=4, seq=128)     | 2324 ms   | 2324 ms |   1.0×    |
+| (C) combined RL step = sample + train    | 4599 ms   | 2530 ms | **1.82×** |
+
+Today's 1.82× is sampling-only — training uses the HF backward
+path. The 3× target is gated on Phase 2 custom backward kernels
+(FA bwd + DeltaNet BPTT), which would drop (B) from ~2300 ms to
+~200 ms and pull (C) to ~400 ms → ~11× over the incumbent
+end-to-end. At that point fused AdamW (124× vs torch.optim.AdamW)
+also plugs in on the grad flat buffer.
+
+Real SGLang is typically 2-3× faster than plain HF for sampling, so
+the measured sampling speedup vs SGLang would scale to ~4-5×. The
+end-to-end 3× target should hold against SGLang once Phase 2 lands.
 
 ### Phase 5 — bench + publish (1 day)
 
