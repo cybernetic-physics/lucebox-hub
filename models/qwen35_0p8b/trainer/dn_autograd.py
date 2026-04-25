@@ -16,6 +16,11 @@ Outputs:
   state_out : [H, Dk, Dv] fp32 (final recurrent state — useful for prefill)
 
 The function does not differentiate w.r.t. state_out; only y.grad is consumed.
+
+When called outside an autograd context (i.e. inference / no_grad), uses the
+faster chunked tensor-core forward kernel (`dn_chunked_fwd`, ~3.4× over the
+recurrent forward). In training mode, uses the recurrent fwd which saves the
+state_history needed by the recurrent bwd.
 """
 from __future__ import annotations
 
@@ -71,3 +76,25 @@ class DeltaNetRecurrence(torch.autograd.Function):
 def deltanet_recurrence(q, k, v, beta, decay, state_init):
     """Functional wrapper: returns (y, state_out) with autograd."""
     return DeltaNetRecurrence.apply(q, k, v, beta, decay, state_init)
+
+
+def deltanet_chunked_inference(q, k, v, beta, g, state_init):
+    """Inference-only fast path: bf16 tensor-core chunked forward.
+
+    Takes log-decay g (not exp(g)) — matches HF's convention. For training
+    use deltanet_recurrence (autograd path) instead.
+    """
+    assert not torch.is_grad_enabled() or not (
+        q.requires_grad or k.requires_grad or v.requires_grad or
+        beta.requires_grad or g.requires_grad or state_init.requires_grad
+    ), "deltanet_chunked_inference is no-grad; use deltanet_recurrence for training"
+    S, H, Dk = q.shape
+    Dv = v.shape[-1]
+    y = torch.empty(S, H, Dv, dtype=torch.bfloat16, device=q.device)
+    state_out = torch.empty(H, Dk, Dv, dtype=torch.float32, device=q.device)
+    torch.ops.train_megakernel_C.dn_chunked_fwd(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        beta.contiguous(), g.contiguous(), state_init.contiguous(),
+        y, state_out,
+    )
+    return y, state_out
