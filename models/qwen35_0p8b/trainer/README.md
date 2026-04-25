@@ -106,12 +106,29 @@ wrapper) + `dn_hf_patch.py` (drops into HF Qwen3-Next/Qwen3.5 layers).
   (consistent with bf16 noise across recurrent vs chunked accumulation
   orders — training converges).
 
+### Tensor-core chunked forward (shipped)
+
+`dn_chunked.cu` is a fused tensor-core forward kernel implementing the
+chunked-delta-rule algorithm (matches HF's `torch_chunk_gated_delta_rule`
+output within bf16 noise, cos > 0.99996 across S=64..1024). All matmuls
+go through `nvcuda::wmma` m16n16k16 with bf16 inputs + fp32 accumulator,
+one fused kernel per head — ~225 KB shared mem, fits B200's 228 KB
+per-block limit.
+
+Speed @ S=512 (one DN layer, forward only):
+  | path | ms | x vs recurrent |
+  |---|---|---|
+  | scalar recurrent | 3.36 | 1.0 |
+  | chunked tensor-core | **0.999** | **3.37×** |
+
+For 18-layer Qwen3.5-0.8B forward at S=512: ~18 ms via chunked vs ~60 ms
+recurrent — about 30× HF's torch_chunk fallback (~684 ms for 18 layers).
+
 ### What's still pending
 
-- Tensor-core / chunked DN port — the scalar fp32 kernel is near its
-  ceiling at ~16 ms (S=512). HF's chunk path uses cuBLAS tensor cores
-  via fp32 `@`. A true CUTLASS / WMMA chunked port targets ~5 ms/layer
-  and decisively wins long-S training.
+- Tensor-core chunked backward — the forward shipped; a chunked bwd
+  with shared-mem fp32 accumulators (mirroring the forward's matmul
+  structure) is the path to ~2 ms/layer bwd at S=512.
 - Flash-attn long-context (S≥8k): cuDNN FA-2 is fast at small S; for
   long context our own kernel could drop further.
 
