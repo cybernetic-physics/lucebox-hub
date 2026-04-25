@@ -10,7 +10,7 @@ setup(
     name="train_megakernel",
     ext_modules=[CUDAExtension(
         name="train_megakernel_C",
-        sources=["torch_bindings.cpp", "kernel.cu", "dn_bwd.cu"],
+        sources=["torch_bindings.cpp", "kernel.cu", "dn_bwd.cu", "dn_chunked.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", f"-arch={arch}", "--use_fast_math", "-std=c++17",

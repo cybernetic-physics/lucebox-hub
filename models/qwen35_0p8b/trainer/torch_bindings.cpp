@@ -169,6 +169,12 @@ extern "C" cudaError_t launch_dn_bwd(
     float *dbeta, float *ddecay, float *dstate_init,
     int S, int H, cudaStream_t stream);
 
+extern "C" cudaError_t launch_dn_chunked_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g, const float *state_in,
+    __nv_bfloat16 *y, float *state_out,
+    int S, int H, cudaStream_t stream);
+
 void fused_adamw_step(
     torch::Tensor params,
     torch::Tensor m, torch::Tensor v,
@@ -322,6 +328,29 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
                 dstate_init.numel() > 0 ? (float *)dstate_init.data_ptr() : nullptr,
                 S, H, c10::cuda::getCurrentCUDAStream().stream());
             TORCH_CHECK(err == cudaSuccess, "dn_bwd: ",
+                        cudaGetErrorString(err));
+        });
+
+    ops.def("dn_chunked_fwd(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor g, "
+            "Tensor state_in, Tensor(a!) y, Tensor(b!) state_out) -> ()");
+    ops.impl("dn_chunked_fwd", torch::kCUDA, +[](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor beta, torch::Tensor g,
+        torch::Tensor state_in,
+        torch::Tensor y, torch::Tensor state_out) {
+            int S = (int)q.size(0);
+            int H = (int)q.size(1);
+            cudaError_t err = launch_dn_chunked_fwd(
+                (const __nv_bfloat16 *)q.data_ptr(),
+                (const __nv_bfloat16 *)k.data_ptr(),
+                (const __nv_bfloat16 *)v.data_ptr(),
+                (const float *)beta.data_ptr(),
+                (const float *)g.data_ptr(),
+                (const float *)state_in.data_ptr(),
+                (__nv_bfloat16 *)y.data_ptr(),
+                state_out.numel() > 0 ? (float *)state_out.data_ptr() : nullptr,
+                S, H, c10::cuda::getCurrentCUDAStream().stream());
+            TORCH_CHECK(err == cudaSuccess, "dn_chunked_fwd: ",
                         cudaGetErrorString(err));
         });
 
