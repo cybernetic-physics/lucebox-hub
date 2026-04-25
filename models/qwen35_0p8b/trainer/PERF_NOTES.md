@@ -2,14 +2,27 @@
 
 Snapshot of where we are and what each optimization buys, by shape regime.
 
+> **Honest baseline note**: every speedup vs "HF" anywhere in this repo
+> has two flavors. The HF *fp32 torch fallback* (which we hit when
+> fla isn't installed) is much slower than HF + fla (production). Numbers
+> below distinguish the two.
+
 ## Where the time goes today
 
-Two reference points from the existing kernels:
+Three reference points (all per-layer, isolated kernel calls):
 
 | kernel | S=128 | S=512 | S=2048 | scaling |
 |---|---|---|---|---|
-| recurrent bwd (scalar fp32) | 3.1 ms | 12.7 ms | 51 ms | linear in S |
-| chunked fwd (bf16 WMMA) | 0.27 ms | 1.0 ms | ~4 ms | linear in S |
+| recurrent bwd (ours, scalar fp32) | 3.1 ms | 12.7 ms | 51 ms | linear in S |
+| chunked fwd (ours, bf16 WMMA) | 0.27 ms | 1.0 ms | 3.6 ms | linear in S |
+| **fla chunk fwd (Triton, production)** | **0.48 ms** | **0.45 ms** | **0.47 ms** | **~constant in S** |
+
+The architectural reason fla wins at long S: it parallelizes *chunks*
+across SMs (one block per chunk per head). For S=2048 with H=16, that's
+S/64 × H = 32 × 16 = 512 logical work units, so they saturate SMs even
+at this S. Our kernel parallelizes *heads* (one block per head, all
+chunks done sequentially in that block) → 16 SMs busy, the rest idle,
+and the per-chunk cost stacks linearly in S.
 
 Per-step in the recurrent kernel is **31.5 µs constant** at H=16 — and stays
 ~31 µs at H=132 (full SM occupancy). So we're **latency-bound, not
@@ -128,27 +141,39 @@ ops/thread = nanoseconds of actual math) but is gated on:
 
 ### Remaining (in shipping order, with realistic effort)
 
-1. **CUDA chunked bwd** (A) — port the validated Python analytical bwd.
-   Real effort: **~3–5 focused days**. The challenge is buffer scheduling
-   under 228 KB shared mem with ~16 working tensors. The math is fully
-   worked out in `dn_chunked_bwd_proto.py` (cos > 0.99998 vs torch
-   autograd). Target: ~2 ms/layer at S=512 vs current 12.7 ms.
-   Closes the long-S training regression from 1.06× to ~3× e2e.
+The honest picture has changed since fla got installed properly. Beating
+fla requires matching its chunk-parallelism architecture, not just
+porting our existing per-head kernel to tensor cores.
 
-2. **C=128 chunk variant** (C) — needs HBM spilling for the [C,C] and
-   [C,Dk] buffers (which double in bytes). Real effort: **~2 days** to
-   write a separate `dn_chunked_fwd_C128_kernel` with HBM scratch for
-   spilled buffers. Worth ~1.5× at S ≥ 2K.
+1. **Chunk-parallelism rewrite** (NEW, was D) — process chunks across
+   SMs in parallel with a persistent kernel + per-chunk producer/consumer
+   sync. This is the single biggest architectural change required to
+   match fla's long-S performance. Real effort: **~1–2 weeks**. Without
+   this, the rest is rearranging deck chairs at long S.
 
-3. **Cooperative-grid multi-block-per-head** (D, full) — splits
-   post-T-construction matmul work across multiple blocks per head with
-   inter-block sync via `cooperative_groups`. Real effort: **~3 days**.
-   Worth ~1.5–2× at long S. Skipped if (1) and (2) hit the long-S target.
+2. **CUDA chunked bwd** (was A) — port the validated Python analytical
+   bwd. Real effort: **~3–5 focused days**. Algorithm is in
+   `dn_chunked_bwd_proto.py` (cos > 0.99998). Useful even with the
+   per-head architecture for short-S use cases. Long-S only matters
+   if combined with (1).
 
-4. **tcgen05 port** (B) — Blackwell-native MMA. Real effort: **~2–3 weeks**
-   for a full PTX-level rewrite of the WMMA helpers + accumulator model.
-   Doubles peak FLOPs across all kernels. Deferred until the algorithmic
-   wins above are exhausted.
+3. **C=128 chunk variant** (was C) — needs HBM spilling. **~2 days**.
+   Marginal vs (1).
 
-The most important next step is (1). Once it lands, the long-S e2e
-training regression (currently 1.06× at S=2048) should close to 3×+.
+4. **tcgen05 port** (was B) — Blackwell-native MMA. **~2–3 weeks**.
+   2× peak throughput across kernels. Most useful AFTER (1) since
+   tcgen05 helps per-block compute density which matters more once
+   blocks aren't already idle.
+
+### When does our kernel actually beat fla?
+
+| regime | who wins | why |
+|---|---|---|
+| S ≤ 128, training | **us, ~1.16×** | launch overhead; fla has fixed per-call constants |
+| S ≤ 512, inference | **us, ~1.27×** | same, plus our chunked fwd is tighter at small S |
+| S ≥ 256, training | fla, 1.4–10× | fla has chunked Triton bwd; ours is scalar recurrent |
+| S ≥ 1024, inference | fla, 1.0–1.85× | fla parallelizes chunks across SMs |
+
+So the "we are faster than PyTorch" claim is honest only in the short-S
+regime today. For genuinely long-context training, **fla is better, full
+stop, until we ship the chunk-parallelism rewrite**.

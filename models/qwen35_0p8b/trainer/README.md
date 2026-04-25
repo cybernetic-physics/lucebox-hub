@@ -93,18 +93,31 @@ wrapper) + `dn_hf_patch.py` (drops into HF Qwen3-Next/Qwen3.5 layers).
   ~1 MB × S; at S=32K that's 32 GB per layer (fits B200's 192 GB but
   bounds full 18-layer training to S≈4K without chunking).
 
-  vs HF's `torch_chunk_gated_delta_rule` (the actual training-path
-  reference on this box, fla unavailable): **7.4× at S=128, 2.3× at S=512**.
+  vs HF's `torch_chunk_gated_delta_rule` (the fp32 Python fallback used
+  when fla isn't available): 7.4× at S=128, 2.3× at S=512.
 
-  End-to-end HF Qwen3.5-0.8B + LoRA fwd+bwd training step (`bench_hf_dn_patch.py`):
-  | S | baseline ms | patched ms | speedup |
-  |---|---|---|---|
-  | 128 | 542 | 92 | **5.92×** |
-  | 512 | 686 | 282 | **2.43×** |
+  **Honest comparison vs production HF + fla** (`bench_vs_fla.py`):
 
-  Loss parity: 18-layer-compounded logit cos = 0.96, |Δloss| ≈ 7.4e-2
-  (consistent with bf16 noise across recurrent vs chunked accumulation
-  orders — training converges).
+  | mode  | S    | HF + fla   | ours       | ratio       |
+  |-------|------|------------|------------|-------------|
+  | train | 128  | 104 ms     | 89 ms      | **1.16× ours** |
+  | infer | 128  | 45 ms      | 35 ms      | **1.28× ours** |
+  | train | 256  | 104 ms     | 144 ms     | 0.72× fla   |
+  | infer | 256  | 44 ms      | 35 ms      | **1.25× ours** |
+  | train | 512  | 105 ms     | 269 ms     | 0.39× fla   |
+  | infer | 512  | 45 ms      | 36 ms      | **1.27× ours** |
+  | train | 1024 | 106 ms     | 520 ms     | 0.20× fla   |
+  | infer | 1024 | 45 ms      | 46 ms      | tied        |
+  | train | 2048 | 106 ms     | 1025 ms    | 0.10× fla   |
+  | infer | 2048 | 46 ms      | 85 ms      | 0.54× fla   |
+
+  We beat fla only at short S (S ≤ 128 train, S ≤ 512 infer). At long S
+  fla wins decisively because its Triton chunk kernel parallelizes chunks
+  across SMs (per-call cost is roughly *constant* in S), while ours
+  processes chunks sequentially per head and is *linear* in S.
+
+  Loss parity: 18-layer-compounded logit cos = 0.96 vs HF, |Δloss| ≈ 7.4e-2
+  (bf16 noise across recurrent vs chunked accumulation orders).
 
 ### Tensor-core chunked forward (shipped)
 
