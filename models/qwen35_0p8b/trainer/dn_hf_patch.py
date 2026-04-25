@@ -79,7 +79,8 @@ def patch_hf_qwen3_deltanet(model) -> int:
     Returns the number of layers patched."""
     n = 0
     for module in model.modules():
-        if module.__class__.__name__ == "Qwen3NextGatedDeltaNet":
+        cn = module.__class__.__name__
+        if cn in ("Qwen3NextGatedDeltaNet", "Qwen3_5GatedDeltaNet"):
             module.chunk_gated_delta_rule = cuda_chunk_gated_delta_rule
             n += 1
     return n
