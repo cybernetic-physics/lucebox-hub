@@ -210,8 +210,8 @@ __global__ void dn_chunked_fwd_kernel(
     float *state         = (float*)smem_raw;                    // [Dk, Dv]      fp32
     float *buf_attn      = state    + Dk * Dv;                  // [C, C]        fp32
     float *buf_decay     = buf_attn + C * C;                    // [C, C]        fp32
-    float *warp_scratch  = buf_decay + C * C;                   // [n_warps * 256] fp32 (8 KB at 8 warps)
-    float *s_g_cs        = warp_scratch + 8 * 256;              // [C]
+    float *warp_scratch  = buf_decay + C * C;                   // [n_warps * 256] fp32 (16 KB at 16 warps)
+    float *s_g_cs        = warp_scratch + 16 * 256;             // [C]
     float *s_exp_cs      = s_g_cs   + C;                        // [C]
     float *s_beta        = s_exp_cs + C;                        // [C]
     __nv_bfloat16 *bf16_base = (__nv_bfloat16*)(s_beta + C);
@@ -531,10 +531,10 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     //   state(Dk*Dv) + buf_attn(C*C) + buf_decay(C*C) + warp_scratch(8*256) + 3*C(fp32)
     //   + state_bf(Dk*Dv/2) + 4*(C*Dk) bf16 + (C*Dv) bf16 + (C*C) bf16
     //   buf_q,buf_k,buf_kbeta,buf_kcd are 4 of the C*Dk bf16 buffers; buf_vbeta is C*Dv.
-    size_t smem_fp32 = ((size_t)Dk * Dv + 2 * (size_t)C * C + 8 * 256 + 3 * C) * sizeof(float);
+    size_t smem_fp32 = ((size_t)Dk * Dv + 2 * (size_t)C * C + 16 * 256 + 3 * C) * sizeof(float);
     size_t smem_bf16 = ((size_t)Dk * (Dv/2) + 4 * (size_t)C * Dk + (size_t)C * Dv + (size_t)C * C) * sizeof(__nv_bfloat16);
     size_t smem = smem_fp32 + smem_bf16;
-    int threads = 256;
+    int threads = 512;
     cudaFuncSetAttribute(dn_chunked_fwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem);
