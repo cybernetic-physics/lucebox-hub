@@ -119,15 +119,36 @@ ops/thread = nanoseconds of actual math) but is gated on:
 
 ## What I'd ship next, in order
 
-1. **CUDA chunked bwd** (A) — port the validated Python analytical bwd.
-   Drops S=512 training from 277 ms → ~80 ms. Closes the long-S regression.
-2. **CUDA Graphs** wrap (F) — 30 lines, a few % at short S, free win.
-3. **Larger chunk size C=128** for long S (C) — variant kernel selected
-   by S; trades shared mem for fewer inner-loop iterations.
-4. **Multi-block-per-head** (D) — splits the post-T-construction matmul
-   work across SMs. Best at long S.
-5. **tcgen05 port** (B) — if/when there's a reason to push past 80 ms
-   training step. Big project (PTX + new accumulator model).
+### Already shipped (this PR series)
+- **CUDA Graphs wrap** (F) — `cuda_graph_train.GraphedTrainStep`.
+  Validated speedup: 1.16× at S=128, 1.07× at S=256, 1.03× at S=512.
+- **16-warp chunked fwd** (partial D) — bumped block size from 256 to
+  512 threads. Validated speedup over 8-warp: 1.10–1.19× across S.
+  Combined with the chunked fwd → 3.11–3.69× over recurrent.
 
-Steps 1–4 can land in the next ~1–2 weeks of focused work. Step 5 is a
-multi-week effort that doubles peak throughput across the board.
+### Remaining (in shipping order, with realistic effort)
+
+1. **CUDA chunked bwd** (A) — port the validated Python analytical bwd.
+   Real effort: **~3–5 focused days**. The challenge is buffer scheduling
+   under 228 KB shared mem with ~16 working tensors. The math is fully
+   worked out in `dn_chunked_bwd_proto.py` (cos > 0.99998 vs torch
+   autograd). Target: ~2 ms/layer at S=512 vs current 12.7 ms.
+   Closes the long-S training regression from 1.06× to ~3× e2e.
+
+2. **C=128 chunk variant** (C) — needs HBM spilling for the [C,C] and
+   [C,Dk] buffers (which double in bytes). Real effort: **~2 days** to
+   write a separate `dn_chunked_fwd_C128_kernel` with HBM scratch for
+   spilled buffers. Worth ~1.5× at S ≥ 2K.
+
+3. **Cooperative-grid multi-block-per-head** (D, full) — splits
+   post-T-construction matmul work across multiple blocks per head with
+   inter-block sync via `cooperative_groups`. Real effort: **~3 days**.
+   Worth ~1.5–2× at long S. Skipped if (1) and (2) hit the long-S target.
+
+4. **tcgen05 port** (B) — Blackwell-native MMA. Real effort: **~2–3 weeks**
+   for a full PTX-level rewrite of the WMMA helpers + accumulator model.
+   Doubles peak FLOPs across all kernels. Deferred until the algorithmic
+   wins above are exhausted.
+
+The most important next step is (1). Once it lands, the long-S e2e
+training regression (currently 1.06× at S=2048) should close to 3×+.
