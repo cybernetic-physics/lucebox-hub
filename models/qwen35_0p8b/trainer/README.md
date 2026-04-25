@@ -69,10 +69,29 @@ wrapper) + `dn_hf_patch.py` (drops into HF Qwen3-Next/Qwen3.5 layers).
   - Grid is `(H,)` — one block per head, 256 threads each cooperating on
     the [Dk=128, Dv=128] state matrix in shared memory.
 
-  Bit-exact (cos=1.0 every gradient) at S=32..512.
+  Bit-exact (cos=1.0 every gradient) at S=32..1024 (`test_dn_bwd_shapes.py`).
+  Finite (no NaN/Inf) at S=2048, 4096, 8192, 16384, 32768.
 
   Speed @ S=512, one DN layer fwd+bwd: **15.9 ms**
    (was 261.6 ms with per-head host loop — 16.4× from grid=(H,) parallelism).
+
+  Sweep on B200 (one DN layer fwd+bwd, scalar fp32):
+  ```
+  S      fwd ms    bwd ms    fwd+bwd ms   state_history
+  32     0.20      0.61      0.81         0.03 GB
+  128    0.83      3.11      3.94         0.13 GB
+  512    3.34      12.66     16.00        0.50 GB
+  1024   6.67      25.44     32.11        1.00 GB
+  2048   13.34     51.01     64.35        2.00 GB
+  4096   26.66     102.22    128.88       4.00 GB
+  8192   53.30     204.60    257.90       8.00 GB
+  16384  106.59    409.33    515.92       16.00 GB
+  32768  213.16    818.74    1031.90      32.00 GB
+  ```
+  Per-step cost is constant ~31.5 µs — perfectly linear scaling for the
+  sequential recurrence. State_history allocates [H, S+1, Dk, Dv] fp32 =
+  ~1 MB × S; at S=32K that's 32 GB per layer (fits B200's 192 GB but
+  bounds full 18-layer training to S≈4K without chunking).
 
   vs HF's `torch_chunk_gated_delta_rule` (the actual training-path
   reference on this box, fla unavailable): **7.4× at S=128, 2.3× at S=512**.
