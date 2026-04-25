@@ -151,6 +151,24 @@ extern "C" void launch_bwd_lora_linear(
     int S, int K_in, int K_out, int R, float scaling,
     cudaStream_t stream);
 
+extern "C" cudaError_t launch_dn_fwd_with_delta_save(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *decay, const float *state_in,
+    __nv_bfloat16 *y, float *state_out, __nv_bfloat16 *delta_save,
+    float *state_history,
+    int S, int H, cudaStream_t stream);
+
+extern "C" cudaError_t launch_dn_bwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *decay,
+    const float *state_in,
+    const __nv_bfloat16 *delta_save,
+    const __nv_bfloat16 *dy,
+    const float *state_history,
+    __nv_bfloat16 *dq, __nv_bfloat16 *dk, __nv_bfloat16 *dv,
+    float *dbeta, float *ddecay, float *dstate_init,
+    int S, int H, cudaStream_t stream);
+
 void fused_adamw_step(
     torch::Tensor params,
     torch::Tensor m, torch::Tensor v,
@@ -244,6 +262,67 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
                 (float *)dgate.data_ptr(), (float *)dup.data_ptr(),
                 (int)N,
                 c10::cuda::getCurrentCUDAStream().stream());
+        });
+
+    ops.def("dn_fwd_save(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor decay, "
+            "Tensor state_in, Tensor(a!) y, Tensor(b!) state_out, "
+            "Tensor(c!) delta_save, Tensor(d!) state_history) -> ()");
+    ops.impl("dn_fwd_save", torch::kCUDA, +[](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor beta, torch::Tensor decay,
+        torch::Tensor state_in,
+        torch::Tensor y, torch::Tensor state_out, torch::Tensor delta_save,
+        torch::Tensor state_history) {
+            int S = (int)q.size(0);
+            int H = (int)q.size(1);
+            cudaError_t err = launch_dn_fwd_with_delta_save(
+                (const __nv_bfloat16 *)q.data_ptr(),
+                (const __nv_bfloat16 *)k.data_ptr(),
+                (const __nv_bfloat16 *)v.data_ptr(),
+                (const float *)beta.data_ptr(),
+                (const float *)decay.data_ptr(),
+                (const float *)state_in.data_ptr(),
+                (__nv_bfloat16 *)y.data_ptr(),
+                state_out.numel() > 0 ? (float *)state_out.data_ptr() : nullptr,
+                (__nv_bfloat16 *)delta_save.data_ptr(),
+                state_history.numel() > 0 ? (float *)state_history.data_ptr() : nullptr,
+                S, H, c10::cuda::getCurrentCUDAStream().stream());
+            TORCH_CHECK(err == cudaSuccess, "dn_fwd_save: ",
+                        cudaGetErrorString(err));
+        });
+
+    ops.def("dn_bwd(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor decay, "
+            "Tensor state_in, Tensor delta_save, Tensor dy, Tensor state_history, "
+            "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, "
+            "Tensor(d!) dbeta, Tensor(e!) ddecay, Tensor(f!) dstate_init) -> ()");
+    ops.impl("dn_bwd", torch::kCUDA, +[](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor beta, torch::Tensor decay,
+        torch::Tensor state_in, torch::Tensor delta_save, torch::Tensor dy,
+        torch::Tensor state_history,
+        torch::Tensor dq, torch::Tensor dk, torch::Tensor dv,
+        torch::Tensor dbeta, torch::Tensor ddecay, torch::Tensor dstate_init) {
+            int S = (int)q.size(0);
+            int H = (int)q.size(1);
+            cudaError_t err = launch_dn_bwd(
+                (const __nv_bfloat16 *)q.data_ptr(),
+                (const __nv_bfloat16 *)k.data_ptr(),
+                (const __nv_bfloat16 *)v.data_ptr(),
+                (const float *)beta.data_ptr(),
+                (const float *)decay.data_ptr(),
+                (const float *)state_in.data_ptr(),
+                (const __nv_bfloat16 *)delta_save.data_ptr(),
+                (const __nv_bfloat16 *)dy.data_ptr(),
+                (const float *)state_history.data_ptr(),
+                (__nv_bfloat16 *)dq.data_ptr(),
+                (__nv_bfloat16 *)dk.data_ptr(),
+                (__nv_bfloat16 *)dv.data_ptr(),
+                (float *)dbeta.data_ptr(),
+                (float *)ddecay.data_ptr(),
+                dstate_init.numel() > 0 ? (float *)dstate_init.data_ptr() : nullptr,
+                S, H, c10::cuda::getCurrentCUDAStream().stream());
+            TORCH_CHECK(err == cudaSuccess, "dn_bwd: ",
+                        cudaGetErrorString(err));
         });
 
     ops.def("bwd_lora_linear(Tensor x, Tensor A, Tensor B, Tensor grad_y, "
