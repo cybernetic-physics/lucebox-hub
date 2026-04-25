@@ -29,6 +29,7 @@ sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
 
 from fa_bwd_flash import fa_forward_flash, fa_backward_flash
 from dn_bwd import dn_backward_autograd
+import train_megakernel_C  # noqa: F401  — registers torch.ops.train_megakernel_C.dn_*
 
 
 def bench(fn, warm=3, runs=10, label=""):
@@ -99,10 +100,32 @@ def main():
         dn_ms = bench(run_dn_bwd, warm=1, runs=3, label=f"1x DN layer bwd (torch autograd ref)")
         print(f"  {'x' + str(N_DN) + ' DN layers (total)':<40} {dn_ms*N_DN:7.2f} ms")
 
-        total_attn_bwd = fa_ms * N_FA + dn_ms * N_DN
-        print(f"  {'total attention bwd (FA + DN)':<40} {total_attn_bwd:7.2f} ms")
+        # ---- DN backward via our CUDA kernel ----
+        y_cuda = torch.empty(S, H_dn, Dv_dn, dtype=torch.bfloat16, device=dev)
+        state_out = torch.empty(H_dn, Dk_dn, Dv_dn, dtype=torch.float32, device=dev)
+        delta_save = torch.empty(S, H_dn, Dv_dn, dtype=torch.bfloat16, device=dev)
+        state_history = torch.empty(H_dn, S + 1, Dk_dn, Dv_dn, dtype=torch.float32, device=dev)
+        dq = torch.empty_like(q_dn); dk_ = torch.empty_like(k_dn); dv_ = torch.empty_like(v_dn)
+        dbeta = torch.empty_like(beta); ddecay = torch.empty_like(decay)
+        ds0 = torch.empty_like(s0)
+
+        def run_dn_bwd_cuda():
+            torch.ops.train_megakernel_C.dn_fwd_save(
+                q_dn, k_dn, v_dn, beta, decay, s0,
+                y_cuda, state_out, delta_save, state_history)
+            torch.ops.train_megakernel_C.dn_bwd(
+                q_dn, k_dn, v_dn, beta, decay, s0, delta_save, dy_dn, state_history,
+                dq, dk_, dv_, dbeta, ddecay, ds0)
+
+        dn_cuda_ms = bench(run_dn_bwd_cuda, warm=3, runs=10,
+                           label=f"1x DN layer fwd+bwd (CUDA)")
+        print(f"  {'x' + str(N_DN) + ' DN layers (total, CUDA)':<40} {dn_cuda_ms*N_DN:7.2f} ms")
+        print(f"  {'CUDA speedup vs torch ref':<40} {dn_ms/dn_cuda_ms:6.1f}x")
+
+        total_attn_bwd = fa_ms * N_FA + dn_cuda_ms * N_DN
+        print(f"  {'total attention bwd (FA + DN-CUDA)':<40} {total_attn_bwd:7.2f} ms")
         print(f"  {'⊂ FA share':<40} {100*fa_ms*N_FA/total_attn_bwd:6.1f} %")
-        print(f"  {'⊂ DN share':<40} {100*dn_ms*N_DN/total_attn_bwd:6.1f} %")
+        print(f"  {'⊂ DN share':<40} {100*dn_cuda_ms*N_DN/total_attn_bwd:6.1f} %")
 
     print()
     print("Takeaway: FA backward is essentially free vs model compute; the full")
