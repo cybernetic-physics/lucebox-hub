@@ -69,6 +69,33 @@
 #endif
 
 
+// Block-reduce-sum via warp shuffles. `scratch` must be at least
+// (blockDim.x + 31) / 32 floats. Returns the meaningful sum on tid==0
+// (and undefined elsewhere). Issues exactly one __syncthreads().
+__device__ __forceinline__ float block_reduce_sum(float val, float *scratch,
+                                                  int tid, int nt) {
+    val += __shfl_xor_sync(0xffffffff, val, 16);
+    val += __shfl_xor_sync(0xffffffff, val, 8);
+    val += __shfl_xor_sync(0xffffffff, val, 4);
+    val += __shfl_xor_sync(0xffffffff, val, 2);
+    val += __shfl_xor_sync(0xffffffff, val, 1);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) scratch[warp] = val;
+    __syncthreads();
+    int n_warps = (nt + 31) >> 5;
+    if (warp == 0) {
+        val = (tid < n_warps) ? scratch[tid] : 0.0f;
+        val += __shfl_xor_sync(0xffffffff, val, 16);
+        val += __shfl_xor_sync(0xffffffff, val, 8);
+        val += __shfl_xor_sync(0xffffffff, val, 4);
+        val += __shfl_xor_sync(0xffffffff, val, 2);
+        val += __shfl_xor_sync(0xffffffff, val, 1);
+    }
+    return val;
+}
+
+
 // ===================== forward + delta save kernel =====================
 // One block per head. Walks t = 0 .. S-1, accumulating state in shared
 // memory (256 threads × 64 cells = 16384 = Dk * Dv). Writes per-step
@@ -287,10 +314,7 @@ __global__ void dn_bwd_kernel(
     float *s_dy        = s_v         + Dv;             // [Dv]
     float *s_delta     = s_dy        + Dv;             // [Dv]
     float *s_d_delta   = s_delta     + Dv;             // [Dv]
-    float *s_dq        = s_d_delta   + Dv;             // [Dk]
-    float *s_dk1       = s_dq        + Dk;             // [Dk]
-    float *s_dk2       = s_dk1       + Dk;             // [Dk]
-    float *s_red       = s_dk2       + Dk;             // [256]
+    float *s_red       = s_d_delta   + Dv;             // [blockDim.x]
 
     // Initialize dstate to zero.
     for (int i = tid; i < Dk * Dv; i += nt) dstate[i] = 0.0f;
@@ -322,18 +346,19 @@ __global__ void dn_bwd_kernel(
 
         // ----- dstate += dy_t ⊗ q_t  (because out_t = state_t.q_t) -----
         // Element (i, j): dstate[i, j] += s_q[i] * s_dy[j].
+        // No sync after this: dq below reads `state` (unchanged) and `s_dy`
+        // (unchanged), so it's safe to start before all dstate writes drain;
+        // the sync at the end of dq ensures dstate is visible before d_delta.
         for (int idx = tid; idx < Dk * Dv; idx += nt) {
             int i = idx / Dv, j = idx - i * Dv;
             dstate[idx] += s_q[i] * s_dy[j];
         }
-        __syncthreads();
 
         // ----- dq[i] = sum_j state_t[i, j] * dy[j] -----
         for (int i = tid; i < Dk; i += nt) {
             float acc = 0.0f;
             #pragma unroll 8
             for (int j = 0; j < Dv; j++) acc += state[i * Dv + j] * s_dy[j];
-            s_dq[i] = acc;
             dq[t * qkd_pos_stride + i] = __float2bfloat16(acc);
         }
         __syncthreads();
@@ -362,14 +387,8 @@ __global__ void dn_bwd_kernel(
             for (int i = 0; i < Dk; i++) pk += prev_state[i * Dv + j] * s_k[i];
             my_partial += s_d_delta[j] * (s_v[j] - pk);
         }
-        s_red[tid] = my_partial;
-        __syncthreads();
-        // block reduce s_red[0..nt-1] -> s_red[0]
-        for (int o = nt / 2; o > 0; o >>= 1) {
-            if (tid < o) s_red[tid] += s_red[tid + o];
-            __syncthreads();
-        }
-        if (tid == 0) dbeta[t * bd_pos_stride] = s_red[0];
+        float beta_sum = block_reduce_sum(my_partial, s_red, tid, nt);
+        if (tid == 0) dbeta[t * bd_pos_stride] = beta_sum;
         __syncthreads();
 
         // ----- dk: two pieces -----
@@ -392,13 +411,8 @@ __global__ void dn_bwd_kernel(
         for (int idx = tid; idx < Dk * Dv; idx += nt) {
             my_dec += prev_state[idx] * dstate[idx];
         }
-        s_red[tid] = my_dec;
-        __syncthreads();
-        for (int o = nt / 2; o > 0; o >>= 1) {
-            if (tid < o) s_red[tid] += s_red[tid + o];
-            __syncthreads();
-        }
-        if (tid == 0) ddecay[t * bd_pos_stride] = s_red[0];
+        float dec_sum = block_reduce_sum(my_dec, s_red, tid, nt);
+        if (tid == 0) ddecay[t * bd_pos_stride] = dec_sum;
         __syncthreads();
 
         // ----- update dstate for next (earlier) step -----
@@ -464,9 +478,9 @@ extern "C" cudaError_t launch_dn_bwd(
 {
     constexpr int Dk = DN_KEY_DEFAULT;
     constexpr int Dv = DN_VAL_DEFAULT;
-    // 3 state slabs + 5 Dk-sized (s_q,s_k,s_dq,s_dk1,s_dk2) +
+    // 3 state slabs + 2 Dk-sized (s_q,s_k) +
     // 4 Dv-sized (s_v,s_dy,s_delta,s_d_delta) + 256-thread reduction.
-    size_t smem = (3 * Dk * Dv + 5 * Dk + 4 * Dv + 256) * sizeof(float);
+    size_t smem = (3 * Dk * Dv + 2 * Dk + 4 * Dv + 256) * sizeof(float);
     int threads = 256;
     cudaFuncSetAttribute(dn_bwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,

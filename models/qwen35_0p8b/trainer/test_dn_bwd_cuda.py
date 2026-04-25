@@ -106,7 +106,7 @@ def main():
     t0 = time.perf_counter()
     for _ in range(10): run_cuda_bwd()
     torch.cuda.synchronize()
-    cuda_ms = (time.perf_counter() - t0) * 100.0
+    cuda_ms = (time.perf_counter() - t0) * 1000.0 / 10
     print(f"\nSpeed @ S=512:")
     print(f"  CUDA dn fwd+bwd (one DN layer): {cuda_ms:.2f} ms/iter")
     print(f"  vs torch ref (~275 ms/iter)   = {275.0/cuda_ms:.1f}x speedup")
