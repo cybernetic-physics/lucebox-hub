@@ -320,33 +320,23 @@ __global__ void dn_bwd_kernel(
             dv[t * v_pos_stride + j] = __float2bfloat16(beta_t * s_d_delta[j]);
         }
         // ----- dbeta_t = sum_j d_delta[j] * (v[j] - prev_state.k_t)[j] -----
-        // First compute pk[j] = sum_i prev_state[i, j] * k[i] in s_dk2 (reuse).
+        // pk[j] = sum_i prev_state[i, j] * s_k[i]. Per-thread partial,
+        // then block-reduce via shared mem.
+        float my_partial = 0.0f;
         for (int j = tid; j < Dv; j += nt) {
-            float acc = 0.0f;
+            float pk = 0.0f;
             #pragma unroll 8
-            for (int i = 0; i < Dk; i++) acc += prev_state[i * Dv + j] * s_k[i];
-            // dv-component sanity: (s_v[j] - acc) is the "raw" contribution.
-            // dbeta term: d_delta[j] * (s_v[j] - acc).
-            float term = s_d_delta[j] * (s_v[j] - acc);
-            s_red[tid] = term;
-            __syncthreads();
-            // simple block-sum into s_red[0]; do this once per thread per j —
-            // this is wasteful, will be replaced by warp-reduce in the
-            // tensor-core port. For correctness OK.
-            // Actually move this OUT of the j-loop.
+            for (int i = 0; i < Dk; i++) pk += prev_state[i * Dv + j] * s_k[i];
+            my_partial += s_d_delta[j] * (s_v[j] - pk);
+        }
+        s_red[tid] = my_partial;
+        __syncthreads();
+        // block reduce s_red[0..nt-1] -> s_red[0]
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o) s_red[tid] += s_red[tid + o];
             __syncthreads();
         }
-        // Compute dbeta as sum over j of d_delta[j] * (v[j] - prev_state.k[j]).
-        // Recompute cleanly:
-        if (tid == 0) {
-            float dbeta_acc = 0.0f;
-            for (int j = 0; j < Dv; j++) {
-                float pk = 0.0f;
-                for (int i = 0; i < Dk; i++) pk += prev_state[i * Dv + j] * s_k[i];
-                dbeta_acc += s_d_delta[j] * (s_v[j] - pk);
-            }
-            dbeta[t * bd_pos_stride] = dbeta_acc;
-        }
+        if (tid == 0) dbeta[t * bd_pos_stride] = s_red[0];
         __syncthreads();
 
         // ----- dk: two pieces -----
@@ -365,13 +355,17 @@ __global__ void dn_bwd_kernel(
         __syncthreads();
 
         // ----- ddecay_t = sum_(i,j) prev_state[i, j] * dstate[i, j] -----
-        if (tid == 0) {
-            float acc = 0.0f;
-            for (int idx = 0; idx < Dk * Dv; idx++) {
-                acc += prev_state[idx] * dstate[idx];
-            }
-            ddecay[t * bd_pos_stride] = acc;
+        float my_dec = 0.0f;
+        for (int idx = tid; idx < Dk * Dv; idx += nt) {
+            my_dec += prev_state[idx] * dstate[idx];
         }
+        s_red[tid] = my_dec;
+        __syncthreads();
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o) s_red[tid] += s_red[tid + o];
+            __syncthreads();
+        }
+        if (tid == 0) ddecay[t * bd_pos_stride] = s_red[0];
         __syncthreads();
 
         // ----- update dstate for next (earlier) step -----
@@ -444,7 +438,9 @@ extern "C" cudaError_t launch_dn_bwd(
 {
     constexpr int Dk = DN_KEY_DEFAULT;
     constexpr int Dv = DN_VAL_DEFAULT;
-    size_t smem = (3 * Dk * Dv + 4 * Dk + 4 * Dv + 256) * sizeof(float);
+    // 3 state slabs + 5 Dk-sized (s_q,s_k,s_dq,s_dk1,s_dk2) +
+    // 4 Dv-sized (s_v,s_dy,s_delta,s_d_delta) + 256-thread reduction.
+    size_t smem = (3 * Dk * Dv + 5 * Dk + 4 * Dv + 256) * sizeof(float);
     int threads = 256;
     cudaFuncSetAttribute(dn_bwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
