@@ -88,26 +88,40 @@
 //
 // Block: 256 threads. Each thread owns DK*DV/256 = 64 state cells.
 __global__ void dn_fwd_with_delta_save_kernel(
-    const __nv_bfloat16 *__restrict__ q,
-    const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v,
-    const float *__restrict__ beta,
-    const float *__restrict__ decay,
-    const float *__restrict__ state_in,
-    __nv_bfloat16 *__restrict__ y,
-    float *__restrict__ state_out,
-    __nv_bfloat16 *__restrict__ delta_save,
-    float *__restrict__ state_history,   // [S+1, Dk, Dv] per head, written here
+    const __nv_bfloat16 *__restrict__ q_base,
+    const __nv_bfloat16 *__restrict__ k_base,
+    const __nv_bfloat16 *__restrict__ v_base,
+    const float *__restrict__ beta_base,
+    const float *__restrict__ decay_base,
+    const float *__restrict__ state_in_base,
+    __nv_bfloat16 *__restrict__ y_base,
+    float *__restrict__ state_out_base,
+    __nv_bfloat16 *__restrict__ delta_save_base,
+    float *__restrict__ state_history_base,   // [H, S+1, Dk, Dv]
     int S,
     int qkd_pos_stride,
     int v_pos_stride,
     int bd_pos_stride,
-    int state_hist_stride_t)              // Dk*Dv (per head, but we pass already-offset ptr)
+    int state_hist_stride_t)              // Dk*Dv
 {
     constexpr int Dk = DN_KEY_DEFAULT;
     constexpr int Dv = DN_VAL_DEFAULT;
     int tid = threadIdx.x;
     int nt  = blockDim.x;
+    int h   = blockIdx.x;
+
+    // Per-head views.
+    const __nv_bfloat16 *q     = q_base + h * Dk;
+    const __nv_bfloat16 *k     = k_base + h * Dk;
+    const __nv_bfloat16 *v     = v_base + h * Dv;
+    const float *beta          = beta_base  + h;
+    const float *decay         = decay_base + h;
+    const float *state_in      = state_in_base + h * Dk * Dv;
+    __nv_bfloat16 *y           = y_base + h * Dv;
+    float *state_out           = state_out_base ? state_out_base + h * Dk * Dv : nullptr;
+    __nv_bfloat16 *delta_save  = delta_save_base + h * Dv;
+    float *state_history       = state_history_base
+        ? state_history_base + h * (S + 1) * (size_t)Dk * Dv : nullptr;
 
     // ----- shared layout -----
     // state[Dk, Dv] fp32, sk[Dv] fp32 reduction scratch, sk_cache[Dv] fp32,
@@ -218,21 +232,21 @@ __global__ void dn_fwd_with_delta_save_kernel(
 //
 // Block: 256 threads.
 __global__ void dn_bwd_kernel(
-    const __nv_bfloat16 *__restrict__ q,
-    const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v,
-    const float *__restrict__ beta,
-    const float *__restrict__ decay,
-    const float *__restrict__ state_in,
-    const __nv_bfloat16 *__restrict__ delta_save,
-    const __nv_bfloat16 *__restrict__ dy,
-    const float *__restrict__ state_history,    // [S+1, Dk, Dv] per head
-    __nv_bfloat16 *__restrict__ dq,
-    __nv_bfloat16 *__restrict__ dk,
-    __nv_bfloat16 *__restrict__ dv,
-    float *__restrict__ dbeta,
-    float *__restrict__ ddecay,
-    float *__restrict__ dstate_init,
+    const __nv_bfloat16 *__restrict__ q_base,
+    const __nv_bfloat16 *__restrict__ k_base,
+    const __nv_bfloat16 *__restrict__ v_base,
+    const float *__restrict__ beta_base,
+    const float *__restrict__ decay_base,
+    const float *__restrict__ state_in_base,
+    const __nv_bfloat16 *__restrict__ delta_save_base,
+    const __nv_bfloat16 *__restrict__ dy_base,
+    const float *__restrict__ state_history_base,    // [H, S+1, Dk, Dv]
+    __nv_bfloat16 *__restrict__ dq_base,
+    __nv_bfloat16 *__restrict__ dk_base,
+    __nv_bfloat16 *__restrict__ dv_base,
+    float *__restrict__ dbeta_base,
+    float *__restrict__ ddecay_base,
+    float *__restrict__ dstate_init_base,
     int S,
     int qkd_pos_stride,
     int v_pos_stride,
@@ -243,6 +257,25 @@ __global__ void dn_bwd_kernel(
     constexpr int Dv = DN_VAL_DEFAULT;
     int tid = threadIdx.x;
     int nt  = blockDim.x;
+    int h   = blockIdx.x;
+
+    // Per-head views.
+    const __nv_bfloat16 *q          = q_base          + h * Dk;
+    const __nv_bfloat16 *k          = k_base          + h * Dk;
+    const __nv_bfloat16 *v          = v_base          + h * Dv;
+    const float *beta               = beta_base       + h;
+    const float *decay              = decay_base      + h;
+    (void)state_in_base;  // unused — backward replays state from state_history.
+    const __nv_bfloat16 *delta_save = delta_save_base + h * Dv;
+    const __nv_bfloat16 *dy         = dy_base         + h * Dv;
+    const float *state_history      = state_history_base + h * (S + 1) * (size_t)Dk * Dv;
+    __nv_bfloat16 *dq               = dq_base         + h * Dk;
+    __nv_bfloat16 *dk               = dk_base         + h * Dk;
+    __nv_bfloat16 *dv               = dv_base         + h * Dv;
+    float *dbeta                    = dbeta_base      + h;
+    float *ddecay                   = ddecay_base     + h;
+    float *dstate_init              = dstate_init_base
+        ? dstate_init_base + h * Dk * Dv : nullptr;
 
     extern __shared__ float smem[];
     float *state       = smem;                        // [Dk, Dv] current state_t (loaded from history)
@@ -410,17 +443,10 @@ extern "C" cudaError_t launch_dn_fwd_with_delta_save(
     int v_stride   = H * Dv;
     int bd_stride  = H;
     int hist_stride_t = Dk * Dv;
-    for (int h = 0; h < H; h++) {
-        dn_fwd_with_delta_save_kernel<<<1, threads, smem, stream>>>(
-            q + h * Dk, k + h * Dk, v + h * Dv,
-            beta + h, decay + h,
-            state_in + h * Dk * Dv,
-            y + h * Dv,
-            state_out ? state_out + h * Dk * Dv : nullptr,
-            delta_save + h * Dv,
-            state_history ? state_history + h * (S + 1) * Dk * Dv : nullptr,
-            S, qkd_stride, v_stride, bd_stride, hist_stride_t);
-    }
+    dn_fwd_with_delta_save_kernel<<<H, threads, smem, stream>>>(
+        q, k, v, beta, decay, state_in,
+        y, state_out, delta_save, state_history,
+        S, qkd_stride, v_stride, bd_stride, hist_stride_t);
     return cudaGetLastError();
 }
 
@@ -449,18 +475,10 @@ extern "C" cudaError_t launch_dn_bwd(
     int v_stride   = H * Dv;
     int bd_stride  = H;
     int hist_stride_t = Dk * Dv;
-    for (int h = 0; h < H; h++) {
-        dn_bwd_kernel<<<1, threads, smem, stream>>>(
-            q + h * Dk, k + h * Dk, v + h * Dv,
-            beta + h, decay + h,
-            state_in + h * Dk * Dv,
-            delta_save + h * Dv,
-            dy + h * Dv,
-            state_history + h * (S + 1) * Dk * Dv,
-            dq + h * Dk, dk + h * Dk, dv + h * Dv,
-            dbeta + h, ddecay + h,
-            dstate_init ? dstate_init + h * Dk * Dv : nullptr,
-            S, qkd_stride, v_stride, bd_stride, hist_stride_t);
-    }
+    dn_bwd_kernel<<<H, threads, smem, stream>>>(
+        q, k, v, beta, decay, state_in,
+        delta_save, dy, state_history,
+        dq, dk, dv, dbeta, ddecay, dstate_init,
+        S, qkd_stride, v_stride, bd_stride, hist_stride_t);
     return cudaGetLastError();
 }
