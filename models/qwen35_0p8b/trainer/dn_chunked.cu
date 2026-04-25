@@ -162,6 +162,9 @@ __device__ inline void wmma_gemm_bf16(
 
 
 // ===================== chunked fwd kernel =====================
+// Optionally writes `state_chunks_base` [H, n_chunks+1, Dk, Dv] fp32 — entry
+// 0 is state_init, entries 1..n_chunks are end-of-chunk states. Used by the
+// chunked backward kernel to replay forward intermediates per chunk.
 __global__ void dn_chunked_fwd_kernel(
     const __nv_bfloat16 *__restrict__ q_base,
     const __nv_bfloat16 *__restrict__ k_base,
@@ -171,6 +174,7 @@ __global__ void dn_chunked_fwd_kernel(
     const float *__restrict__ state_in_base,
     __nv_bfloat16 *__restrict__ y_base,
     float *__restrict__ state_out_base,
+    float *__restrict__ state_chunks_base,   // [H, n_chunks+1, Dk, Dv] or null
     int S,
     int qkd_pos_stride,
     int v_pos_stride,
@@ -196,6 +200,10 @@ __global__ void dn_chunked_fwd_kernel(
     __nv_bfloat16 *y_h      = y_base + h * Dv;
     float *state_out_h      = state_out_base ? state_out_base + h * Dk * Dv : nullptr;
 
+    int n_chunks = (S + C - 1) / C;
+    float *state_chunks_h   = state_chunks_base
+        ? state_chunks_base + h * (size_t)(n_chunks + 1) * Dk * Dv : nullptr;
+
     // ----- shared memory layout -----
     // Lay out fp32 buffers first (16-byte alignment guaranteed), then bf16.
     extern __shared__ unsigned char smem_raw[];
@@ -219,7 +227,12 @@ __global__ void dn_chunked_fwd_kernel(
     for (int i = tid; i < Dk * Dv; i += nt) state[i] = state_in_h[i];
     __syncthreads();
 
-    int n_chunks = (S + C - 1) / C;
+    // Save state_chunks[0] = state_init (entry 0 of the per-head slab).
+    if (state_chunks_h) {
+        for (int i = tid; i < Dk * Dv; i += nt) state_chunks_h[i] = state[i];
+    }
+    __syncthreads();
+
     for (int c = 0; c < n_chunks; c++) {
         int t0 = c * C;
         int chunk_len = (S - t0 < C) ? (S - t0) : C;
@@ -487,6 +500,13 @@ __global__ void dn_chunked_fwd_kernel(
         wmma_gemm_fp32<Dk, Dv, C, true, false>(
             buf_kbeta, Dk, buf_vbeta, Dv, state, Dv, warp, n_warps, true);
         __syncthreads();
+
+        // Save state at end of chunk c into state_chunks[c+1].
+        if (state_chunks_h) {
+            float *dst = state_chunks_h + (size_t)(c + 1) * Dk * Dv;
+            for (int i = tid; i < Dk * Dv; i += nt) dst[i] = state[i];
+        }
+        __syncthreads();
     }
 
     if (state_out_h) {
@@ -500,6 +520,7 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
     const float *beta, const float *g, const float *state_in,
     __nv_bfloat16 *y, float *state_out,
+    float *state_chunks,                  // [H, n_chunks+1, Dk, Dv] or null
     int S, int H, cudaStream_t stream)
 {
     constexpr int Dk = DN_KEY_DEFAULT;
@@ -521,7 +542,7 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     int v_stride   = H * Dv;
     int bd_stride  = H;
     dn_chunked_fwd_kernel<<<H, threads, smem, stream>>>(
-        q, k, v, beta, g, state_in, y, state_out,
+        q, k, v, beta, g, state_in, y, state_out, state_chunks,
         S, qkd_stride, v_stride, bd_stride);
     return cudaGetLastError();
 }

@@ -92,9 +92,10 @@ def deltanet_chunked_inference(q, k, v, beta, g, state_init):
     Dv = v.shape[-1]
     y = torch.empty(S, H, Dv, dtype=torch.bfloat16, device=q.device)
     state_out = torch.empty(H, Dk, Dv, dtype=torch.float32, device=q.device)
+    state_chunks = torch.empty(0, dtype=torch.float32, device=q.device)
     torch.ops.train_megakernel_C.dn_chunked_fwd(
         q.contiguous(), k.contiguous(), v.contiguous(),
         beta.contiguous(), g.contiguous(), state_init.contiguous(),
-        y, state_out,
+        y, state_out, state_chunks,
     )
     return y, state_out

@@ -49,8 +49,9 @@ def main():
         # Chunked CUDA.
         y_chk = torch.empty(S, H, Dv, dtype=torch.bfloat16, device=dev)
         state_chk = torch.empty(H, Dk, Dv, dtype=torch.float32, device=dev)
+        empty = torch.empty(0, dtype=torch.float32, device=dev)
         torch.ops.train_megakernel_C.dn_chunked_fwd(
-            q, k, v, beta, g, state_init, y_chk, state_chk)
+            q, k, v, beta, g, state_init, y_chk, state_chk, empty)
         torch.cuda.synchronize()
 
         print(f"--- S={S} ---")
@@ -62,13 +63,13 @@ def main():
         # Speed.
         for _ in range(3):
             torch.ops.train_megakernel_C.dn_chunked_fwd(
-                q, k, v, beta, g, state_init, y_chk, state_chk)
+                q, k, v, beta, g, state_init, y_chk, state_chk, empty)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         N = 10
         for _ in range(N):
             torch.ops.train_megakernel_C.dn_chunked_fwd(
-                q, k, v, beta, g, state_init, y_chk, state_chk)
+                q, k, v, beta, g, state_init, y_chk, state_chk, empty)
         torch.cuda.synchronize()
         chk_ms = (time.perf_counter() - t0) * 1000.0 / N
 
