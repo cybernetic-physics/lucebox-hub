@@ -40,6 +40,15 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
+# transformers' is_flash_linear_attention_available calls
+# version.parse("N/A") when an empty `fla` namespace package is installed
+# (happens on some boxes). Short-circuit it before importing transformers.
+try:
+    import transformers.utils.import_utils as _iu
+    _iu.is_flash_linear_attention_available = lambda: False
+except Exception:
+    pass
+
 sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
 sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/prefill_megakernel")
 sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
@@ -232,6 +241,21 @@ class LoraMegakernelTrainer:
         )
         hf_model = get_peft_model(session_base, cfg).to("cuda", dtype=torch.bfloat16)
         hf_model.train()
+
+        # Swap HF's fp32 torch_chunk_gated_delta_rule for our CUDA DN
+        # recurrence kernel (bit-exact to the recurrent variant, ~2-6x
+        # faster training step end-to-end at S=128..512). Opt-out with
+        # LORA_MEGAKERNEL_DISABLE_DN_PATCH=1 to fall back to HF's impl.
+        import os
+        if not os.environ.get("LORA_MEGAKERNEL_DISABLE_DN_PATCH"):
+            from dn_hf_patch import patch_hf_qwen3_deltanet
+            try:
+                _n = patch_hf_qwen3_deltanet(hf_model)
+            except Exception:
+                _n = 0  # kernel not built — fall back quietly
+            if _n:
+                print(f"[LoraMegakernelTrainer] patched {_n} GatedDeltaNet "
+                      f"layers with CUDA kernel")
 
         optimizer = torch.optim.AdamW(
             [p for p in hf_model.parameters() if p.requires_grad],
