@@ -100,16 +100,15 @@ def _resolve_backend(backend):
 
 
 def _resolve_prefill_mode():
-    # On fork-parent-gb10 only the "raw" mode is wired up: prefill runs via
-    # launch_prefill_megakernel_nvfp4 from prefill_megakernel.cu. The "hybrid"
-    # mode from the upstream gb10 branch would dispatch to prefill_bf16_nvfp4_lm,
-    # which requires the vectorized prefill.cu rewrite that is deferred to a
-    # future PR.
-    mode = os.environ.get("MEGAKERNEL_PREFILL_MODE", "raw")
-    if mode != "raw":
+    # 'hybrid' (default) = bf16 body + NVFP4 LM head via prefill_bf16_nvfp4_lm
+    #   from prefill_bw.cu (Blackwell-only, anonymous-namespaced so it does
+    #   not collide with upstream prefill.cu).
+    # 'raw' = single-dispatch persistent prefill_megakernel_nvfp4 from
+    #   prefill_megakernel.cu.
+    mode = os.environ.get("MEGAKERNEL_PREFILL_MODE", "hybrid")
+    if mode not in ("hybrid", "raw"):
         raise ValueError(
-            f"MEGAKERNEL_PREFILL_MODE={mode!r} is not available in this build; "
-            "only 'raw' (prefill_megakernel_nvfp4) is wired up."
+            f"MEGAKERNEL_PREFILL_MODE={mode!r} is not supported; expected 'hybrid' or 'raw'."
         )
     return mode
 

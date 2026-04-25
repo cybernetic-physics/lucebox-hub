@@ -52,6 +52,7 @@ nvcc_args = [
 if is_blackwell:
     sources.append("kernel_gb10_nvfp4.cu")
     sources.append("prefill_megakernel.cu")
+    sources.append("prefill_bw.cu")
     # Exposed to both nvcc (for the Blackwell .cu files) and the host
     # compiler (so torch_bindings.cpp registers the NVFP4 ops).
     cxx_args.append("-DMEGAKERNEL_HAS_NVFP4")

@@ -40,6 +40,17 @@ struct LayerWeightsNVFP4 {
     int _pad[2];
     void *ptrs[24];  // hot decode weights become packed fp4 + per-group scales
 };
+
+// Layout-compatible with PFFusedLayerWeights in prefill_bw.cu — used by the
+// hybrid bf16 prefill + NVFP4 LM head path (launch_prefill_bf16_nvfp4_lm).
+struct PrefillFusedLayerWeights {
+    void *proj_weight;
+    void *gate_up_weight;
+    void *proj_weight_packed;
+    void *proj_weight_scales;
+    void *gate_up_weight_packed;
+    void *gate_up_weight_scales;
+};
 #endif
 
 extern "C" void launch_decode(
@@ -407,6 +418,63 @@ void prefill_bf16_mega(
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
+extern "C" void launch_prefill_bf16_nvfp4_lm(
+    const int *token_ids, int seq_len, int *output_token,
+    const void *embed_weight, const LayerWeights *layers,
+    const PrefillFusedLayerWeights *fused_layers,
+    const void *final_norm_w, const void *lm_head_w,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden, void *residual, void *normalized,
+    void *proj_buf, void *proj_buf2, void *proj_buf_half, void *proj_act_packed, void *proj_act_scales,
+    void *attn_buf, void *mlp_buf,
+    void *dn_out_buf, void *beta_buf, void *alpha_buf,
+    void *final_normed, void *hidden_bf16_out,
+    void *lm_bmv, void *lm_bmi,
+    void *lm_hidden_bf16, void *lm_hidden_packed,
+    void *lm_hidden_scales, void *lm_logits_f16,
+    cudaStream_t stream);
+
+void prefill_bf16_nvfp4_lm(
+    torch::Tensor output_token, torch::Tensor token_ids,
+    torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
+    torch::Tensor prefill_fused_weights_packed,
+    torch::Tensor final_norm_weight, torch::Tensor lm_head_weight,
+    torch::Tensor lm_head_weight_packed, torch::Tensor lm_head_scales,
+    torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
+    torch::Tensor dn_states, torch::Tensor conv_bufs,
+    torch::Tensor hidden, torch::Tensor residual, torch::Tensor normalized,
+    torch::Tensor proj_buf, torch::Tensor proj_buf2, torch::Tensor proj_buf_half,
+    torch::Tensor proj_act_packed, torch::Tensor proj_act_scales,
+    torch::Tensor attn_buf, torch::Tensor mlp_buf,
+    torch::Tensor dn_out_buf, torch::Tensor beta_buf, torch::Tensor alpha_buf,
+    torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
+    torch::Tensor lm_bmv, torch::Tensor lm_bmi,
+    torch::Tensor lm_hidden_bf16, torch::Tensor lm_hidden_packed,
+    torch::Tensor lm_hidden_scales, torch::Tensor lm_logits_f16)
+{
+    launch_prefill_bf16_nvfp4_lm(
+        (const int*)token_ids.data_ptr(), token_ids.size(0),
+        (int*)output_token.data_ptr(),
+        embed_weight.data_ptr(),
+        reinterpret_cast<const LayerWeights*>(layer_weights_packed.data_ptr()),
+        reinterpret_cast<const PrefillFusedLayerWeights*>(prefill_fused_weights_packed.data_ptr()),
+        final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+        lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
+        dn_states.data_ptr(), conv_bufs.data_ptr(),
+        hidden.data_ptr(), residual.data_ptr(), normalized.data_ptr(),
+        proj_buf.data_ptr(), proj_buf2.data_ptr(), proj_buf_half.data_ptr(),
+        proj_act_packed.data_ptr(), proj_act_scales.data_ptr(),
+        attn_buf.data_ptr(), mlp_buf.data_ptr(),
+        dn_out_buf.data_ptr(), beta_buf.data_ptr(), alpha_buf.data_ptr(),
+        final_normed.data_ptr(), hidden_bf16_out.data_ptr(),
+        lm_bmv.data_ptr(), lm_bmi.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(),
+        lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
 void prefill_megakernel_nvfp4(
     torch::Tensor output_token, torch::Tensor token_ids,
     torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
@@ -545,6 +613,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor block_max_vals, Tensor block_max_idxs, Tensor lm_sync_counter, "
             "int max_seq_len, int group_size) -> ()");
     ops.impl("prefill_megakernel_nvfp4", torch::kCUDA, &prefill_megakernel_nvfp4);
+
+    ops.def("prefill_bf16_nvfp4_lm(Tensor output_token, Tensor token_ids, "
+            "Tensor embed_weight, Tensor layer_weights_packed, Tensor prefill_fused_weights_packed, "
+            "Tensor final_norm_weight, Tensor lm_head_weight, "
+            "Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
+            "Tensor hidden, Tensor residual, Tensor normalized, "
+            "Tensor proj_buf, Tensor proj_buf2, Tensor proj_buf_half, Tensor proj_act_packed, Tensor proj_act_scales, "
+            "Tensor attn_buf, Tensor mlp_buf, "
+            "Tensor dn_out_buf, Tensor beta_buf, Tensor alpha_buf, "
+            "Tensor final_normed, Tensor hidden_bf16_out, "
+            "Tensor lm_bmv, Tensor lm_bmi, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, Tensor lm_hidden_scales, Tensor lm_logits_f16) -> ()");
+    ops.impl("prefill_bf16_nvfp4_lm", torch::kCUDA, &prefill_bf16_nvfp4_lm);
 
     ops.def("quantize_nvfp4_out(Tensor packed_out, Tensor scales_out, Tensor weight, int group_size) -> ()");
     ops.impl("quantize_nvfp4_out", torch::kCUDA, &quantize_nvfp4_out);
