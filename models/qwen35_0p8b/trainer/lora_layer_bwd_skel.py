@@ -414,60 +414,83 @@ def layer_attn_bwd_fa(
 
 
 # ---------------------------------------------------------------------------
-# FA-layer reverse walk (stub)
+# FA-layer reverse walk: compose mlp_bwd + attn_bwd
 # ---------------------------------------------------------------------------
 
 def per_layer_bwd_fa(
-    L: int,                          # absolute layer index in [0, NUM_LAYERS)
+    *,
     fa_idx: int,                     # FA-only layer index in [0, N_FA)
-    dh_out: torch.Tensor,            # [S, H]  fp32 — gradient flowing into this layer's output
-    saves: dict,                     # the 6 activation slabs from prefill_bf16_train_step
-    lora_flat: list[torch.Tensor],   # 26 packed bf16 tensors
-    base_weights_handle: Any,        # base model weights for layer L
-    lora_rank: int,
+    dh_out: torch.Tensor,            # [S, HIDDEN] fp32 — gradient flowing into the
+                                      #   layer's output (= layer L+1's dh_in)
+    # Saved activations (single-layer slices already taken):
+    hidden_in: torch.Tensor,         # [S, HIDDEN] bf16
+    normalized_post_attn: torch.Tensor,  # [S, HIDDEN] bf16
+    mlp_inter: torch.Tensor,         # [S, INTER]  bf16
+    h_post_attn: torch.Tensor,       # [S, HIDDEN] bf16
+    # Frozen base weights for this layer:
+    input_norm_w: torch.Tensor,      # [HIDDEN]
+    q_W: torch.Tensor, k_W: torch.Tensor, v_W: torch.Tensor,
+    q_nw: torch.Tensor, k_nw: torch.Tensor,
+    o_W: torch.Tensor,
+    post_attn_norm_w: torch.Tensor,
+    gate_W: torch.Tensor, up_W: torch.Tensor, down_W: torch.Tensor,
+    # Single-layer LoRA tensor slices (already indexed by fa_idx):
+    fa_q_A: torch.Tensor,    fa_q_B: torch.Tensor,
+    fa_k_A: torch.Tensor,    fa_k_B: torch.Tensor,
+    fa_v_A: torch.Tensor,    fa_v_B: torch.Tensor,
+    fa_o_A: torch.Tensor,    fa_o_B: torch.Tensor,
+    fa_gate_A: torch.Tensor, fa_gate_B: torch.Tensor,
+    fa_up_A: torch.Tensor,   fa_up_B: torch.Tensor,
+    fa_down_A: torch.Tensor, fa_down_B: torch.Tensor,
     lora_scaling: float,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Reverse walk of one FA layer. TODO: implement.
+    rms_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Compose layer_mlp_bwd and layer_attn_bwd_fa for one FA layer.
 
     Returns:
-        dh_in: [S, H] fp32 — gradient flowing OUT of this layer into the
-               previous layer's residual stream.
-        layer_lora_grads: dict of per-projection LoRA grads
-                          (keys: fa_q_A, fa_q_B, ..., fa_down_B; one each).
+        dh_in              : [S, HIDDEN] fp32 — flows out of this layer to L-1
+        grad_*_A, grad_*_B : 7 LoRA pairs (q, k, v, o, gate, up, down)
     """
-    raise NotImplementedError(
-        "per_layer_bwd_fa is the core Slice B.3b work. Steps:\n"
-        "  1. dmlp_out = dh_out                                  (residual)\n"
-        "  2. dh_post_attn = dh_out                              (residual)\n"
-        "  3. dmlp_inter, dA_down, dB_down ←\n"
-        "       lora_linear_bwd(saves['mlp_inter'][L], fa_down_A[fa_idx],\n"
-        "                       fa_down_B[fa_idx], down_W, dmlp_out, scaling)\n"
-        "  4. RECOMPUTE gate, up: 2 cuBLAS GEMMs from saves['normalized_post_attn'][L]\n"
-        "       gate = saves['normalized_post_attn'][L] @ gate_W.T + LoRA gate path\n"
-        "       up   = same with up_W and fa_up_A/B\n"
-        "  5. dgate, dup = swiglu_bwd(gate, up, dmlp_inter)\n"
-        "  6. dnorm_post_attn = LoRA-path dx (gate) + base @ gate_W +\n"
-        "                       LoRA-path dx (up)   + base @ up_W\n"
-        "       Plus dA/dB grads for fa_gate, fa_up.\n"
-        "  7. dh_post_attn += rmsnorm_bwd(saves['h_post_attn'][L], post_attn_norm_w,\n"
-        "                                  dnorm_post_attn)\n"
-        "  8. dattn_out = dh_post_attn        (residual)\n"
-        "  9. dh_in = dh_post_attn            (residual; will accumulate further)\n"
-        " 10. d_attn_out_pre_o, dA_o, dB_o ←\n"
-        "       lora_linear_bwd(saves['attn_out_pre_o'][L], fa_o_A[fa_idx],\n"
-        "                       fa_o_B[fa_idx], o_W, dattn_out, scaling)\n"
-        " 11. RECOMPUTE Q, K, V from saves['normalized_in'][L] + RoPE/QKnorm\n"
-        "       (or save them in a separate kernel mod — TODO)\n"
-        " 12. dQ, dK, dV = fa_bwd_flash(Q, K, V, O, LSE, d_attn_out_pre_o, ...)\n"
-        "       (need to also compute O + LSE — either save in fwd or recompute.)\n"
-        " 13. dnorm_in = sum of:\n"
-        "       lora_linear_bwd over q, k, v with respective dQ_pre_norm, etc.\n"
-        " 14. dh_in += rmsnorm_bwd(saves['hidden_in'][L], input_norm_w, dnorm_in)\n"
-        " 15. Return dh_in + the 7 (A,B) grad pairs.\n\n"
-        "The trickiest items: 11/12 (need to either save Q/K/V/O/LSE during\n"
-        "forward or recompute them), 6 (correctly accumulating dA/dB grads\n"
-        "for two parallel LoRA paths sharing the same x).\n"
+    # MLP block first (it sits at the layer's output side).
+    mlp_out = layer_mlp_bwd(
+        h_post_attn=h_post_attn,
+        normalized_post_attn=normalized_post_attn,
+        mlp_inter=mlp_inter,
+        dh_out=dh_out,
+        post_attn_norm_w=post_attn_norm_w,
+        gate_W=gate_W, up_W=up_W, down_W=down_W,
+        gate_A=fa_gate_A, gate_B=fa_gate_B,
+        up_A=fa_up_A, up_B=fa_up_B,
+        down_A=fa_down_A, down_B=fa_down_B,
+        lora_scaling=lora_scaling, rms_eps=rms_eps,
     )
+    # mlp_out["dh_post_attn"] is the gradient flowing into the attention
+    # output residual stream — this is the upstream for the attention bwd.
+
+    attn_out = layer_attn_bwd_fa(
+        hidden_in=hidden_in,
+        h_post_attn=h_post_attn,
+        dh_post_attn=mlp_out["dh_post_attn"],
+        input_norm_w=input_norm_w,
+        q_W=q_W, k_W=k_W, v_W=v_W,
+        q_nw=q_nw, k_nw=k_nw, o_W=o_W,
+        q_A=fa_q_A, q_B=fa_q_B,
+        k_A=fa_k_A, k_B=fa_k_B,
+        v_A=fa_v_A, v_B=fa_v_B,
+        o_A=fa_o_A, o_B=fa_o_B,
+        lora_scaling=lora_scaling, rms_eps=rms_eps,
+    )
+
+    return {
+        "dh_in":      attn_out["dh_in"],
+        "grad_q_A":   attn_out["grad_q_A"],   "grad_q_B":   attn_out["grad_q_B"],
+        "grad_k_A":   attn_out["grad_k_A"],   "grad_k_B":   attn_out["grad_k_B"],
+        "grad_v_A":   attn_out["grad_v_A"],   "grad_v_B":   attn_out["grad_v_B"],
+        "grad_o_A":   attn_out["grad_o_A"],   "grad_o_B":   attn_out["grad_o_B"],
+        "grad_gate_A": mlp_out["grad_gate_A"], "grad_gate_B": mlp_out["grad_gate_B"],
+        "grad_up_A":   mlp_out["grad_up_A"],   "grad_up_B":   mlp_out["grad_up_B"],
+        "grad_down_A": mlp_out["grad_down_A"], "grad_down_B": mlp_out["grad_down_B"],
+    }
 
 
 # ---------------------------------------------------------------------------
