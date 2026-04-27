@@ -237,18 +237,23 @@ HF/torch reference RL loop (stand-in for SGLang + torch-PEFT). The
 incumbent here is HF transformers + fla (Triton chunk_gated_delta_rule)
 + PEFT + torch.optim.AdamW — i.e. the **optimized torch stack** on B200.
 
-Numbers (B200, batch=4, S=128, gen=64, 2026-04-27 rerun with fla
-properly available + hybrid DN routing live):
+Numbers (B200, batch=4, S=128, gen=64, 2026-04-27 with fla available,
+hybrid DN routing live, **prefill-based rollout (Tier 0.1 landed)**):
 
 | stage                                    | incumbent | ours    | speedup |
 |:-----------------------------------------|:---------:|:-------:|:-------:|
-| (A) sample 64 tokens (greedy)            | 1944.7 ms |  210.0 ms | **9.26×** |
-| (B) training step (batch=4, seq=128)     |  517.0 ms |  517.0 ms |  1.00× by construction |
-| (C) combined RL step = sample + train    | 2461.7 ms |  726.9 ms | **3.39×** |
+| (A) sample 64 tokens (greedy)            | 2103.5 ms |   77.4 ms | **27.18×** |
+| (B) training step (batch=4, seq=128)     |  471.0 ms |  471.0 ms |  1.00× by construction |
+| (C) combined RL step = sample + train    | 2574.5 ms |  548.4 ms | **4.69×** |
 
-**The 3× Phase-5 target is met (3.39×).** All of the win is on the
-sampling side — the megakernel decode + cuBLAS+graph prefill path is
-9.26× faster than HF generate on the same weights. The training step
+**Phase-5 target cleared (4.69× over HF+fla).** All of the win is on
+the sampling side — the megakernel decode + cuBLAS+graph prefill path
+is 27× faster than HF generate on the same weights. Prior to Tier 0.1
+the rollout was running the prompt one token at a time through
+decode_kernel (127 launches × 1 ms for a 128-token prompt) instead of
+using the existing `prefill_bf16` op (single dispatch, ~6.5 ms);
+landing Tier 0.1 cut sampling from 210 ms to 77 ms (2.73×) and lifted
+combined from 3.39× → 4.69×. The training step
 is parity by construction: both sides use HF+PEFT for fwd+bwd and
 torch.optim.AdamW for the step, since `LoraMegakernelTrainer` routes
 training through fla's chunked Triton bwd via the hybrid DN router

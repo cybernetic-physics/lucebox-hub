@@ -79,15 +79,21 @@ because each item saves measurably more wall-time than the next.**
 
 ### Tier 0 — fix the wall, not the kernels (do these first)
 
-**0.1 — Use `prefill_bf16_with_lora` for the rollout prompt.**
-   - Replace `for tid in prompt[:-1]: decoder.step(tid)` with one
-     prefill call into the same `dn_states` / `fa_k_cache` /
-     `fa_v_cache` buffers the decoder uses.
-   - Rollout 206 ms → ~85 ms = **2.4× faster sampling.**
-   - Combined RL step 727 ms → ~600 ms = **4.1× over HF+fla** (vs
-     today's 3.39×).
-   - Effort: ~1 day. The op already exists; needs a glue path that
-     populates the Decoder's internal state from prefill output.
+**0.1 — Use `prefill_bf16` for the rollout prompt. ✅ SHIPPED 2026-04-27.**
+   - Added `Decoder.prefill(prompt_ids)` that calls the existing
+     `prefill_bf16` op into the decoder's KV/DN/conv state buffers,
+     then continues with `decoder.step()` for generation only.
+   - **Measured:** rollout 209 ms → 76 ms = **2.73× faster sampling**.
+     E2E RL step 727 ms → 548 ms = **4.69× over HF+fla** (was 3.39×).
+     Sampling vs HF: 27.18× (was 9.26×).
+   - `test_prefill_sample.py` confirms the prefill path is deterministic
+     and matches the legacy step path on short gens (long gens drift
+     within bf16 noise; cooperative-kernel atomic-barrier ordering
+     means the legacy step path is itself non-deterministic at long S).
+   - Hot-swappable LoRA into the rollout (using `prefill_bf16_with_lora`
+     instead of the base op) is a Phase 5 follow-up — today's `.sample()`
+     uses the FROZEN base model regardless of registered LoRA sessions,
+     same as before this change.
 
 **0.2 — Replace HF+PEFT training path with our cuBLAS+graph forward
 + existing custom backward kernels.**

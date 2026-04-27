@@ -295,6 +295,34 @@ def _pack_layer_weights_nvfp4(layer_data, group_size):
     return torch.frombuffer(buf, dtype=torch.uint8).cuda()
 
 
+def _alloc_prefill_buffers(max_tokens: int) -> dict:
+    """Allocate the scratch buffers prefill_bf16 writes into.
+
+    Mirrors final_bench.alloc_prefill_buffers; kept here so Decoder.prefill
+    can self-manage its own buffers without the bench script being in scope.
+    """
+    bf16 = dict(dtype=torch.bfloat16, device="cuda")
+    f32 = dict(dtype=torch.float32, device="cuda")
+    i32 = dict(dtype=torch.int32, device="cuda")
+    mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
+    return dict(
+        hidden=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        residual=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        normalized=torch.empty(max_tokens * HIDDEN_SIZE, **bf16),
+        proj_buf=torch.empty(max_tokens * mx, **bf16),
+        proj_buf2=torch.empty(max_tokens * mx, **bf16),
+        attn_buf=torch.empty(max_tokens * max(FA_Q_SIZE, FA_KV_SIZE), **bf16),
+        mlp_buf=torch.empty(max_tokens * INTERMEDIATE_SIZE, **bf16),
+        dn_out_buf=torch.empty(max_tokens * DN_V_SIZE, **bf16),
+        beta_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+        alpha_buf=torch.empty(max_tokens * DN_NUM_HEADS, **f32),
+        final_normed=torch.empty(HIDDEN_SIZE, **bf16),
+        hidden_bf16_out=torch.empty(HIDDEN_SIZE, **bf16),
+        lm_bmv=torch.empty(1024, **f32),
+        lm_bmi=torch.empty(1024, **i32),
+    )
+
+
 class Decoder:
     """Stateful decoder for Qwen3.5-0.8B megakernel backends."""
 
@@ -415,17 +443,92 @@ class Decoder:
         self._dn_states.zero_()
         self._conv_bufs.zero_()
 
-    def generate(self, prompt: str, max_tokens: int = 100) -> str:
+    def prefill(self, prompt_ids) -> int:
+        """Process a multi-token prompt via the cuBLAS+graph prefill kernel.
+
+        Equivalent in semantics to ``reset()`` followed by
+        ``[step(t) for t in prompt_ids]``, but in one dispatch instead
+        of one decode kernel per token. Populates the KV cache, DN
+        recurrent state, and conv ring buffers; returns the predicted
+        next token id (the would-be output of ``step(prompt_ids[-1])``).
+
+        BF16 backend only — NVFP4 prefill is not yet implemented in the
+        kernel extension.
+        """
+        if self.backend == "nvfp4":
+            raise NotImplementedError(
+                "Decoder.prefill is not implemented for the NVFP4 backend; "
+                "fall back to per-token step() for NVFP4."
+            )
+
+        if isinstance(prompt_ids, torch.Tensor):
+            ids_t = prompt_ids.to(dtype=torch.int32, device="cuda").contiguous()
+        else:
+            ids_t = torch.tensor(list(prompt_ids), dtype=torch.int32, device="cuda")
+        prompt_len = ids_t.numel()
+        if prompt_len == 0:
+            raise ValueError("Decoder.prefill: prompt_ids must be non-empty")
+        if prompt_len > MAX_SEQ_LEN:
+            raise ValueError(
+                f"Decoder.prefill: prompt_len={prompt_len} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}"
+            )
+
+        bufs = self._get_prefill_buffers(prompt_len)
         self.reset()
+        _prefill_bf16(
+            self._out_token,
+            ids_t,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._fa_k_cache,
+            self._fa_v_cache,
+            self._dn_states,
+            self._conv_bufs,
+            bufs["hidden"],
+            bufs["residual"],
+            bufs["normalized"],
+            bufs["proj_buf"],
+            bufs["proj_buf2"],
+            bufs["attn_buf"],
+            bufs["mlp_buf"],
+            bufs["dn_out_buf"],
+            bufs["beta_buf"],
+            bufs["alpha_buf"],
+            bufs["final_normed"],
+            bufs["hidden_bf16_out"],
+            bufs["lm_bmv"],
+            bufs["lm_bmi"],
+        )
+        self._hidden.copy_(bufs["hidden_bf16_out"])
+        self._position = prompt_len
+        return self._out_token.item()
+
+    def _get_prefill_buffers(self, max_tokens: int) -> dict:
+        """Lazy-allocate (and grow) the prefill scratch buffers."""
+        cap = getattr(self, "_prefill_buf_capacity", 0)
+        if cap < max_tokens:
+            self._prefill_buffers = _alloc_prefill_buffers(max_tokens)
+            self._prefill_buf_capacity = max_tokens
+        return self._prefill_buffers
+
+    def generate(self, prompt: str, max_tokens: int = 100) -> str:
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-        for tid in ids[:-1]:
-            self.step(tid)
+        if self.backend == "bf16" and len(ids) > 1:
+            # prefill the entire prompt; pred is the model's prediction at
+            # position len(ids), i.e. the would-be first generated token.
+            pred = self.prefill(ids)
+        else:
+            self.reset()
+            for tid in ids[:-1]:
+                self.step(tid)
+            pred = self.step(ids[-1])
         out = []
-        next_id = ids[-1]
         eos = self.tokenizer.eos_token_id
         for _ in range(max_tokens):
-            next_id = self.step(next_id)
-            if next_id == eos:
+            if pred == eos:
                 break
-            out.append(next_id)
+            out.append(pred)
+            pred = self.step(pred)
         return self.tokenizer.decode(out, skip_special_tokens=True)

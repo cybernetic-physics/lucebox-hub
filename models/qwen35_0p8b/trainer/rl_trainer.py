@@ -163,23 +163,33 @@ class LoraMegakernelTrainer:
         """
         self._ensure_decoder()
         decoder = self._decoder
+        eos = self._tokenizer.eos_token_id
+
+        # Prefill the prompt via cuBLAS+graph (one dispatch instead of one
+        # decode kernel per prompt token). NVFP4 backend doesn't have a
+        # prefill kernel yet — fall back to the per-token loop there.
+        use_prefill = decoder.backend == "bf16" and len(prompt_tokens) > 1
 
         sequences = []
         for _ in range(num_samples):
-            decoder.reset()
-            # Prefill prompt (feed all but the last token via `step`).
-            for tid in prompt_tokens[:-1]:
-                decoder.step(int(tid))
-            next_id = int(prompt_tokens[-1])
+            if use_prefill:
+                pred = decoder.prefill(prompt_tokens)
+            else:
+                decoder.reset()
+                for tid in prompt_tokens[:-1]:
+                    decoder.step(int(tid))
+                pred = decoder.step(int(prompt_tokens[-1]))
+
             out_ids: list[int] = []
-            eos = self._tokenizer.eos_token_id
+            stop_reason = "max_tokens"
             for _ in range(max_tokens):
-                next_id = decoder.step(int(next_id))
-                if next_id == eos:
+                if pred == eos:
+                    stop_reason = "eos"
                     break
-                out_ids.append(int(next_id))
+                out_ids.append(int(pred))
+                pred = decoder.step(int(pred))
             sequences.append({
-                "stop_reason": "eos" if next_id == eos else "max_tokens",
+                "stop_reason": stop_reason,
                 "tokens": out_ids,
                 "logprobs": None,
             })
