@@ -8,51 +8,72 @@ which pulls combined RL step toward ~18× over HF+fla.
 
 ## Wall-time bench (`bench_kernel_bwd.py`)
 
-After hand-rolled FA bwd shipped (2026-04-27, this commit):
+After hand-rolled DN bwd shipped (2026-04-27, this commit):
 
 ```
 path                                   ms/step
 --------------------------------------------------
-HF+PEFT autograd (default)              548.4ms
-Kernel-driven Slice B.3b                663.1ms
+HF+PEFT autograd (default)              609.2ms
+Kernel-driven Slice B.3b                558.8ms
 --------------------------------------------------
-Kernel path is 1.21× slower (was 1.33× pre-handrolled-FA-bwd).
+Kernel path is 1.09× FASTER than HF+PEFT.
 ```
 
-The hand-rolled FA bwd (replaces autograd-through-recomputed-SDPA with
-direct cuDNN FA-2 bwd + manual reverse-RoPE / reverse-QKnorm / reverse-
-gate / kernel-driven LoRA bwd / kernel-driven RMSnorm bwd) recovered
-~10 ms/step from the FA path.
+Progression across this session:
 
-### DN bwd headroom (investigated, then deprioritized)
+| commit              | kernel path | vs HF+PEFT       |
+|---------------------|-------------|------------------|
+| pre-FA-handrolled   |  674.5 ms   | 1.33× SLOWER     |
+| FA bwd handrolled   |  663.1 ms   | 1.21× slower     |
+| **DN bwd handrolled** |  **558.8 ms** | **1.09× FASTER** |
 
-Profiled per-layer DN bwd at the bench shape:
+The hand-rolled DN bwd (`dn_attn_handrolled.py`) replaces the autograd-
+through-HF.linear_attn path with a Python forward that calls fla's
+`chunk_gated_delta_rule_fwd / _bwd` directly (skipping autograd's
+2.1× wrapping overhead) and chains through manual silu / conv1d /
+sigmoid / softplus / RMSNormGated / linear bwds. 1.48× faster per
+DN call vs the autograd path; cos > 0.9998 vs HF reference.
 
-```
-calls                  72/step (4 items × 18 DN layers)
-mlp_bwd          ~1.41 ms/call (kernel-driven; already optimal)
-recompute_fwd    ~2.08 ms/call (autograd through HF.linear_attn)
-bwd              ~3.72 ms/call (autograd, fla's chunked Triton bwd)
-```
+The hand-rolled FA bwd (`layer_attn_bwd_fa_handrolled`) similarly
+replaces autograd-through-recomputed-SDPA with direct cuDNN FA-2 bwd
++ manual reverse-RoPE / reverse-QKnorm / reverse-gate / kernel-driven
+LoRA bwd / kernel-driven RMSnorm bwd.
 
-The "recompute" piece looked like Python overhead, but a hand-rolled
-manual DN forward (skipping HF's wrappers, running the same fla op +
-GEMMs + conv1d directly) showed only **1.04× speedup** — i.e. virtually
-all of the 2 ms is genuine compute. fla's `chunk_gated_delta_rule` IS
-already calling fast Triton kernels.
+### DN bwd headroom (resolved 2026-04-27)
 
-The realistic remaining wins for DN bwd are:
-1. Save fla's intermediate state (h_chunks, dh_chunks) during the kernel
-   forward and feed it to fla's underlying Triton bwd directly,
-   eliminating ~2 ms × 72 = ~144 ms forward recompute. Requires deeper
-   integration with fla's chunked GDR kernel internals.
-2. Batch the 4 items into a single varlen FA-2 forward + 1 bwd over all
-   18 layers, amortizing Python overhead across items (rather than
-   running 4 separate per-item bwd passes today).
+Direct fla calls vs autograd: 2.82 ms/call (autograd) vs 1.35 ms/call
+(direct fwd+bwd) vs 0.74 ms/call (direct bwd only). The autograd
+overhead through `chunk_gated_delta_rule.apply` was the ~150 ms culprit.
 
-Both are multi-day efforts. Current path's 1.21× slowdown is acceptable
-as the kernel-bwd validated correctness baseline; further DN-bwd
-optimization waits behind those investments.
+`dn_attn_handrolled.py` reproduces HF's linear_attn forward in Python
+(matching cos > 0.9999 against HF's autograd path), saves intermediates,
+and runs a hand-rolled bwd that calls `chunk_gated_delta_rule_bwd`
+directly. Per-call timing: 5.5 ms (HF autograd) → 3.7 ms (ours) =
+**1.48×**.
+
+Forward chain:
+  input rmsnorm → [in_proj_qkv | in_proj_z | in_proj_b | in_proj_a]
+  → causal-conv1d → silu → split(q,k,v) → reshape per head
+  → l2norm_fwd(q), l2norm_fwd(k)
+  → sigmoid(b) = beta;  -A_log.exp() * softplus(a + dt_bias) = g_log
+  → chunk_gated_delta_rule_fwd(q_l2, k_l2, v, g_log, beta) = y_pre
+  → RMSNorm(y_pre, dn_norm_W) * silu(z) = attn_pre_o
+  → out_proj  = attn_out
+
+Backward chain (manual chain rule, no autograd):
+  out_proj^T · d_attn_out → d_attn_pre_o
+  reverse RMSNormGated (rmsnorm bwd + silu(z) bwd) → d_y_pre, d_z
+  chunk_gated_delta_rule_bwd → dq, dk, dv, dbeta, dg
+  l2norm_bwd → pre-l2norm dq, dk
+  reshape + concat → dqkv_post_silu
+  silu_bwd → d(qkv_pre_silu)
+  conv_transpose1d → d(qkv_raw)  (depthwise causal conv bwd)
+  in_proj_qkv^T · d(qkv_raw) → d_npa_from_qkv  (no LoRA on DN attn)
+  in_proj_z^T · d_z          → d_npa_from_z
+  sigmoid_bwd · in_proj_b^T  → d_npa_from_b
+  softplus_bwd · in_proj_a^T → d_npa_from_a
+  Σ → d_npa
+  input rmsnorm bwd → d_h_in
 
 **Why slower:** the autograd-based interior in `per_layer_bwd_dn`
 recomputes the HF GatedDeltaNet forward inside the bwd to get the

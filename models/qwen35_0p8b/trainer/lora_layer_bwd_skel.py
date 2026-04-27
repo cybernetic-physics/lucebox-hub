@@ -764,10 +764,7 @@ def per_layer_bwd_dn(
     normalized_post_attn: torch.Tensor,   # [S, HIDDEN] bf16
     mlp_inter: torch.Tensor,              # [S, INTER]  bf16
     h_post_attn: torch.Tensor,            # [S, HIDDEN] bf16
-    # HF layer module — used to run the DN attention forward under
-    # autograd. Provides: input_layernorm, linear_attn (the
-    # Qwen3NextGatedDeltaNet), and post-attn norm (consumed via
-    # post_attn_norm_w arg below).
+    # HF layer module — used to read the DN attention base weights.
     hf_layer,
     # Frozen MLP base weights:
     post_attn_norm_w: torch.Tensor,       # [HIDDEN]
@@ -785,7 +782,15 @@ def per_layer_bwd_dn(
     Returns:
         dh_in: [S, HIDDEN] fp32 — gradient flowing OUT of this layer
         grad_dn_{gate,up,down}_{A,B}: 6 LoRA grads for the MLP block
+
+    DN attention block uses :func:`dn_attn_handrolled` which calls fla's
+    chunk_gated_delta_rule_fwd / _bwd directly (skipping autograd's
+    wrapping overhead). 1.48× faster than autograd-through-HF.
     """
+    # Lazy import — avoids loading fla at module-load time for callers
+    # that only use the FA reverse walk.
+    from dn_attn_handrolled import dn_attn_forward, dn_attn_backward
+
     # MLP block bwd via our kernel (identical to FA's MLP path).
     mlp_out = layer_mlp_bwd(
         h_post_attn=h_post_attn,
@@ -800,20 +805,39 @@ def per_layer_bwd_dn(
         lora_scaling=lora_scaling, rms_eps=rms_eps,
     )
 
-    # DN attention block bwd via autograd through HF's actual layer.
-    # We need to backward from d(attn_out) (= dh_through_attn) through
-    # input_layernorm + linear_attn (= Qwen3NextGatedDeltaNet).
-    h_in = hidden_in.unsqueeze(0).detach().clone().requires_grad_(True)  # [1, S, HIDDEN]
-    npa = hf_layer.input_layernorm(h_in)
-    attn_out = hf_layer.linear_attn(npa)
-    h_post_attn_recomp = h_in + attn_out
-    # Upstream gradient is mlp_out["dh_post_attn"] in [S, HIDDEN] fp32;
-    # HF expects [B=1, S, HIDDEN] in the same dtype as h_post_attn.
-    upstream = mlp_out["dh_post_attn"].unsqueeze(0).to(h_post_attn_recomp.dtype)
-    h_post_attn_recomp.backward(upstream)
+    # DN attention block: hand-rolled forward + manual fla-bwd.
+    # The forward includes input_layernorm; bwd returns dh_in directly.
+    input_norm = hf_layer.input_layernorm
+    dn = hf_layer.linear_attn
+    rms_eps_in = getattr(input_norm, "eps",
+                          getattr(input_norm, "variance_epsilon", rms_eps))
+    rms_eps_dn = getattr(dn.norm, "eps",
+                          getattr(dn.norm, "variance_epsilon", rms_eps))
+    h_in_b = hidden_in.unsqueeze(0).contiguous()                       # [1, S, HIDDEN]
+    _attn_out, saves = dn_attn_forward(
+        h_in_b,
+        input_norm_w=input_norm.weight,
+        in_proj_qkv_W=dn.in_proj_qkv.weight,
+        in_proj_z_W=dn.in_proj_z.weight,
+        in_proj_b_W=dn.in_proj_b.weight,
+        in_proj_a_W=dn.in_proj_a.weight,
+        conv1d_W=dn.conv1d.weight,
+        A_log=dn.A_log, dt_bias=dn.dt_bias,
+        dn_norm_W=dn.norm.weight,
+        out_proj_W=dn.out_proj.weight,
+        rms_eps=rms_eps_in, layer_norm_eps=rms_eps_dn,
+    )
+    # Upstream is dh_post_attn (mlp + attention contribution to the
+    # residual stream's outgoing gradient). dn_attn_backward returns
+    # gradient on the residual-stream input via the input-norm path;
+    # we add the residual-skip term separately.
+    d_attn_out_b = mlp_out["dh_post_attn"].unsqueeze(0)                 # [1, S, HIDDEN] fp32
+    dh_in_through_attn = dn_attn_backward(d_attn_out_b, saves)[0]       # [S, HIDDEN] fp32
+    # Residual: h_post_attn = h_in + attn_out, so d(h_in)_via_residual = d(h_post_attn).
+    dh_in = dh_in_through_attn + mlp_out["dh_post_attn"]
 
     return {
-        "dh_in":         h_in.grad[0].detach(),
+        "dh_in":         dh_in,
         "grad_dn_gate_A": mlp_out["grad_gate_A"], "grad_dn_gate_B": mlp_out["grad_gate_B"],
         "grad_dn_up_A":   mlp_out["grad_up_A"],   "grad_dn_up_B":   mlp_out["grad_up_B"],
         "grad_dn_down_A": mlp_out["grad_down_A"], "grad_dn_down_B": mlp_out["grad_down_B"],
