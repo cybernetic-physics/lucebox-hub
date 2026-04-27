@@ -93,6 +93,43 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
 }
 
+// ===== state transpose for the chunked DN forward path =====
+//
+// The recurrence kernel stores DN state as [H, Dv, Dk] (V outer, K inner;
+// `my_state[j*Dk + k]` = state[h, V=j, K=k]). The chunked kernel reads /
+// writes [H, Dk, Dv] (K outer, V inner). When we route a layer through
+// the chunked path we transpose into a scratch buffer, run the chunked
+// kernel, then transpose back. Cost is O(Dk*Dv) reads/writes per layer
+// — ~1 MB per pass at H=16, Dk=Dv=128 — dwarfed by the recurrence work
+// it replaces.
+__global__ void pf_dn_state_transpose(const float *src, float *dst,
+                                      int H, int outer, int inner) {
+    int h = blockIdx.x;
+    int N = outer * inner;
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    const float *s = src + h * N;
+    float *d = dst + h * N;
+    for (int idx = tid; idx < N; idx += nt) {
+        int i = idx / inner;       // outer index in src
+        int j = idx - i * inner;   // inner index in src
+        d[j * outer + i] = s[i * inner + j];
+    }
+}
+
+// ===== decay -> g converter for the chunked DN forward path =====
+// pf_dn_prep writes alpha_buf as `decay = exp(-exp(a_log)*softplus(...))`,
+// which the per-step recurrence kernel uses directly. The chunked kernel
+// (dn_chunked.cu) instead takes `g = log(decay) = -exp(a_log)*softplus(...)`
+// and computes the per-chunk cumsum of g internally for tensor-core speed.
+// Rather than threading a second alpha_buf through the layer body, we
+// invert the final exp on-demand right before launching the chunked
+// kernel — in place, since decay isn't needed afterwards.
+__global__ void pf_decay_to_g(float *buf, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) buf[i] = logf(buf[i]);
+}
+
 // ===== DeltaNet per-step prep kernel =====
 //
 // Before the V-split recurrence runs its per-step loop, precompute the
@@ -928,6 +965,20 @@ extern "C" void launch_fa_attn_aten(
     int max_seq,
     cudaStream_t stream);
 
+// Chunked DeltaNet forward — defined in dn_chunked.cu. Replaces the
+// serial-over-t pf_deltanet_recurrence_vsplit_prepped path with a
+// chunk-parallel bf16 tensor-core kernel. q/k/v are read directly out
+// of prefill's interleaved qkv_proj scratch via the stride params.
+extern "C" cudaError_t launch_dn_chunked_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g, const float *state_in,
+    __nv_bfloat16 *y, float *state_out,
+    float *state_chunks,
+    int S, int H,
+    int qkd_stride, int v_stride, int bd_stride,
+    int y_stride,
+    cudaStream_t stream);
+
 static void cublas_bf16_gemm(cublasHandle_t h,
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
     int S, int N, int K) {
@@ -1030,10 +1081,70 @@ static void prefill_bf16_body(
             int v_slice = DN_V_SIZE / num_v_splits;
             int nwarps_want = dn_block_size / 32;
             while (v_slice < nwarps_want) { dn_block_size >>= 1; nwarps_want = dn_block_size / 32; }
-            pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
-                proj_buf, beta_buf, alpha_buf,
-                dn_states + dn_idx*dn_stride,
-                dn_out_buf, S, num_v_splits);
+
+            // Chunked DN forward via bf16 tensor cores (dn_chunked.cu) —
+            // chunk-parallel, ~3-5x faster than the serial-over-t recurrence
+            // at S>=1k. Default behavior:
+            //   MEGAKERNEL_DN_CHUNKED unset / "0" -> recurrence (default)
+            //   MEGAKERNEL_DN_CHUNKED = "1"       -> chunked
+            //   MEGAKERNEL_DN_CHUNKED = "auto"    -> chunked when S>=1024
+            bool use_chunked = false;
+            if (const char *env = std::getenv("MEGAKERNEL_DN_CHUNKED")) {
+                if (env[0] == '1') use_chunked = true;
+                else if (env[0] == 'a' || env[0] == 'A') use_chunked = (S >= 1024);
+            }
+
+            if (use_chunked) {
+                // pf_dn_prep wrote `decay` to alpha_buf; the chunked kernel
+                // wants `g = log(decay)`. Convert in-place.
+                int conv_blocks = (S * DN_HEADS + 255) / 256;
+                pf_decay_to_g<<<conv_blocks, 256, 0, stream>>>(alpha_buf, S * DN_HEADS);
+
+                // Transpose state from recurrence layout [H, Dv, Dk] into
+                // chunked layout [H, Dk, Dv] in a lazily-allocated scratch.
+                static float *g_dn_state_scratch = nullptr;
+                if (!g_dn_state_scratch) {
+                    cudaMalloc(&g_dn_state_scratch,
+                               (size_t)DN_HEADS * DN_KEY * DN_VAL * sizeof(float));
+                }
+                float *state_layer = dn_states + dn_idx*dn_stride;
+                pf_dn_state_transpose<<<DN_HEADS, 256, 0, stream>>>(
+                    state_layer, g_dn_state_scratch,
+                    DN_HEADS, DN_VAL, DN_KEY);
+
+                // q / k / v slices live inside qkv_proj at offsets
+                //   q : 0
+                //   k : DN_QK_SIZE
+                //   v : 2 * DN_QK_SIZE
+                // with stride DN_CONV_CH between successive S rows. y goes
+                // to dn_out_buf which has stride DN_V_SIZE.
+                launch_dn_chunked_fwd(
+                    proj_buf,                                // q
+                    proj_buf + DN_QK_SIZE,                   // k
+                    proj_buf + 2 * DN_QK_SIZE,               // v
+                    beta_buf, alpha_buf,                     // g (now log(decay))
+                    g_dn_state_scratch,                      // state_in [H,Dk,Dv]
+                    dn_out_buf,                              // y
+                    g_dn_state_scratch,                      // state_out [H,Dk,Dv]
+                    nullptr,                                 // state_chunks (training-only)
+                    S, DN_HEADS,
+                    /*qkd_stride=*/DN_CONV_CH,
+                    /*v_stride=*/  DN_CONV_CH,
+                    /*bd_stride=*/ DN_HEADS,
+                    /*y_stride=*/  DN_V_SIZE,
+                    stream);
+
+                // Transpose state back into recurrence layout for the next
+                // call (decode kernel + the same layer's next prefill).
+                pf_dn_state_transpose<<<DN_HEADS, 256, 0, stream>>>(
+                    g_dn_state_scratch, state_layer,
+                    DN_HEADS, DN_KEY, DN_VAL);
+            } else {
+                pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
+                    proj_buf, beta_buf, alpha_buf,
+                    dn_states + dn_idx*dn_stride,
+                    dn_out_buf, S, num_v_splits);
+            }
             // Gnorm + silu-mul with z, applied across full V per (t, head).
             pf_deltanet_gnorm<<<S * DN_HEADS, 128, 0, stream>>>(
                 dn_out_buf, proj_buf2, dn_norm, S);

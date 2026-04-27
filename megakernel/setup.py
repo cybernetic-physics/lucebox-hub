@@ -42,6 +42,7 @@ sources = [
     "kernel.cu",
     "prefill.cu",
     "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
+    "dn_chunked.cu",     # chunked DN forward (bf16 tensor cores) used by prefill.cu
 ]
 libraries = ["cublas"]
 cxx_args = ["-O3"]
