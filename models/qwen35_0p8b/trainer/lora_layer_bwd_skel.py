@@ -265,6 +265,20 @@ def _qwen_rms(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tens
     return (x_f * rstd * (1.0 + w.float())).to(x.dtype)
 
 
+def _qwen_rope_cs(S: int, device, dtype=torch.float32):
+    """Pre-compute Qwen3-Next RoPE cos/sin tables.
+
+    Returns (cos, sin) each of shape [S, ROT_DIM/2] in `dtype`.
+    """
+    half = _FA_ROT_DIM // 2
+    pos = torch.arange(S, device=device, dtype=dtype)
+    i = torch.arange(half, device=device, dtype=dtype)
+    fe = 2.0 * i / _FA_ROT_DIM
+    inv_theta = 1.0 / (_FA_ROPE_THETA ** fe)            # [half]
+    angles = pos.unsqueeze(1) * inv_theta.unsqueeze(0)  # [S, half]
+    return torch.cos(angles), torch.sin(angles)
+
+
 def _qwen_rope(x: torch.Tensor) -> torch.Tensor:
     """Apply Qwen3-Next RoPE to ``x`` of shape [S, num_heads, FA_HEAD_DIM].
     Only the first FA_ROT_DIM (=64) dimensions of each head get rotated.
@@ -273,14 +287,7 @@ def _qwen_rope(x: torch.Tensor) -> torch.Tensor:
     S, H, D = x.shape
     assert D == _FA_HEAD_DIM, f"expected head_dim={_FA_HEAD_DIM}, got {D}"
     half = _FA_ROT_DIM // 2
-    pos = torch.arange(S, device=x.device, dtype=torch.float32)
-    # freq[i] for i ∈ [0, half) is 1/theta^(2*i/ROT_DIM).
-    i = torch.arange(half, device=x.device, dtype=torch.float32)
-    fe = 2.0 * i / _FA_ROT_DIM
-    inv_theta = 1.0 / (_FA_ROPE_THETA ** fe)            # [half]
-    angles = pos.unsqueeze(1) * inv_theta.unsqueeze(0)  # [S, half]
-    cos = torch.cos(angles)                              # [S, half]
-    sin = torch.sin(angles)
+    cos, sin = _qwen_rope_cs(S, x.device, dtype=torch.float32)
     x_f = x.float()
     rot = x_f[..., :_FA_ROT_DIM]      # [S, H, ROT_DIM]
     pass_ = x_f[..., _FA_ROT_DIM:]    # [S, H, D-ROT_DIM]  no rotation
@@ -293,6 +300,33 @@ def _qwen_rope(x: torch.Tensor) -> torch.Tensor:
     rot_new = torch.cat([a_new, b_new], dim=-1)
     out = torch.cat([rot_new, pass_], dim=-1)
     return out.to(x.dtype)
+
+
+def _qwen_rope_bwd(dy: torch.Tensor) -> torch.Tensor:
+    """Backward of _qwen_rope. Given d/dy(out)·dy, return dx.
+
+    Forward (per pair):  a_new = a·cos − b·sin;  b_new = b·cos + a·sin
+    Backward:            da    = da_new·cos + db_new·sin
+                         db    = -da_new·sin + db_new·cos
+    The pass-through tail copies straight back.
+
+    Returns fp32 tensor of the same [S, H, D] shape as `dy`.
+    """
+    S, H, D = dy.shape
+    assert D == _FA_HEAD_DIM
+    half = _FA_ROT_DIM // 2
+    cos, sin = _qwen_rope_cs(S, dy.device, dtype=torch.float32)
+    dy_f = dy.float()
+    rot = dy_f[..., :_FA_ROT_DIM]
+    pass_ = dy_f[..., _FA_ROT_DIM:]
+    da_new = rot[..., :half]
+    db_new = rot[..., half:]
+    cos_b = cos.unsqueeze(1)
+    sin_b = sin.unsqueeze(1)
+    da = da_new * cos_b + db_new * sin_b
+    db = -da_new * sin_b + db_new * cos_b
+    rot_back = torch.cat([da, db], dim=-1)
+    return torch.cat([rot_back, pass_], dim=-1)
 
 
 def layer_attn_bwd_fa(
@@ -414,6 +448,202 @@ def layer_attn_bwd_fa(
 
 
 # ---------------------------------------------------------------------------
+# Hand-rolled FA attention bwd (consumes saved Q/O/LSE + cache K/V)
+#
+# The autograd-based `layer_attn_bwd_fa` above recomputes the entire
+# attention forward sub-graph under torch autograd to get gradients.
+# That's correct but expensive — at S=512 it costs ~30ms per FA layer.
+#
+# This function eliminates the recompute by reading:
+#     fa_q_save  : post-RoPE/QKnorm Q (gate stripped)        [S, Hq, D] bf16
+#     fa_o_save  : FA output before sigmoid-gate is applied  [S, Hq, D] bf16
+#     fa_lse_save: cuDNN's log-sum-exp                       [Hq, S]    fp32
+#     k_cache_layer_S : post-RoPE/QKnorm K, sliced to S      [Hk, S, D] bf16
+#     v_cache_layer_S : V (no RoPE)                          [Hk, S, D] bf16
+#
+# Backward chain:
+#   dh_post_attn → split: dh_in_residual + d_attn_out
+#   o_proj LoRA bwd                       (bwd_lora_linear)
+#   reverse-gate (sigmoid)                (elementwise)
+#   fa_bwd_flash(dO, Q, K, V, O, LSE)     (cuDNN FA-2 bwd)
+#   reverse-RoPE (Q & K)                  (elementwise)
+#   reverse-QKnorm (Q & K)                (bwd_rmsnorm × 2)
+#   q/k/v projection LoRA bwd × 3         (bwd_lora_linear × 3)
+#   sum dnpa contributions
+#   input rmsnorm bwd                     (bwd_rmsnorm)
+#   add to dh_in_residual
+# ---------------------------------------------------------------------------
+
+import math
+
+# Lazy import — fa_bwd_flash imports torch ops at module load.
+def _fa_bwd_flash():
+    from fa_bwd_flash import fa_backward_flash
+    return fa_backward_flash
+
+
+def layer_attn_bwd_fa_handrolled(
+    *,
+    hidden_in: torch.Tensor,            # [S, HIDDEN]   bf16 — input to this layer
+    normalized_in: torch.Tensor,        # [S, HIDDEN]   bf16 — output of input rmsnorm
+                                          #   (= input to qkv projections)
+    attn_out_pre_o: torch.Tensor,       # [S, FA_Q_SIZE]bf16 — input to o_proj
+    fa_q_save: torch.Tensor,            # [S, Hq, D]    bf16 — post-RoPE/QKnorm Q
+    fa_o_save: torch.Tensor,            # [S, Hq, D]    bf16 — FA output (no gate)
+    fa_lse_save: torch.Tensor,          # [Hq, S]       fp32
+    k_cache_layer_S: torch.Tensor,      # [Hk, S, D]    bf16 — post-RoPE/QKnorm K
+    v_cache_layer_S: torch.Tensor,      # [Hk, S, D]    bf16 — V (no RoPE)
+    dh_post_attn: torch.Tensor,         # [S, HIDDEN]   fp32 — gradient flowing in
+    # Frozen base weights for this layer:
+    input_norm_w: torch.Tensor,         # [HIDDEN]      bf16
+    q_W: torch.Tensor,                  # [FA_QPROJ, HIDDEN]      bf16 (Q+Gate)
+    k_W: torch.Tensor,                  # [FA_KV_SIZE, HIDDEN]    bf16
+    v_W: torch.Tensor,                  # [FA_KV_SIZE, HIDDEN]    bf16
+    q_nw: torch.Tensor,                 # [FA_HEAD_DIM]           bf16 (QK-norm gain)
+    k_nw: torch.Tensor,                 # [FA_HEAD_DIM]           bf16
+    o_W: torch.Tensor,                  # [HIDDEN, FA_Q_SIZE]     bf16
+    # LoRA tensors (single-layer slices):
+    q_A: torch.Tensor, q_B: torch.Tensor,
+    k_A: torch.Tensor, k_B: torch.Tensor,
+    v_A: torch.Tensor, v_B: torch.Tensor,
+    o_A: torch.Tensor, o_B: torch.Tensor,
+    lora_scaling: float,
+    rms_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Reverse walk of one FA layer's attention block — hand-rolled
+    (no torch autograd through the FA sub-graph).
+
+    Same return shape as :func:`layer_attn_bwd_fa`: the consumer is
+    interchangeable with the autograd-based version.
+
+    Side-effect-free: doesn't touch any of the input tensors.
+    """
+    fa_backward_flash = _fa_bwd_flash()
+
+    S = hidden_in.shape[0]
+    Hq, D = _FA_Q_HEADS, _FA_HEAD_DIM
+    Hk = _FA_KV_HEADS
+    H_R = _FA_GQA
+
+    # --- Step 1: residual split -----------------------------------------
+    # h_post_attn = h_in + attn_out, so:
+    #   dh_in_residual = dh_post_attn (one piece — to merge with norm path)
+    #   d_attn_out = dh_post_attn
+    dh_in_residual = dh_post_attn
+    d_attn_out = dh_post_attn
+
+    # --- Step 2: o_proj LoRA bwd ---------------------------------------
+    # attn_out = attn_pre_o @ o_W.T + scaling * (attn_pre_o @ oA) @ oB
+    # → d_attn_pre_o, grad_o_A, grad_o_B
+    d_attn_pre_o_flat, grad_o_A, grad_o_B = lora_linear_bwd(
+        x=attn_out_pre_o, A=o_A, B=o_B, base_W=o_W,
+        grad_y=d_attn_out, scaling=lora_scaling)
+    d_attn_pre_o = d_attn_pre_o_flat.view(S, Hq, D)            # [S, Hq, D] fp32
+
+    # --- Step 3: reverse-gate (sigmoid) --------------------------------
+    # Forward (elementwise): attn_pre_o = sigmoid(Gate) * attn_unfold
+    #   d_attn_unfold = sigmoid(Gate)         · d_attn_pre_o
+    #   d_Gate         = sigmoid'(Gate) · attn_unfold · d_attn_pre_o
+    #                  = sig·(1-sig) · attn_unfold · d_attn_pre_o
+    #
+    # Recompute Gate. q_raw = npa @ q_W.T + scaling·(npa @ qA)·qB; Gate
+    # is the second [S, Hq, D] half of q_raw.view(S, Hq, 2, D).
+    npa = normalized_in
+    q_raw_recomp = (npa @ q_W.t()
+                    + lora_scaling * (npa @ q_A) @ q_B)        # [S, FA_QPROJ_SIZE] bf16
+    q_packed_recomp = q_raw_recomp.view(S, Hq, 2, D)
+    Q_h_recomp = q_packed_recomp[:, :, 0, :].contiguous()      # [S, Hq, D] bf16 (pre-norm Q)
+    Gate_recomp = q_packed_recomp[:, :, 1, :]                  # [S, Hq, D] bf16
+
+    sig = torch.sigmoid(Gate_recomp.float())                   # [S, Hq, D] fp32
+    attn_unfold = fa_o_save.float()                            # [S, Hq, D] fp32
+    d_attn_unfold = sig * d_attn_pre_o                         # [S, Hq, D] fp32
+    d_Gate = (sig * (1.0 - sig)) * attn_unfold * d_attn_pre_o  # [S, Hq, D] fp32
+
+    # --- Step 4: fa_bwd_flash ------------------------------------------
+    # cuDNN FA-2 bwd consumes [B=1, Hq, S, D] for Q/K/V/O/dO and [1,Hq,S]
+    # for LSE. K/V are expanded to Hq via repeat_interleave.
+    Q_bhsd = fa_q_save.permute(1, 0, 2).unsqueeze(0).contiguous()   # [1, Hq, S, D] bf16
+    O_bhsd = fa_o_save.permute(1, 0, 2).unsqueeze(0).contiguous()   # [1, Hq, S, D] bf16
+    dO_bhsd = d_attn_unfold.to(torch.bfloat16).permute(1, 0, 2) \
+        .unsqueeze(0).contiguous()                                  # [1, Hq, S, D] bf16
+    K_bhsd = k_cache_layer_S.unsqueeze(0).contiguous()              # [1, Hk, S, D] bf16
+    V_bhsd = v_cache_layer_S.unsqueeze(0).contiguous()
+    K_e = K_bhsd.repeat_interleave(H_R, dim=1)                      # [1, Hq, S, D]
+    V_e = V_bhsd.repeat_interleave(H_R, dim=1)
+    LSE_bhs = fa_lse_save.unsqueeze(0).contiguous()                 # [1, Hq, S]   fp32
+
+    scale = 1.0 / math.sqrt(D)
+    dQ_bhsd, dK_bhsd, dV_bhsd = fa_backward_flash(
+        dO_bhsd, Q_bhsd, K_e, V_e, O_bhsd, LSE_bhs,
+        is_causal=True, scale=scale,
+        num_kv_heads=Hk,                                          # reduce dK/dV to Hk heads
+    )
+    # Permute back to [S, H, D].
+    dQ_post = dQ_bhsd.squeeze(0).permute(1, 0, 2).contiguous()    # [S, Hq, D] bf16
+    dK_post = dK_bhsd.squeeze(0).permute(1, 0, 2).contiguous()    # [S, Hk, D] bf16
+    dV_h    = dV_bhsd.squeeze(0).permute(1, 0, 2).contiguous()    # [S, Hk, D] bf16
+
+    # --- Step 5: reverse RoPE for Q and K ------------------------------
+    dQ_normed = _qwen_rope_bwd(dQ_post)                           # [S, Hq, D] fp32
+    dK_normed = _qwen_rope_bwd(dK_post)                           # [S, Hk, D] fp32
+
+    # --- Step 6: reverse QKnorm for Q and K ----------------------------
+    # rms_norm normalizes over the last axis (D). Our bwd_rmsnorm kernel
+    # accepts [S_flat, H_flat] with w[H_flat]; treat (S, head) as a flat
+    # batch dim and D as the norm axis.
+    Q_h_flat = Q_h_recomp.view(S * Hq, D).contiguous()
+    dQ_normed_flat = dQ_normed.contiguous().view(S * Hq, D)
+    dQ_h_flat = rmsnorm_bwd(Q_h_flat, q_nw, dQ_normed_flat, eps=rms_eps)  # [S*Hq, D] fp32
+    dQ_h = dQ_h_flat.view(S, Hq, D)
+
+    # K_h pre-norm — recompute from k_raw analogously to Q.
+    k_raw_recomp = (npa @ k_W.t()
+                    + lora_scaling * (npa @ k_A) @ k_B)            # [S, FA_KV_SIZE] bf16
+    K_h_recomp = k_raw_recomp.view(S, Hk, D).contiguous()
+    K_h_flat = K_h_recomp.view(S * Hk, D)
+    dK_normed_flat = dK_normed.contiguous().view(S * Hk, D)
+    dK_h_flat = rmsnorm_bwd(K_h_flat, k_nw, dK_normed_flat, eps=rms_eps)
+    dK_h = dK_h_flat.view(S, Hk, D)
+
+    # --- Step 7: pack dq_raw -------------------------------------------
+    # q_packed[:, :, 0, :] = Q_h ; q_packed[:, :, 1, :] = Gate
+    dq_packed = torch.empty(S, Hq, 2, D, dtype=torch.float32, device="cuda")
+    dq_packed[:, :, 0, :] = dQ_h
+    dq_packed[:, :, 1, :] = d_Gate
+    dq_raw = dq_packed.reshape(S, _FA_QPROJ_SIZE).contiguous()    # [S, FA_QPROJ_SIZE] fp32
+
+    dk_raw = dK_h.reshape(S, _FA_KV_SIZE).contiguous()
+    dv_raw = dV_h.reshape(S, _FA_KV_SIZE).to(torch.float32).contiguous()
+
+    # --- Step 8: q/k/v LoRA bwd ----------------------------------------
+    dnpa_q, grad_q_A, grad_q_B = lora_linear_bwd(
+        x=npa, A=q_A, B=q_B, base_W=q_W,
+        grad_y=dq_raw, scaling=lora_scaling)
+    dnpa_k, grad_k_A, grad_k_B = lora_linear_bwd(
+        x=npa, A=k_A, B=k_B, base_W=k_W,
+        grad_y=dk_raw, scaling=lora_scaling)
+    dnpa_v, grad_v_A, grad_v_B = lora_linear_bwd(
+        x=npa, A=v_A, B=v_B, base_W=v_W,
+        grad_y=dv_raw, scaling=lora_scaling)
+    dnpa = dnpa_q + dnpa_k + dnpa_v                                # [S, HIDDEN] fp32
+
+    # --- Step 9: input rmsnorm bwd -------------------------------------
+    dh_in_through_norm = rmsnorm_bwd(
+        x=hidden_in, w=input_norm_w, dy=dnpa, eps=rms_eps)         # [S, HIDDEN] fp32
+
+    dh_in = dh_in_residual + dh_in_through_norm                    # [S, HIDDEN] fp32
+
+    return {
+        "dh_in":      dh_in,
+        "grad_q_A":   grad_q_A,   "grad_q_B":   grad_q_B,
+        "grad_k_A":   grad_k_A,   "grad_k_B":   grad_k_B,
+        "grad_v_A":   grad_v_A,   "grad_v_B":   grad_v_B,
+        "grad_o_A":   grad_o_A,   "grad_o_B":   grad_o_B,
+    }
+
+
+# ---------------------------------------------------------------------------
 # FA-layer reverse walk: compose mlp_bwd + attn_bwd
 # ---------------------------------------------------------------------------
 
@@ -424,9 +654,16 @@ def per_layer_bwd_fa(
                                       #   layer's output (= layer L+1's dh_in)
     # Saved activations (single-layer slices already taken):
     hidden_in: torch.Tensor,         # [S, HIDDEN] bf16
+    normalized_in: torch.Tensor,     # [S, HIDDEN] bf16 — output of input rmsnorm
     normalized_post_attn: torch.Tensor,  # [S, HIDDEN] bf16
     mlp_inter: torch.Tensor,         # [S, INTER]  bf16
     h_post_attn: torch.Tensor,       # [S, HIDDEN] bf16
+    attn_out_pre_o: torch.Tensor,    # [S, FA_Q_SIZE] bf16 — input to o_proj
+    fa_q_save: torch.Tensor,         # [S, Hq, D]  bf16 — post-RoPE/QKnorm Q
+    fa_o_save: torch.Tensor,         # [S, Hq, D]  bf16 — FA output (no gate)
+    fa_lse_save: torch.Tensor,       # [Hq, S]     fp32
+    k_cache_layer_S: torch.Tensor,   # [Hk, S, D]  bf16 — post-RoPE K from cache
+    v_cache_layer_S: torch.Tensor,   # [Hk, S, D]  bf16 — V from cache
     # Frozen base weights for this layer:
     input_norm_w: torch.Tensor,      # [HIDDEN]
     q_W: torch.Tensor, k_W: torch.Tensor, v_W: torch.Tensor,
@@ -445,7 +682,7 @@ def per_layer_bwd_fa(
     lora_scaling: float,
     rms_eps: float = 1e-6,
 ) -> dict[str, torch.Tensor]:
-    """Compose layer_mlp_bwd and layer_attn_bwd_fa for one FA layer.
+    """Compose layer_mlp_bwd and layer_attn_bwd_fa_handrolled for one FA layer.
 
     Returns:
         dh_in              : [S, HIDDEN] fp32 — flows out of this layer to L-1
@@ -467,9 +704,15 @@ def per_layer_bwd_fa(
     # mlp_out["dh_post_attn"] is the gradient flowing into the attention
     # output residual stream — this is the upstream for the attention bwd.
 
-    attn_out = layer_attn_bwd_fa(
+    attn_out = layer_attn_bwd_fa_handrolled(
         hidden_in=hidden_in,
-        h_post_attn=h_post_attn,
+        normalized_in=normalized_in,
+        attn_out_pre_o=attn_out_pre_o,
+        fa_q_save=fa_q_save,
+        fa_o_save=fa_o_save,
+        fa_lse_save=fa_lse_save,
+        k_cache_layer_S=k_cache_layer_S,
+        v_cache_layer_S=v_cache_layer_S,
         dh_post_attn=mlp_out["dh_post_attn"],
         input_norm_w=input_norm_w,
         q_W=q_W, k_W=k_W, v_W=v_W,
@@ -623,13 +866,17 @@ _DN_FLAT_IDX = {
 def run_layer_walking_bwd(
     *,
     grad_h_pre_norm: torch.Tensor,    # [S, HIDDEN] fp32 — entry from kernel_loss_autograd
-    saves: dict,                       # 6 activation slabs, each [NUM_LAYERS, S, *]
+    saves: dict,                       # 6+ activation slabs, each [NUM_LAYERS, S, *]
+                                        #   + (optional) FA-only saves
+                                        #   fa_q_save / fa_o_save / fa_lse_save
     lora_flat: list[torch.Tensor],     # 26 packed bf16 LoRA tensors
     final_norm_weight: torch.Tensor,   # [HIDDEN] bf16
     hf_model,                          # PEFT-wrapped HF model, used for DN bwd
                                         #   + base-weight access on a per-layer basis
     lora_rank: int,
     lora_scaling: float,
+    fa_k_cache: torch.Tensor | None = None,  # [N_FA, Hk, max_seq, D] bf16 — kernel scratch
+    fa_v_cache: torch.Tensor | None = None,
     rms_eps: float = 1e-6,
 ) -> list[torch.Tensor]:
     """Walk layers in reverse, dispatching to per_layer_bwd_fa or
@@ -669,6 +916,7 @@ def run_layer_walking_bwd(
 
         # Pull per-layer activation slices.
         hidden_in_L            = saves["hidden_in"][L]               # [S, HIDDEN] bf16
+        normalized_in_L        = saves["normalized_in"][L]           # [S, HIDDEN] bf16
         normalized_post_attn_L = saves["normalized_post_attn"][L]    # [S, HIDDEN] bf16
         mlp_inter_L            = saves["mlp_inter"][L]               # [S, INTER]  bf16
         h_post_attn_L          = saves["h_post_attn"][L]             # [S, HIDDEN] bf16
@@ -708,12 +956,31 @@ def run_layer_walking_bwd(
                 "fa_down_B": lora_flat[_FA_FLAT_IDX["down"][1]][fa_idx],
             }
 
+            # Hand-rolled FA bwd needs:
+            #   - per-layer attn_out_pre_o save (input to o_proj)
+            #   - per-layer fa_q_save / fa_o_save / fa_lse_save (FA fwd saves)
+            #   - K/V cache slices for THIS FA layer's positions [0, S)
+            attn_out_pre_o_L = saves["attn_out_pre_o"][L][:, :_FA_Q_SIZE]
+            fa_q_L   = saves["fa_q_save"][fa_idx]
+            fa_o_L   = saves["fa_o_save"][fa_idx]
+            fa_lse_L = saves["fa_lse_save"][fa_idx]
+            S_L = hidden_in_L.shape[0]
+            k_cache_L = fa_k_cache[fa_idx, :, :S_L, :].contiguous()  # [Hk, S, D] bf16
+            v_cache_L = fa_v_cache[fa_idx, :, :S_L, :].contiguous()
+
             out = per_layer_bwd_fa(
                 fa_idx=fa_idx, dh_out=dh,
                 hidden_in=hidden_in_L,
+                normalized_in=normalized_in_L,
                 normalized_post_attn=normalized_post_attn_L,
                 mlp_inter=mlp_inter_L,
                 h_post_attn=h_post_attn_L,
+                attn_out_pre_o=attn_out_pre_o_L,
+                fa_q_save=fa_q_L,
+                fa_o_save=fa_o_L,
+                fa_lse_save=fa_lse_L,
+                k_cache_layer_S=k_cache_L,
+                v_cache_layer_S=v_cache_L,
                 input_norm_w=input_norm_w,
                 q_W=q_W, k_W=k_W, v_W=v_W,
                 q_nw=q_nw, k_nw=k_nw, o_W=o_W,

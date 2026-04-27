@@ -1551,11 +1551,15 @@ extern "C" void launch_bwd_rmsnorm(
     const int nwarps = block_size / 32;
     const size_t smem_bytes = (3 * H + nwarps) * sizeof(float);
 
-    static bool cfg = false;
-    if (!cfg) {
+    // Track the largest smem we've configured. cudaFuncSetAttribute with
+    // cudaFuncAttributeMaxDynamicSharedMemorySize sets a HARD LIMIT, so a
+    // first call with a small H + later call with a large H would fail
+    // launch with cudaErrorInvalidValue. Bump the limit when needed.
+    static size_t cfg_smem = 0;
+    if (smem_bytes > cfg_smem) {
         cudaFuncSetAttribute((void *)bwd_rmsnorm_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        cfg = true;
+        cfg_smem = smem_bytes;
     }
     bwd_rmsnorm_kernel<<<S, block_size, smem_bytes, stream>>>(
         (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)w, dy, dx, S, H, eps);

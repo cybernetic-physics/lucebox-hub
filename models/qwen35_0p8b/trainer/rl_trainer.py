@@ -467,6 +467,7 @@ class LoraMegakernelTrainer:
             loss = out["loss"]
             grad_h_pre_norm = out["grad_h_pre_norm"]
             saves = out["saves"]
+            scratch = out["scratch"]
 
             # Scale grad_h_pre_norm by 1/N so the accumulated gradient
             # corresponds to mean-loss across items (matches HF+PEFT
@@ -482,6 +483,8 @@ class LoraMegakernelTrainer:
                 hf_model=s.hf_model,
                 lora_rank=s.lora_rank,
                 lora_scaling=s.lora_scaling,
+                fa_k_cache=scratch["fa_k_cache"],
+                fa_v_cache=scratch["fa_v_cache"],
             )
 
             # Scatter into PEFT params' .grad. Accumulate across items.

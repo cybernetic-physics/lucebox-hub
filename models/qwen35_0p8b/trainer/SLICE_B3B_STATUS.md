@@ -6,16 +6,25 @@ roadmap). End goal: replace HF+PEFT autograd in
 walk for ~3× faster training step (114 ms → ~30-50 ms, projected),
 which pulls combined RL step toward ~18× over HF+fla.
 
-## Wall-time bench (`bench_kernel_bwd.py`, 2026-04-27)
+## Wall-time bench (`bench_kernel_bwd.py`)
+
+After hand-rolled FA bwd shipped (2026-04-27, this commit):
 
 ```
 path                                   ms/step
 --------------------------------------------------
-HF+PEFT autograd (default)              507.0ms
-Kernel-driven Slice B.3b                674.5ms
+HF+PEFT autograd (default)              548.4ms
+Kernel-driven Slice B.3b                663.1ms
 --------------------------------------------------
-Kernel path is 1.33× SLOWER than HF+PEFT today.
+Kernel path is 1.21× slower (was 1.33× pre-handrolled-FA-bwd).
 ```
+
+The hand-rolled FA bwd (replaces autograd-through-recomputed-SDPA with
+direct cuDNN FA-2 bwd + manual reverse-RoPE / reverse-QKnorm / reverse-
+gate / kernel-driven LoRA bwd / kernel-driven RMSnorm bwd) recovered
+~10 ms/step from the FA path. The remaining ~115 ms slowdown is the
+DN-attention autograd interior in `per_layer_bwd_dn` — that's the next
+target.
 
 **Why slower:** the autograd-based interior in `per_layer_bwd_dn`
 recomputes the HF GatedDeltaNet forward inside the bwd to get the

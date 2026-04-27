@@ -133,11 +133,28 @@ def autograd_reference(inp):
     loss = (h_out.float() * inp["g_for_loss"].float()).sum()
     loss.backward()
 
+    # Capture FA saves the kernel would have written.
+    import math as _math
+    with torch.no_grad():
+        scale = 1.0 / _math.sqrt(_FA_HEAD_DIM)
+        logits = (Q_b * scale) @ K_b.transpose(-1, -2)
+        mask = torch.triu(torch.ones(S, S, device=Q_b.device, dtype=torch.bool),
+                          diagonal=1)
+        logits = logits.masked_fill(mask, float("-inf"))
+        lse = torch.logsumexp(logits.float(), dim=-1).squeeze(0).contiguous()  # [Hq, S]
+
     return {
         # Saves our function will need:
         "h_post_attn":          h_post_attn.detach().to(torch.bfloat16),
+        "normalized_in":        npa_in.detach().to(torch.bfloat16),
         "normalized_post_attn": npa_post.detach().to(torch.bfloat16),
         "mlp_inter":            mlp_inter.detach().to(torch.bfloat16),
+        "attn_out_pre_o":       attn_pre_o.detach().to(torch.bfloat16),
+        "fa_q_save":            Q.detach().contiguous(),                       # [S, Hq, D] bf16
+        "fa_o_save":            attn_unfold.detach().contiguous(),              # [S, Hq, D] bf16
+        "fa_lse_save":          lse,                                             # [Hq, S] fp32
+        "k_cache":              K.permute(1, 0, 2).detach().contiguous(),       # [Hk, S, D] bf16
+        "v_cache":              V.permute(1, 0, 2).detach().contiguous(),       # [Hk, S, D] bf16
         # Reference grads:
         "dh_in": h.grad.detach(),
         "grad_q_A": qA.grad.detach(), "grad_q_B": qB.grad.detach(),
@@ -174,9 +191,16 @@ def main():
         fa_idx=0,
         dh_out=inp["g_for_loss"].float(),
         hidden_in=inp["h_in"],
+        normalized_in=ref["normalized_in"],
         normalized_post_attn=ref["normalized_post_attn"],
         mlp_inter=ref["mlp_inter"],
         h_post_attn=ref["h_post_attn"],
+        attn_out_pre_o=ref["attn_out_pre_o"],
+        fa_q_save=ref["fa_q_save"],
+        fa_o_save=ref["fa_o_save"],
+        fa_lse_save=ref["fa_lse_save"],
+        k_cache_layer_S=ref["k_cache"],
+        v_cache_layer_S=ref["v_cache"],
         input_norm_w=inp["input_norm_w"],
         q_W=inp["q_W"], k_W=inp["k_W"], v_W=inp["v_W"],
         q_nw=inp["q_nw"], k_nw=inp["k_nw"], o_W=inp["o_W"],
