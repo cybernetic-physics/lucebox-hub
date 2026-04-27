@@ -41,6 +41,7 @@ sources = [
     "torch_bindings.cpp",
     "kernel.cu",
     "prefill.cu",
+    "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
 ]
 libraries = ["cublas"]
 cxx_args = ["-O3"]
