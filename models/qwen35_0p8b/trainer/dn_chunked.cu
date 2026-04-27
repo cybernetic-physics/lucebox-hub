@@ -515,6 +515,336 @@ __global__ void dn_chunked_fwd_kernel(
 }
 
 
+// ===================== chunk-parallel kernel =====================
+// Same math as dn_chunked_fwd_kernel but the outer chunk loop is unrolled
+// across CUDA blocks: one block per (head, chunk) pair instead of one
+// block per head. State flows between chunks of the same head through
+// global memory (state_chunks_base[h, my_chunk]) with an atomic counter
+// per head enforcing the sequential dependency. This raises SM
+// occupancy from H = 16 to min(SM_count, H × n_chunks): at S=8K with
+// 18 DN layers we have 16 × 128 = 2048 logical work units per layer
+// vs 16 in the original kernel.
+//
+// Caller must initialize chunk_counter[H] to all zeros and write
+// state_chunks_base[h, 0] = state_in[h] before the launch (the kernel's
+// chunk-0 block reads from there and writes state_chunks_base[h, 1]).
+//
+// Block scheduling: we use grid (H, n_chunks) so the linearization
+// `chunk * H + head` is chunk-major — all chunk=0 blocks across heads
+// are scheduled before any chunk=1 block. That avoids deadlock from
+// later-chunk blocks occupying SMs while their dependencies are still
+// queued.
+__global__ void dn_chunk_parallel_fwd_kernel(
+    const __nv_bfloat16 *__restrict__ q_base,
+    const __nv_bfloat16 *__restrict__ k_base,
+    const __nv_bfloat16 *__restrict__ v_base,
+    const float *__restrict__ beta_base,
+    const float *__restrict__ g_base,
+    __nv_bfloat16 *__restrict__ y_base,
+    float *__restrict__ state_out_base,
+    float *__restrict__ state_chunks_base,        // [H, n_chunks+1, Dk, Dv]
+    unsigned int *__restrict__ chunk_counter,      // [H], zeroed by caller
+    int S, int n_chunks,
+    int qkd_pos_stride,
+    int v_pos_stride,
+    int bd_pos_stride)
+{
+    constexpr int Dk = DN_KEY_DEFAULT;
+    constexpr int Dv = DN_VAL_DEFAULT;
+    constexpr int C  = DN_CHUNK;
+
+    int h        = blockIdx.x;
+    int my_chunk = blockIdx.y;
+    if (my_chunk >= n_chunks) return;
+
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    int warp = tid >> 5;
+    int n_warps = nt >> 5;
+
+    // Per-head views into [S, H, D]-laid-out tensors.
+    const __nv_bfloat16 *q  = q_base  + h * Dk;
+    const __nv_bfloat16 *k  = k_base  + h * Dk;
+    const __nv_bfloat16 *v  = v_base  + h * Dv;
+    const float *beta_h     = beta_base + h;
+    const float *g_h        = g_base    + h;
+    __nv_bfloat16 *y_h      = y_base + h * Dv;
+    float *state_chunks_h   = state_chunks_base
+                              + (size_t)h * (n_chunks + 1) * Dk * Dv;
+    float *state_out_h      = state_out_base ? state_out_base + h * Dk * Dv : nullptr;
+
+    // Shared-mem layout (omits the persistent state slab from the
+    // original — state lives in global; we just stage one chunk's
+    // worth of working state in shared while we compute).
+    extern __shared__ unsigned char smem_raw[];
+    float *state         = (float*)smem_raw;                    // [Dk, Dv]      fp32 (this chunk's working state)
+    float *buf_attn      = state    + Dk * Dv;                  // [C, C]        fp32
+    float *buf_decay     = buf_attn + C * C;                    // [C, C]        fp32
+    float *warp_scratch  = buf_decay + C * C;                   // [n_warps * 256] fp32
+    float *s_g_cs        = warp_scratch + 16 * 256;             // [C]
+    float *s_exp_cs      = s_g_cs   + C;                        // [C]
+    float *s_beta        = s_exp_cs + C;                        // [C]
+    __nv_bfloat16 *bf16_base = (__nv_bfloat16*)(s_beta + C);
+    __nv_bfloat16 *state_bf  = bf16_base;                  // [Dk, Dv/2]    bf16
+    __nv_bfloat16 *buf_q     = state_bf + Dk * (Dv/2);     // [C, Dk]
+    __nv_bfloat16 *buf_k     = buf_q    + C * Dk;          // [C, Dk]
+    __nv_bfloat16 *buf_kbeta = buf_k    + C * Dk;          // [C, Dk]
+    __nv_bfloat16 *buf_vbeta = buf_kbeta + C * Dk;         // [C, Dv]
+    __nv_bfloat16 *buf_kcd   = buf_vbeta + C * Dv;         // [C, Dk]
+    __nv_bfloat16 *buf_attn_bf = buf_kcd + C * Dk;         // [C, C]   bf16
+
+    // ----- Wait for this head's prior chunk to finish + flush its state. -----
+    if (tid == 0) {
+        // Spin on the per-head counter until it reaches my_chunk
+        // (chunk 0 sees counter==0 immediately).
+        while (atomicAdd(&chunk_counter[h], 0u) < (unsigned)my_chunk) {
+            __nanosleep(20);
+        }
+    }
+    __syncthreads();
+
+    // ----- Load state from state_chunks[h, my_chunk] into shared. -----
+    {
+        const float *src = state_chunks_h + (size_t)my_chunk * Dk * Dv;
+        for (int i = tid; i < Dk * Dv; i += nt) state[i] = src[i];
+    }
+    __syncthreads();
+
+    int t0 = my_chunk * C;
+    int chunk_len = (S - t0 < C) ? (S - t0) : C;
+
+    // ===== Per-chunk math (mirrors dn_chunked_fwd_kernel's body 1:1) =====
+
+    // ----- Load q, k, v for chunk; pad with zeros if chunk_len < C -----
+    for (int idx = tid; idx < C * Dk; idx += nt) {
+        int j = idx / Dk;
+        int d = idx - j * Dk;
+        __nv_bfloat16 vq = (j < chunk_len) ? q[(t0 + j) * qkd_pos_stride + d]
+                                           : __float2bfloat16(0.0f);
+        __nv_bfloat16 vk = (j < chunk_len) ? k[(t0 + j) * qkd_pos_stride + d]
+                                           : __float2bfloat16(0.0f);
+        buf_q[idx] = vq;
+        buf_k[idx] = vk;
+    }
+    for (int idx = tid; idx < C * Dv; idx += nt) {
+        int j = idx / Dv;
+        int d = idx - j * Dv;
+        buf_vbeta[idx] = (j < chunk_len) ? v[(t0 + j) * v_pos_stride + d]
+                                         : __float2bfloat16(0.0f);
+    }
+    if (tid < C) {
+        float bj = (tid < chunk_len) ? beta_h[(t0 + tid) * bd_pos_stride] : 0.0f;
+        float gj = (tid < chunk_len) ? g_h   [(t0 + tid) * bd_pos_stride] : 0.0f;
+        s_beta[tid] = bj;
+        s_g_cs[tid] = gj;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (int i = 0; i < C; i++) { acc += s_g_cs[i]; s_g_cs[i] = acc; }
+    }
+    __syncthreads();
+    if (tid < C) s_exp_cs[tid] = expf(s_g_cs[tid]);
+
+    for (int idx = tid; idx < C * C; idx += nt) {
+        int i = idx / C, j = idx - i * C;
+        if (i >= j && i < chunk_len && j < chunk_len) {
+            buf_decay[idx] = expf(s_g_cs[i] - s_g_cs[j]);
+        } else {
+            buf_decay[idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < C * Dk; idx += nt) {
+        int j = idx / Dk;
+        float bj = (j < chunk_len) ? s_beta[j] : 0.0f;
+        float kk = __bfloat162float(buf_k[idx]);
+        buf_kbeta[idx] = __float2bfloat16(bj * kk);
+    }
+    for (int idx = tid; idx < C * Dv; idx += nt) {
+        int j = idx / Dv;
+        float bj = (j < chunk_len) ? s_beta[j] : 0.0f;
+        float vv = __bfloat162float(buf_vbeta[idx]);
+        buf_vbeta[idx] = __float2bfloat16(bj * vv);
+    }
+    __syncthreads();
+
+    // attn0 = -(k_beta @ k.T)
+    wmma_gemm_fp32<C, C, Dk, false, true>(
+        buf_kbeta, Dk, buf_k, Dk, buf_attn, C, warp, n_warps, false);
+    __syncthreads();
+    for (int idx = tid; idx < C * C; idx += nt) {
+        int i = idx / C, j = idx - i * C;
+        if (i > j) buf_attn[idx] = -buf_attn[idx] * buf_decay[idx];
+        else       buf_attn[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    // T construction (in-place sequential row update on buf_attn)
+    for (int i = 1; i < C; i++) {
+        for (int j = tid; j < i; j += nt) {
+            float orig = buf_attn[i * C + j];
+            float acc = 0.0f;
+            for (int l = j + 1; l < i; l++) {
+                acc += buf_attn[i * C + l] * buf_attn[l * C + j];
+            }
+            s_exp_cs[j] = orig + acc;
+        }
+        __syncthreads();
+        for (int j = tid; j < i; j += nt) {
+            buf_attn[i * C + j] = s_exp_cs[j];
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < C; idx += nt) {
+        buf_attn[idx * C + idx] += 1.0f;
+    }
+    if (tid < C) s_exp_cs[tid] = expf(s_g_cs[tid]);
+    __syncthreads();
+    for (int idx = tid; idx < C * C; idx += nt) {
+        buf_attn_bf[idx] = __float2bfloat16(buf_attn[idx]);
+    }
+    __syncthreads();
+
+    // v_new = T @ v_beta
+    wmma_gemm_bf16<C, Dv, C>(
+        buf_attn_bf, C, buf_vbeta, Dv, buf_kcd, Dv, warp, n_warps, warp_scratch);
+    __syncthreads();
+    for (int idx = tid; idx < C * Dv; idx += nt) buf_vbeta[idx] = buf_kcd[idx];
+    __syncthreads();
+
+    // k_cd = T @ (k_beta * exp_g_cs)
+    for (int idx = tid; idx < C * Dk; idx += nt) {
+        int j = idx / Dk;
+        float ec = (j < chunk_len) ? s_exp_cs[j] : 0.0f;
+        float kb = __bfloat162float(buf_kbeta[idx]);
+        buf_kbeta[idx] = __float2bfloat16(kb * ec);
+    }
+    __syncthreads();
+    wmma_gemm_bf16<C, Dk, C>(
+        buf_attn_bf, C, buf_kbeta, Dk, buf_kcd, Dk, warp, n_warps, warp_scratch);
+    __syncthreads();
+
+    // v_new -= k_cd @ state, in two halves of Dv
+    for (int half = 0; half < 2; half++) {
+        int dv_off = half * (Dv / 2);
+        for (int idx = tid; idx < Dk * (Dv/2); idx += nt) {
+            int i = idx / (Dv/2);
+            int d = idx - i * (Dv/2);
+            state_bf[i * (Dv/2) + d] = __float2bfloat16(state[i * Dv + dv_off + d]);
+        }
+        __syncthreads();
+        wmma_gemm_fp32<C, Dv/2, Dk>(
+            buf_kcd, Dk, state_bf, Dv/2, buf_attn, Dv/2,
+            warp, n_warps, false);
+        __syncthreads();
+        for (int idx = tid; idx < C * (Dv/2); idx += nt) {
+            int j = idx / (Dv/2);
+            int d = idx - j * (Dv/2);
+            float v_old = __bfloat162float(buf_vbeta[j * Dv + dv_off + d]);
+            buf_vbeta[j * Dv + dv_off + d] = __float2bfloat16(v_old - buf_attn[idx]);
+        }
+        __syncthreads();
+    }
+
+    // attn_in = q @ k.T * decay_mask
+    wmma_gemm_fp32<C, C, Dk, false, true>(
+        buf_q, Dk, buf_k, Dk, buf_attn, C, warp, n_warps, false);
+    __syncthreads();
+    for (int idx = tid; idx < C * C; idx += nt) {
+        int i = idx / C, j = idx - i * C;
+        if (i >= j && i < chunk_len && j < chunk_len) {
+            buf_attn[idx] *= buf_decay[idx];
+        } else {
+            buf_attn[idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    for (int idx = tid; idx < C * C; idx += nt) {
+        buf_attn_bf[idx] = __float2bfloat16(buf_attn[idx]);
+    }
+    __syncthreads();
+
+    // attn_int = (q * exp_g_cs) @ state
+    for (int idx = tid; idx < C * Dk; idx += nt) {
+        int j = idx / Dk;
+        float ec = (j < chunk_len) ? s_exp_cs[j] : 0.0f;
+        float qq = __bfloat162float(buf_q[idx]);
+        buf_q[idx] = __float2bfloat16(qq * ec);
+    }
+    __syncthreads();
+    for (int half = 0; half < 2; half++) {
+        int dv_off = half * (Dv / 2);
+        for (int idx = tid; idx < Dk * (Dv/2); idx += nt) {
+            int i = idx / (Dv/2);
+            int d = idx - i * (Dv/2);
+            state_bf[i * (Dv/2) + d] = __float2bfloat16(state[i * Dv + dv_off + d]);
+        }
+        __syncthreads();
+        wmma_gemm_fp32<C, Dv/2, Dk>(
+            buf_q, Dk, state_bf, Dv/2, buf_attn, Dv/2,
+            warp, n_warps, false);
+        __syncthreads();
+        for (int idx = tid; idx < C * (Dv/2); idx += nt) {
+            int j = idx / (Dv/2);
+            int d = idx - j * (Dv/2);
+            buf_kcd[j * Dv + dv_off + d] = __float2bfloat16(buf_attn[idx]);
+        }
+        __syncthreads();
+    }
+
+    // y_chunk = attn_int + attn_in_bf @ v_new
+    for (int half = 0; half < 2; half++) {
+        int dv_off = half * (Dv / 2);
+        wmma_gemm_fp32<C, Dv/2, C>(
+            buf_attn_bf, C, buf_vbeta + dv_off, Dv,
+            buf_attn, Dv/2, warp, n_warps, false);
+        __syncthreads();
+        for (int idx = tid; idx < C * (Dv/2); idx += nt) {
+            int j = idx / (Dv/2);
+            int d = idx - j * (Dv/2);
+            if (j >= chunk_len) continue;
+            float ai = __bfloat162float(buf_kcd[j * Dv + dv_off + d]);
+            float ax = buf_attn[idx];
+            y_h[(t0 + j) * v_pos_stride + dv_off + d] = __float2bfloat16(ai + ax);
+        }
+        __syncthreads();
+    }
+
+    // state_next = state * exp(g_total) + (k * exp(g_total - g_cs))^T @ v_new
+    float g_total = s_g_cs[chunk_len - 1];
+    float exp_total = expf(g_total);
+    for (int idx = tid; idx < Dk * Dv; idx += nt) state[idx] *= exp_total;
+    __syncthreads();
+    for (int idx = tid; idx < C * Dk; idx += nt) {
+        int j = idx / Dk;
+        float scale = (j < chunk_len) ? expf(g_total - s_g_cs[j]) : 0.0f;
+        float kk = __bfloat162float(buf_k[idx]);
+        buf_kbeta[idx] = __float2bfloat16(kk * scale);
+    }
+    __syncthreads();
+    wmma_gemm_fp32<Dk, Dv, C, true, false>(
+        buf_kbeta, Dk, buf_vbeta, Dv, state, Dv, warp, n_warps, true);
+    __syncthreads();
+
+    // ----- Write state_next to global at state_chunks[h, my_chunk+1]. -----
+    {
+        float *dst = state_chunks_h + (size_t)(my_chunk + 1) * Dk * Dv;
+        for (int i = tid; i < Dk * Dv; i += nt) dst[i] = state[i];
+    }
+    __threadfence();   // ensure state writes visible to other blocks before signaling
+    __syncthreads();
+
+    // ----- Signal next chunk + (last chunk) write final state_out. -----
+    if (tid == 0) atomicAdd(&chunk_counter[h], 1u);
+    if (my_chunk == n_chunks - 1 && state_out_h) {
+        for (int i = tid; i < Dk * Dv; i += nt) state_out_h[i] = state[i];
+    }
+}
+
+
 // ===================== launcher =====================
 extern "C" cudaError_t launch_dn_chunked_fwd(
     const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
@@ -544,5 +874,45 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     dn_chunked_fwd_kernel<<<H, threads, smem, stream>>>(
         q, k, v, beta, g, state_in, y, state_out, state_chunks,
         S, qkd_stride, v_stride, bd_stride);
+    return cudaGetLastError();
+}
+
+
+// ===================== chunk-parallel launcher =====================
+// Caller must pre-fill state_chunks[h, 0] = state_in[h] (so chunk-0
+// blocks find their starting state), and zero chunk_counter[H]. The
+// kernel writes y, state_out (last chunk only), state_chunks[h, c+1]
+// (each chunk), and increments chunk_counter[h].
+extern "C" cudaError_t launch_dn_chunk_parallel_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g,
+    __nv_bfloat16 *y, float *state_out,
+    float *state_chunks,                   // [H, n_chunks+1, Dk, Dv] (REQUIRED, pre-filled at [:, 0])
+    unsigned int *chunk_counter,           // [H] (REQUIRED, pre-zeroed)
+    int S, int H, cudaStream_t stream)
+{
+    constexpr int Dk = DN_KEY_DEFAULT;
+    constexpr int Dv = DN_VAL_DEFAULT;
+    constexpr int C  = DN_CHUNK;
+    int n_chunks = (S + C - 1) / C;
+    // Same shared-mem layout as dn_chunked_fwd_kernel — same buffers,
+    // same sizes (state slab is staged identically).
+    size_t smem_fp32 = ((size_t)Dk * Dv + 2 * (size_t)C * C + 16 * 256 + 3 * C) * sizeof(float);
+    size_t smem_bf16 = ((size_t)Dk * (Dv/2) + 4 * (size_t)C * Dk + (size_t)C * Dv + (size_t)C * C) * sizeof(__nv_bfloat16);
+    size_t smem = smem_fp32 + smem_bf16;
+    int threads = 512;
+    cudaFuncSetAttribute(dn_chunk_parallel_fwd_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem);
+    int qkd_stride = H * Dk;
+    int v_stride   = H * Dv;
+    int bd_stride  = H;
+    // Grid (H, n_chunks): linear index = chunk * H + head, so all chunk=0
+    // blocks across heads are scheduled before chunk=1 — avoids deadlock
+    // with later-chunk blocks waiting on earlier ones.
+    dim3 grid((unsigned)H, (unsigned)n_chunks);
+    dn_chunk_parallel_fwd_kernel<<<grid, threads, smem, stream>>>(
+        q, k, v, beta, g, y, state_out, state_chunks, chunk_counter,
+        S, n_chunks, qkd_stride, v_stride, bd_stride);
     return cudaGetLastError();
 }

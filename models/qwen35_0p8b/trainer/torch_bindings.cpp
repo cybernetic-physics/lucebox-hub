@@ -176,6 +176,14 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     float *state_chunks,
     int S, int H, cudaStream_t stream);
 
+extern "C" cudaError_t launch_dn_chunk_parallel_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g,
+    __nv_bfloat16 *y, float *state_out,
+    float *state_chunks,                   // [H, n_chunks+1, Dk, Dv] (state_chunks[:,0] = state_in)
+    unsigned int *chunk_counter,           // [H] (pre-zeroed)
+    int S, int H, cudaStream_t stream);
+
 void fused_adamw_step(
     torch::Tensor params,
     torch::Tensor m, torch::Tensor v,
@@ -355,6 +363,42 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
                 state_chunks.numel() > 0 ? (float *)state_chunks.data_ptr() : nullptr,
                 S, H, c10::cuda::getCurrentCUDAStream().stream());
             TORCH_CHECK(err == cudaSuccess, "dn_chunked_fwd: ",
+                        cudaGetErrorString(err));
+        });
+
+    ops.def("dn_chunk_parallel_fwd(Tensor q, Tensor k, Tensor v, "
+            "Tensor beta, Tensor g, Tensor(a!) y, Tensor(b!) state_out, "
+            "Tensor(c!) state_chunks, Tensor(d!) chunk_counter) -> ()");
+    ops.impl("dn_chunk_parallel_fwd", torch::kCUDA, +[](
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor beta, torch::Tensor g,
+        torch::Tensor y, torch::Tensor state_out,
+        torch::Tensor state_chunks, torch::Tensor chunk_counter) {
+            // Caller pre-fills state_chunks[:, 0] = state_in (so the
+            // chunk-0 blocks find their starting state) and zeros the
+            // chunk_counter; the kernel writes state_chunks[:, 1..]
+            // and the final state_out.
+            int S = (int)q.size(0);
+            int H = (int)q.size(1);
+            TORCH_CHECK(state_chunks.numel() > 0,
+                "dn_chunk_parallel_fwd: state_chunks is required (must be sized "
+                "[H, n_chunks+1, Dk, Dv] fp32 with [:, 0] = state_in already filled)");
+            TORCH_CHECK(chunk_counter.numel() == H,
+                "dn_chunk_parallel_fwd: chunk_counter must be u32[H] (pre-zeroed)");
+            TORCH_CHECK(chunk_counter.scalar_type() == torch::kUInt32,
+                "dn_chunk_parallel_fwd: chunk_counter must be u32");
+            cudaError_t err = launch_dn_chunk_parallel_fwd(
+                (const __nv_bfloat16 *)q.data_ptr(),
+                (const __nv_bfloat16 *)k.data_ptr(),
+                (const __nv_bfloat16 *)v.data_ptr(),
+                (const float *)beta.data_ptr(),
+                (const float *)g.data_ptr(),
+                (__nv_bfloat16 *)y.data_ptr(),
+                state_out.numel() > 0 ? (float *)state_out.data_ptr() : nullptr,
+                (float *)state_chunks.data_ptr(),
+                (unsigned int *)chunk_counter.data_ptr(),
+                S, H, c10::cuda::getCurrentCUDAStream().stream());
+            TORCH_CHECK(err == cudaSuccess, "dn_chunk_parallel_fwd: ",
                         cudaGetErrorString(err));
         });
 
