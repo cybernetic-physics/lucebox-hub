@@ -46,21 +46,24 @@ Decode (tok/s, after S-token prefill):
 | S | upstream/main | this branch | sglang | best |
 |---:|---:|---:|---:|---|
 | 32 | hang | **915** | 484 | this branch |
-| 64 | hang | **902** | 487 | this branch |
-| 128 | hang | **872** | 552 | this branch |
-| 256 | hang | **819** | 520 | this branch |
-| 512 | hang | **729** | 488 | this branch |
-| 1,024 | hang | **597** | 441 | this branch |
-| 2,048 | hang | 439 | **450** | sglang |
-| 4,096 | hang | 230 | **423** | sglang |
-| 8,192 | hang | 113 | **367** | sglang |
-| 16,384 | hang | 58 | **282** | sglang |
-| 32,768 | hang | 30 | **193** | sglang |
-| 65,536 | hang | **15** | n/a | this branch |
+| 64 | hang | **915** | 487 | this branch |
+| 128 | hang | **914** | 552 | this branch |
+| 256 | hang | **907** | 520 | this branch |
+| 512 | hang | **901** | 488 | this branch |
+| 1,024 | hang | **885** | 441 | this branch |
+| 2,048 | hang | **830** | 450 | this branch |
+| 4,096 | hang | **746** | 423 | this branch |
+| 8,192 | hang | **602** | 367 | this branch |
+| 16,384 | hang | **472** | 282 | this branch |
+| 32,768 | hang | **332** | 193 | this branch |
+| 65,536 | hang | **208** | n/a | this branch |
 
 upstream/main BF16 decode hangs on B200 — its hand-rolled grid
 barrier doesn't progress on 148 SMs. The cooperative-grid-sync fix
-is what makes BF16 decode functional on sm_100.
+is what makes BF16 decode functional on sm_100, and the split-K
+rewrite of phase 3 (kernel.cu) lifts decode from 11→208 tok/s at
+S=64k by filling 144 of 148 SMs during the FA scan instead of
+just 8.
 
 ### RTX 3090 (sm_86, vast.ai PCIe 4.0×8, 350 W stock)
 
@@ -85,18 +88,18 @@ Decode (tok/s, after S-token prefill):
 
 | S | upstream/main | this branch | sglang | best |
 |---:|---:|---:|---:|---|
-| 32 | 430 | **433** | 335 | this branch |
-| 64 | 443 | **444** | 336 | this branch |
-| 128 | 439 | **440** | 334 | this branch |
-| 256 | 431 | **432** | 334 | this branch |
-| 512 | 419 | **420** | 324 | this branch |
-| 1,024 | 394 | **396** | 336 | this branch |
-| 2,048 | n/a | **353** | 333 | this branch |
-| 4,096 | — | 292 | **328** | sglang |
-| 8,192 | — | 216 | **320** | sglang |
-| 16,384 | — | 142 | **307** | sglang |
-| 32,768 | — | **84** | OOM | this branch |
-| 65,536 | — | **46** | n/a | this branch |
+| 32 | 430 | **440** | 335 | this branch |
+| 64 | 443 | **448** | 336 | this branch |
+| 128 | 439 | **447** | 334 | this branch |
+| 256 | 431 | **446** | 334 | this branch |
+| 512 | 419 | **445** | 324 | this branch |
+| 1,024 | 394 | **443** | 336 | this branch |
+| 2,048 | n/a | **437** | 333 | this branch |
+| 4,096 | — | **425** | 328 | this branch |
+| 8,192 | — | **401** | 320 | this branch |
+| 16,384 | — | **361** | 307 | this branch |
+| 32,768 | — | **302** | OOM | this branch |
+| 65,536 | — | **227** | n/a | this branch |
 
 `upstream/main` columns are capped at S = 2,048 because the upstream
 binding hardcodes `FA_KV_HEADS * 2048 * FA_HEAD_DIM` as the KV
@@ -106,7 +109,13 @@ that cap (the launcher reads `max_seq` from `fa_k_cache.size(2)`).
 ## Crossover map
 
 ```
-                          this branch beats sglang (prefill)
+                          this branch beats sglang (DECODE)
+                         ┌──────────────────────────────┐
+  3090 (sm_86)           │  ALL shapes (1.18–1.37x ours)│
+  B200 (sm_100)          │  ALL shapes (1.64–2.00x ours)│
+                         └──────────────────────────────┘
+
+                          this branch beats sglang (PREFILL)
                          ┌──────────────────────────────┐
   3090 (sm_86)           │  S ≤ 256                     │
   B200 (sm_100)          │  S ≤ 1,024                   │
