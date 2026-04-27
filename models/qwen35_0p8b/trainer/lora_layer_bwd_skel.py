@@ -235,6 +235,185 @@ def layer_mlp_bwd(
 
 
 # ---------------------------------------------------------------------------
+# FA attention block reverse walk (qkv + RoPE + QKnorm + FA + o_proj +
+# input rmsnorm). First-pass implementation uses torch autograd through
+# the recomputed attention sub-graph — slow but provably correct. The
+# layer_mlp_bwd above is the fast template; future work replaces the
+# autograd interior here with hand-rolled cuDNN FA-bwd + manual chain
+# rule for QKnorm/RoPE.
+# ---------------------------------------------------------------------------
+
+# Constants (mirrors prefill.cu).
+_FA_HEAD_DIM = 256
+_FA_Q_HEADS  = 8
+_FA_KV_HEADS = 2
+_FA_GQA      = _FA_Q_HEADS // _FA_KV_HEADS
+_FA_Q_SIZE       = _FA_Q_HEADS  * _FA_HEAD_DIM
+_FA_QPROJ_SIZE   = _FA_Q_SIZE * 2     # Q + Gate per head
+_FA_KV_SIZE      = _FA_KV_HEADS * _FA_HEAD_DIM
+_FA_ROT_DIM      = 64
+_FA_ROPE_THETA   = 1e7
+
+
+def _qwen_rms(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Qwen3-Next RMSnorm: y = x * rsqrt(mean(x²) + eps) * (1 + w).
+    Normalizes over the last axis. Used for both the layer-input RMSnorm
+    (last-axis = HIDDEN) and the per-head QK-norm (last-axis = HEAD_DIM).
+    """
+    x_f = x.float()
+    rstd = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (x_f * rstd * (1.0 + w.float())).to(x.dtype)
+
+
+def _qwen_rope(x: torch.Tensor) -> torch.Tensor:
+    """Apply Qwen3-Next RoPE to ``x`` of shape [S, num_heads, FA_HEAD_DIM].
+    Only the first FA_ROT_DIM (=64) dimensions of each head get rotated.
+    The pairing is "halves": for i ∈ [0, ROT_DIM/2), the partner is i+ROT_DIM/2.
+    """
+    S, H, D = x.shape
+    assert D == _FA_HEAD_DIM, f"expected head_dim={_FA_HEAD_DIM}, got {D}"
+    half = _FA_ROT_DIM // 2
+    pos = torch.arange(S, device=x.device, dtype=torch.float32)
+    # freq[i] for i ∈ [0, half) is 1/theta^(2*i/ROT_DIM).
+    i = torch.arange(half, device=x.device, dtype=torch.float32)
+    fe = 2.0 * i / _FA_ROT_DIM
+    inv_theta = 1.0 / (_FA_ROPE_THETA ** fe)            # [half]
+    angles = pos.unsqueeze(1) * inv_theta.unsqueeze(0)  # [S, half]
+    cos = torch.cos(angles)                              # [S, half]
+    sin = torch.sin(angles)
+    x_f = x.float()
+    rot = x_f[..., :_FA_ROT_DIM]      # [S, H, ROT_DIM]
+    pass_ = x_f[..., _FA_ROT_DIM:]    # [S, H, D-ROT_DIM]  no rotation
+    a = rot[..., :half]               # [S, H, half]
+    b = rot[..., half:]               # [S, H, half]
+    cos_b = cos.unsqueeze(1)          # [S, 1, half]
+    sin_b = sin.unsqueeze(1)
+    a_new = a * cos_b - b * sin_b
+    b_new = b * cos_b + a * sin_b
+    rot_new = torch.cat([a_new, b_new], dim=-1)
+    out = torch.cat([rot_new, pass_], dim=-1)
+    return out.to(x.dtype)
+
+
+def layer_attn_bwd_fa(
+    *,
+    hidden_in: torch.Tensor,            # [S, HIDDEN]   bf16 — input to this layer
+    h_post_attn: torch.Tensor,          # [S, HIDDEN]   bf16 — post-residual saved
+    dh_post_attn: torch.Tensor,         # [S, HIDDEN]   fp32 — gradient flowing in
+                                         #   from the MLP block bwd
+    # Frozen base weights for this layer:
+    input_norm_w: torch.Tensor,         # [HIDDEN]      bf16
+    q_W: torch.Tensor,                  # [FA_QPROJ, HIDDEN]      bf16 (Q+Gate)
+    k_W: torch.Tensor,                  # [FA_KV_SIZE, HIDDEN]    bf16
+    v_W: torch.Tensor,                  # [FA_KV_SIZE, HIDDEN]    bf16
+    q_nw: torch.Tensor,                 # [FA_HEAD_DIM]           bf16 (QK-norm gain)
+    k_nw: torch.Tensor,                 # [FA_HEAD_DIM]           bf16
+    o_W: torch.Tensor,                  # [HIDDEN, FA_Q_SIZE]     bf16
+    # LoRA tensors (single-layer slices):
+    q_A: torch.Tensor, q_B: torch.Tensor,
+    k_A: torch.Tensor, k_B: torch.Tensor,
+    v_A: torch.Tensor, v_B: torch.Tensor,
+    o_A: torch.Tensor, o_B: torch.Tensor,
+    lora_scaling: float,
+    rms_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Reverse walk of the attention block of one FA layer.
+
+    Forward (for reference):
+        normalized_in = rms_norm(hidden_in, input_norm_w)
+        q_raw = q_W·normalized_in + LoRA   →  [S, FA_Q_HEADS, 2, FA_HEAD_DIM]
+        k_raw = k_W·normalized_in + LoRA   →  [S, FA_KV_HEADS, FA_HEAD_DIM]
+        v     = v_W·normalized_in + LoRA   →  [S, FA_KV_HEADS, FA_HEAD_DIM]
+        Q_h   = q_raw[:, :, 0, :]          (drop gate)
+        Gate  = q_raw[:, :, 1, :]
+        Q     = rope(qknorm(Q_h, q_nw))
+        K     = rope(qknorm(k_raw, k_nw))
+        attn_out_unfold = FA(Q, K, v, causal=True)   ([S, FA_Q_HEADS, FA_HEAD_DIM])
+        attn_out_pre_o  = sigmoid(Gate) · attn_out_unfold
+        attn_out        = o_W·attn_out_pre_o + LoRA
+        h_post_attn     = hidden_in + attn_out
+
+    Returns dh_in (gradient out of this layer; goes to layer L-1's
+    dh_post_attn) and per-projection LoRA grads.
+
+    Implementation: torch autograd through a recomputed sub-graph.
+    Cost is roughly 2× a forward attn pass (one for the recompute,
+    one inside autograd). Faster paths replace the inner autograd
+    with hand-rolled cuDNN FA-bwd + manual QKnorm/RoPE chain rules.
+    """
+    # Detach the fixed inputs (hidden_in, h_post_attn) to leaves, but
+    # keep them requires_grad on the bwd-target axis (hidden_in for
+    # dh_in_through_norm; h_post_attn doesn't need grad — it's just
+    # used to compute the residual).
+    h_in = hidden_in.detach().clone().requires_grad_(True)
+
+    qA = q_A.detach().clone().requires_grad_(True)
+    qB = q_B.detach().clone().requires_grad_(True)
+    kA = k_A.detach().clone().requires_grad_(True)
+    kB = k_B.detach().clone().requires_grad_(True)
+    vA = v_A.detach().clone().requires_grad_(True)
+    vB = v_B.detach().clone().requires_grad_(True)
+    oA = o_A.detach().clone().requires_grad_(True)
+    oB = o_B.detach().clone().requires_grad_(True)
+
+    S = h_in.shape[0]
+
+    # Forward (recompute under autograd).
+    npa = _qwen_rms(h_in, input_norm_w, eps=rms_eps)
+
+    q_raw = npa @ q_W.t() + lora_scaling * (npa @ qA) @ qB         # [S, FA_QPROJ_SIZE]
+    k_raw = npa @ k_W.t() + lora_scaling * (npa @ kA) @ kB         # [S, FA_KV_SIZE]
+    v_raw = npa @ v_W.t() + lora_scaling * (npa @ vA) @ vB         # [S, FA_KV_SIZE]
+
+    q_packed = q_raw.view(S, _FA_Q_HEADS, 2, _FA_HEAD_DIM)
+    Q_h = q_packed[:, :, 0, :]                                      # [S, FA_Q_HEADS, FA_HEAD_DIM]
+    Gate = q_packed[:, :, 1, :]                                     # same
+    K_h = k_raw.view(S, _FA_KV_HEADS, _FA_HEAD_DIM)
+    V   = v_raw.view(S, _FA_KV_HEADS, _FA_HEAD_DIM)
+
+    Q_normed = _qwen_rms(Q_h, q_nw, eps=rms_eps)
+    K_normed = _qwen_rms(K_h, k_nw, eps=rms_eps)
+
+    Q = _qwen_rope(Q_normed)
+    K = _qwen_rope(K_normed)
+
+    # Expand K, V to FA_Q_HEADS for SDPA (GQA expansion).
+    K_e = K.repeat_interleave(_FA_GQA, dim=1)                       # [S, FA_Q_HEADS, D]
+    V_e = V.repeat_interleave(_FA_GQA, dim=1)
+
+    # SDPA expects [B, H, S, D].
+    Q_b = Q.permute(1, 0, 2).unsqueeze(0).contiguous()              # [1, FA_Q_HEADS, S, D]
+    K_b = K_e.permute(1, 0, 2).unsqueeze(0).contiguous()
+    V_b = V_e.permute(1, 0, 2).unsqueeze(0).contiguous()
+
+    attn_b = torch.nn.functional.scaled_dot_product_attention(
+        Q_b, K_b, V_b, is_causal=True)                              # [1, H, S, D]
+    attn_unfold = attn_b.squeeze(0).permute(1, 0, 2)                # [S, FA_Q_HEADS, D]
+
+    attn_pre_o = torch.sigmoid(Gate.float()).to(attn_unfold.dtype) * attn_unfold
+    attn_pre_o_flat = attn_pre_o.reshape(S, _FA_Q_SIZE)
+
+    attn_out = attn_pre_o_flat @ o_W.t() + lora_scaling * (attn_pre_o_flat @ oA) @ oB
+
+    # The forward gives h_post_attn_recomp = h_in + attn_out, and the
+    # caller passed dh_post_attn as the upstream gradient. Backward:
+    h_post_attn_recomp = h_in + attn_out
+    h_post_attn_recomp.backward(dh_post_attn)
+
+    return {
+        "dh_in":      h_in.grad.detach(),    # [S, HIDDEN] fp32; consumed by layer L-1
+        "grad_q_A":   qA.grad.detach(),
+        "grad_q_B":   qB.grad.detach(),
+        "grad_k_A":   kA.grad.detach(),
+        "grad_k_B":   kB.grad.detach(),
+        "grad_v_A":   vA.grad.detach(),
+        "grad_v_B":   vB.grad.detach(),
+        "grad_o_A":   oA.grad.detach(),
+        "grad_o_B":   oB.grad.detach(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # FA-layer reverse walk (stub)
 # ---------------------------------------------------------------------------
 
@@ -354,6 +533,6 @@ def run_layer_walking_bwd(
 
 __all__ = [
     "lora_linear_bwd", "rmsnorm_bwd", "swiglu_bwd",
-    "layer_mlp_bwd",
+    "layer_mlp_bwd", "layer_attn_bwd_fa",
     "per_layer_bwd_fa", "per_layer_bwd_dn", "run_layer_walking_bwd",
 ]
