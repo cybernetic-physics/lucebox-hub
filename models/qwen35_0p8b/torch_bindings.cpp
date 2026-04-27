@@ -201,6 +201,14 @@ struct SavedActivationsPF {
     // Slice B.2 saves — see prefill.cu for the layout details.
     void *attn_out_pre_o;
     void *h_post_attn;
+    // Slice B.3b kernel-bwd saves (FA-only): Q post-RoPE/QKnorm, O
+    // post-FA pre-gate, LSE log-sum-exp from cuDNN. Shapes:
+    //   fa_q_save   [N_FA, S, FA_Q_HEADS, FA_HEAD_DIM] bf16
+    //   fa_o_save   same
+    //   fa_lse_save [N_FA, FA_Q_HEADS, S]              fp32
+    void *fa_q_save;
+    void *fa_o_save;
+    void *fa_lse_save;
 };
 
 extern "C" void launch_prefill_bf16(
@@ -388,7 +396,11 @@ void prefill_bf16_train_step(
     torch::Tensor mlp_inter_save,
     // Slice B.2 saves — pass empty tensors to keep this op backward-compat.
     torch::Tensor attn_out_pre_o_save,
-    torch::Tensor h_post_attn_save)
+    torch::Tensor h_post_attn_save,
+    // Slice B.3b kernel-bwd saves (FA only) — pass empty tensors to skip.
+    torch::Tensor fa_q_save,
+    torch::Tensor fa_o_save,
+    torch::Tensor fa_lse_save)
 {
     LoraPFSet lora{
         opt_ptr(fa_q_A),    opt_ptr(fa_q_B),
@@ -412,6 +424,9 @@ void prefill_bf16_train_step(
         const_cast<void*>(opt_ptr(mlp_inter_save)),
         const_cast<void*>(opt_ptr(attn_out_pre_o_save)),
         const_cast<void*>(opt_ptr(h_post_attn_save)),
+        const_cast<void*>(opt_ptr(fa_q_save)),
+        const_cast<void*>(opt_ptr(fa_o_save)),
+        const_cast<void*>(opt_ptr(fa_lse_save)),
     };
     launch_prefill_bf16(
         (const int*)token_ids.data_ptr(), token_ids.size(0),
@@ -551,7 +566,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "int lora_rank, float lora_scaling, Tensor lora_h_ws, "
             "Tensor hidden_in_save, Tensor normalized_in_save, "
             "Tensor normalized_post_attn_save, Tensor mlp_inter_save, "
-            "Tensor attn_out_pre_o_save, Tensor h_post_attn_save) -> ()");
+            "Tensor attn_out_pre_o_save, Tensor h_post_attn_save, "
+            "Tensor fa_q_save, Tensor fa_o_save, Tensor fa_lse_save) -> ()");
     ops.impl("prefill_bf16_train_step", torch::kCUDA, &prefill_bf16_train_step);
 
     ops.def("prefill_bf16_mega(Tensor output_token, Tensor token_ids, "

@@ -89,6 +89,10 @@ def run_train_step(w, tokens, lora_tensors, lora_rank, lora_scaling, saves):
         saves.get("mlp_inter", empty),
         saves.get("attn_out_pre_o", empty),
         saves.get("h_post_attn", empty),
+        saves.get("fa_q_save", empty),
+        saves.get("fa_o_save", empty),
+        saves.get("fa_lse_save",
+                  torch.empty(0, dtype=torch.float32, device="cuda")),
     )
     return int(sc["out_token"].item())
 

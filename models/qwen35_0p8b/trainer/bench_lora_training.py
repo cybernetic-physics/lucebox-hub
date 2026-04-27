@@ -102,6 +102,7 @@ def alloc_activation_saves(S: int):
 def run_our_train_step(weights, layers_packed, tokens, sc, saves,
                        lora_tensors, lora_rank, lora_scaling):
     empty = torch.empty(0, dtype=torch.bfloat16, device="cuda")
+    empty_f32 = torch.empty(0, dtype=torch.float32, device="cuda")
     torch.ops.qwen35_megakernel_bf16_C.prefill_bf16_train_step(
         sc["out_token"], tokens.to(dtype=torch.int32, device="cuda").contiguous(),
         weights["embed_weight"], layers_packed,
@@ -116,8 +117,9 @@ def run_our_train_step(weights, layers_packed, tokens, sc, saves,
         lora_rank, lora_scaling, sc["lora_h_ws"],
         saves["hidden_in"], saves["normalized_in"],
         saves["normalized_post_attn"], saves["mlp_inter"],
-        # Slice B.2 saves not needed for this bench — pass empties.
+        # Slice B.2 + B.3b saves not needed for this bench — pass empties.
         empty, empty,
+        empty, empty, empty_f32,
     )
 
 

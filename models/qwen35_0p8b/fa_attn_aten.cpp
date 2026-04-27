@@ -75,6 +75,23 @@ extern "C" void launch_fa_attn_aten(
     __nv_bfloat16 *out,
     int S,
     int max_seq,
+    // Optional per-layer save buffers for the FA backward (Slice B.3b
+    // optimization round). All four are written iff non-null:
+    //   q_save  : [S, FA_Q_HEADS, FA_HEAD_DIM]  bf16
+    //               post-RoPE/QKnorm Q (contiguous), the input cuDNN
+    //               FA-2 bwd consumes
+    //   o_save  : [S, FA_Q_HEADS, FA_HEAD_DIM]  bf16
+    //               FA output BEFORE the sigmoid-gate is applied (i.e.
+    //               just cuDNN's O), so the bwd path can reverse the
+    //               gate analytically without re-running FA-2 forward
+    //   lse_save: [FA_Q_HEADS, S]               fp32  (cuDNN's native
+    //                                                  layout — [H, S],
+    //                                                  not [S, H])
+    //               log-sum-exp from cuDNN, also consumed by FA-2 bwd
+    // K and V live in the cache and are addressed by the bwd directly.
+    __nv_bfloat16 *q_save,
+    __nv_bfloat16 *o_save,
+    float *lse_save,
     cudaStream_t stream)
 {
     using namespace fa_consts;
@@ -118,10 +135,36 @@ extern "C" void launch_fa_attn_aten(
         /*return_debug_mask=*/false,
         /*scale=*/c10::optional<double>(scale));
     auto O_bhsd = std::get<0>(r);  // [1, FA_Q_HEADS, S, FA_HEAD_DIM]
+    auto LSE    = std::get<1>(r);  // [1, FA_Q_HEADS, S]              fp32
 
     // Reshape O to [S, FA_Q_HEADS, FA_HEAD_DIM] = [S, FA_Q_SIZE] flat.
     auto O_shd = O_bhsd.permute({0, 2, 1, 3}).contiguous();
     auto O_flat = O_shd.view({S, FA_Q_SIZE});
+
+    // ----- Optional saves for the bwd path -----
+    if (q_save != nullptr) {
+        // q is [1, FA_Q_HEADS, S, FA_HEAD_DIM] contiguous; we want
+        // [S, FA_Q_HEADS, FA_HEAD_DIM] in q_save (matches the layout
+        // attn_out_pre_o etc. use elsewhere).
+        auto q_shd = q.squeeze(0).permute({1, 0, 2}).contiguous();
+        size_t bytes = (size_t)S * FA_Q_HEADS * FA_HEAD_DIM * sizeof(__nv_bfloat16);
+        cudaMemcpyAsync(q_save, q_shd.data_ptr(), bytes,
+                        cudaMemcpyDeviceToDevice, stream);
+    }
+    if (o_save != nullptr) {
+        // O_shd is [1, S, FA_Q_HEADS, FA_HEAD_DIM] contiguous after the
+        // permute — same shape we want for o_save.
+        size_t bytes = (size_t)S * FA_Q_HEADS * FA_HEAD_DIM * sizeof(__nv_bfloat16);
+        cudaMemcpyAsync(o_save, O_shd.data_ptr(), bytes,
+                        cudaMemcpyDeviceToDevice, stream);
+    }
+    if (lse_save != nullptr) {
+        // LSE is [1, FA_Q_HEADS, S] fp32 — squeeze to [FA_Q_HEADS, S].
+        auto lse_hs = LSE.squeeze(0).contiguous();
+        size_t bytes = (size_t)FA_Q_HEADS * S * sizeof(float);
+        cudaMemcpyAsync(lse_save, lse_hs.data_ptr(), bytes,
+                        cudaMemcpyDeviceToDevice, stream);
+    }
 
     // Apply sigmoid-gate from the second half of q_proj and write to
     // `out`. The kernel reads gate at the per-(pos, head) slot

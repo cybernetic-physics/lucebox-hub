@@ -1017,6 +1017,15 @@ struct SavedActivationsPF {
     //   the pre-norm input — y alone is not enough to recover rstd).
     __nv_bfloat16 *attn_out_pre_o;
     __nv_bfloat16 *h_post_attn;
+    // Slice B.3b kernel-bwd saves — let per_layer_bwd_fa skip the
+    // autograd recompute by feeding cuDNN FA-2 bwd directly. All three
+    // are FA-only (DN layers leave them untouched).
+    //   fa_q_save  : [N_FA, S, FA_Q_HEADS, FA_HEAD_DIM]  bf16
+    //   fa_o_save  : [N_FA, S, FA_Q_HEADS, FA_HEAD_DIM]  bf16
+    //   fa_lse_save: [N_FA, FA_Q_HEADS, S]               fp32
+    __nv_bfloat16 *fa_q_save;
+    __nv_bfloat16 *fa_o_save;
+    float         *fa_lse_save;
 };
 
 // cuDNN FA-2 forward via aten — defined in fa_attn_aten.cpp. The
@@ -1029,6 +1038,9 @@ extern "C" void launch_fa_attn_aten(
     __nv_bfloat16 *out,
     int S,
     int max_seq,
+    __nv_bfloat16 *q_save,    // optional per-layer save buffers (Slice B.3b);
+    __nv_bfloat16 *o_save,    //   pass nullptr to disable
+    float         *lse_save,
     cudaStream_t stream);
 
 static inline void save_bf16_slab(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
@@ -1245,11 +1257,31 @@ static void prefill_bf16_body(
             // pf_causal_attn). Reads Q + Gate from proj_buf, K/V from
             // the cache slice, writes sigmoid(Gate) * attn_out to
             // dn_out_buf in [S, FA_Q_SIZE] layout.
+            //
+            // Optional per-layer Slice B.3b saves for the bwd path —
+            // index by fa_idx into the [N_FA, ...] save slabs.
+            __nv_bfloat16 *fa_q_save_layer = nullptr;
+            __nv_bfloat16 *fa_o_save_layer = nullptr;
+            float         *fa_lse_save_layer = nullptr;
+            if (saved.fa_q_save) {
+                fa_q_save_layer = saved.fa_q_save
+                    + (size_t)fa_idx * S * FA_Q_HEADS * FA_HEAD_DIM;
+            }
+            if (saved.fa_o_save) {
+                fa_o_save_layer = saved.fa_o_save
+                    + (size_t)fa_idx * S * FA_Q_HEADS * FA_HEAD_DIM;
+            }
+            if (saved.fa_lse_save) {
+                fa_lse_save_layer = saved.fa_lse_save
+                    + (size_t)fa_idx * FA_Q_HEADS * S;
+            }
             launch_fa_attn_aten(
                 proj_buf,
                 fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride,
                 dn_out_buf,
-                S, max_seq, stream);
+                S, max_seq,
+                fa_q_save_layer, fa_o_save_layer, fa_lse_save_layer,
+                stream);
 
             // Save the o_proj input (causal-attention output, pre-o_proj) for bwd.
             save_bf16_slab(saved.attn_out_pre_o, dn_out_buf, li, S, FA_Q_SIZE, stream);
