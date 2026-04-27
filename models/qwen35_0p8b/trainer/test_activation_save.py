@@ -87,6 +87,8 @@ def run_train_step(w, tokens, lora_tensors, lora_rank, lora_scaling, saves):
         saves.get("normalized_in", empty),
         saves.get("normalized_post_attn", empty),
         saves.get("mlp_inter", empty),
+        saves.get("attn_out_pre_o", empty),
+        saves.get("h_post_attn", empty),
     )
     return int(sc["out_token"].item())
 

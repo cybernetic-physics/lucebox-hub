@@ -963,6 +963,17 @@ struct SavedActivationsPF {
     __nv_bfloat16 *normalized_in;
     __nv_bfloat16 *normalized_post_attn;
     __nv_bfloat16 *mlp_inter;
+    // Slice B.2 saves — needed by the layer-walking backward kernels.
+    // attn_out_pre_o[L, S, max(FA_Q_SIZE, DN_V_SIZE)] = input to o_proj
+    //   per layer. For FA layers this is the per-head causal-attention
+    //   output concatenated; for DN layers, the post-gnorm DN output.
+    //   Both are 2048 bf16 elements per position (FA_Q_SIZE = DN_V_SIZE).
+    // h_post_attn[L, S, HIDDEN] = pre-post-attn-RMSnorm residual stream
+    //   (= hidden_in[L] + attn_out[L]). This is the `x` input that
+    //   bwd_rmsnorm needs for the post-attn norm (RMSNorm bwd needs
+    //   the pre-norm input — y alone is not enough to recover rstd).
+    __nv_bfloat16 *attn_out_pre_o;
+    __nv_bfloat16 *h_post_attn;
 };
 
 static inline void save_bf16_slab(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
@@ -1121,10 +1132,15 @@ static void prefill_bf16_body(
             pf_deltanet_gnorm<<<S * DN_HEADS, 128, 0, stream>>>(
                 dn_out_buf, proj_buf2, dn_norm, S);
 
+            // Save the o_proj input (post-gnorm DN output) for bwd.
+            save_bf16_slab(saved.attn_out_pre_o, dn_out_buf, li, S, DN_V_SIZE, stream);
+
             // Out projection + residual
             cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
             APPLY_LORA(lora.dn_out_A, lora.dn_out_B, dn_out_buf, proj_buf, DN_V_SIZE, HIDDEN, dn_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            // Save pre-post-attn-RMSnorm residual (= hidden_in[L] + attn_out[L]).
+            save_bf16_slab(saved.h_post_attn, hidden, li, S, HIDDEN, stream);
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
@@ -1169,9 +1185,14 @@ static void prefill_bf16_body(
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
 
+            // Save the o_proj input (causal-attention output, pre-o_proj) for bwd.
+            save_bf16_slab(saved.attn_out_pre_o, dn_out_buf, li, S, FA_Q_SIZE, stream);
+
             cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
             APPLY_LORA(lora.fa_o_A, lora.fa_o_B, dn_out_buf, proj_buf, FA_Q_SIZE, HIDDEN, fa_idx);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            // Save pre-post-attn-RMSnorm residual (= hidden_in[L] + attn_out[L]).
+            save_bf16_slab(saved.h_post_attn, hidden, li, S, HIDDEN, stream);
 
             // MLP
             pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);

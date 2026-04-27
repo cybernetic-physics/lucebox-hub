@@ -174,15 +174,30 @@ def alloc_scratch(S: int, lora_rank: int) -> dict:
     )
 
 
-def alloc_activation_saves(S: int) -> dict:
-    """The 4 per-layer slabs `prefill_bf16_train_step` writes during fwd."""
+def alloc_activation_saves(S: int, *, with_b2_saves: bool = True) -> dict:
+    """The per-layer activation slabs `prefill_bf16_train_step` writes
+    during fwd. Returns 4 slabs (the original Slice B.1 set) plus, when
+    ``with_b2_saves=True``, the two extra Slice B.2 slabs the layer-
+    walking backward needs:
+
+      attn_out_pre_o  — input to o_proj (FA causal-attn output / DN
+                        post-gnorm output, both [S, 2048])
+      h_post_attn     — pre-post-attn-RMSnorm residual stream
+
+    DN_V_SIZE == FA_Q_SIZE == 2048 in Qwen3.5-0.8B; the same slab shape
+    works for both layer types.
+    """
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
-    return dict(
+    out = dict(
         hidden_in=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
         normalized_in=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
         normalized_post_attn=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
         mlp_inter=torch.empty(NUM_LAYERS, S, INTER, **bf16),
     )
+    if with_b2_saves:
+        out["attn_out_pre_o"] = torch.empty(NUM_LAYERS, S, DN_V_SIZE, **bf16)
+        out["h_post_attn"] = torch.empty(NUM_LAYERS, S, HIDDEN, **bf16)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +230,7 @@ def _train_step_forward(
         sc = alloc_scratch(S, lora_rank)
     if saves is None:
         saves = alloc_activation_saves(S)
+    empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device="cuda")
     torch.ops.qwen35_megakernel_bf16_C.prefill_bf16_train_step(
         sc["out_token"], tokens.to(dtype=torch.int32, device="cuda").contiguous(),
         handle.embed_weight, handle.layers_packed,
@@ -228,6 +244,8 @@ def _train_step_forward(
         *lora_flat, lora_rank, lora_scaling, sc["lora_h_ws"],
         saves["hidden_in"], saves["normalized_in"],
         saves["normalized_post_attn"], saves["mlp_inter"],
+        saves.get("attn_out_pre_o", empty_bf16),
+        saves.get("h_post_attn", empty_bf16),
     )
     return sc, saves
 
