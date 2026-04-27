@@ -443,12 +443,92 @@ class MegakernelTrainStep(torch.autograd.Function):
         )
 
 
+def kernel_loss_autograd(
+    handle: BaseModelHandle,
+    prompt_tokens: torch.Tensor,     # [P]
+    target_tokens: torch.Tensor,     # [T]
+    lora_flat: list[torch.Tensor],
+    lora_rank: int,
+    lora_scaling: float,
+) -> dict:
+    """Run kernel forward, then backward to d(h_pre_norm) via torch autograd.
+
+    This is the entry point Slice B.3 builds on. Layout:
+
+        kernel forward  -> h_pre_norm     (LEAF in autograd; opaque kernel)
+        h_pre_norm      -> rms_norm()     (autograd-tracked python)
+                        -> @ lm_head.T    (autograd-tracked python)
+                        -> log_softmax    (autograd-tracked)
+                        -> nll mean       (autograd-tracked)
+        loss            -> loss.backward()
+        h_pre_norm.grad = d(loss)/d(h_pre_norm) — the gradient flowing
+                          into the per-layer reverse walk.
+
+    For Slice B.3b the layer-walking backward consumes h_pre_norm.grad
+    + the saved activations and produces grads on the LoRA params. This
+    function is the foundation: validates that the upstream-of-layers
+    autograd is set up correctly.
+
+    Returns:
+        loss              : scalar fp32 cuda tensor (autograd-tracked)
+        grad_h_pre_norm   : [S, HIDDEN] fp32 cuda tensor — the gradient
+                            d(loss)/d(h_pre_norm) for all S positions.
+                            For positions outside `predict_pos` this is
+                            zero (they don't contribute to the loss).
+        h_pre_norm        : [S, HIDDEN] bf16 cuda tensor — the kernel's
+                            pre-final-norm hidden, kept alive so the
+                            caller can pass it to the layer-walking bwd.
+        saves             : 6-slab activation save dict (B.1 + B.2).
+        scratch           : kernel scratch buffers (kept alive).
+        predict_pos       : torch.LongTensor of positions whose
+                            predictions correspond to target_tokens.
+    """
+    P = int(prompt_tokens.numel())
+    T = int(target_tokens.numel())
+    if T == 0:
+        raise ValueError("target_tokens must be non-empty")
+    full = torch.cat([prompt_tokens, target_tokens], dim=0)
+    S = int(full.numel())
+
+    sc, saves = _train_step_forward(
+        handle, full, lora_flat, lora_rank, lora_scaling,
+    )
+
+    # Detach and clone sc["hidden"] into a leaf tensor with requires_grad.
+    # The kernel's own buffer is opaque to autograd; we want grad routing
+    # to STOP here so we can read it explicitly.
+    h_pre_norm = sc["hidden"].view(S, HIDDEN).detach().clone()
+    h_pre_norm.requires_grad_(True)
+
+    # Autograd-tracked python from h_pre_norm to loss.
+    final_normed = _rms_norm_qwen(h_pre_norm, handle.final_norm_weight)
+    predict_pos = torch.arange(P - 1, P - 1 + T, device="cuda")
+    predict_logits = (final_normed[predict_pos].float()
+                      @ handle.lm_head_weight.float().t())  # [T, VOCAB]
+    log_probs = torch.nn.functional.log_softmax(predict_logits, dim=-1)
+    logp = log_probs.gather(1, target_tokens.long().unsqueeze(1)).squeeze(1)
+    loss = -logp.mean()
+
+    grad_h_pre_norm, = torch.autograd.grad(loss, h_pre_norm,
+                                            retain_graph=False,
+                                            create_graph=False)
+    return {
+        "loss": loss.detach(),
+        "grad_h_pre_norm": grad_h_pre_norm,    # [S, HIDDEN] fp32
+        "h_pre_norm": h_pre_norm.detach(),     # [S, HIDDEN] bf16
+        "saves": saves,
+        "scratch": sc,
+        "predict_pos": predict_pos,
+    }
+
+
 __all__ = [
     "BaseModelHandle",
     "load_base_model",
     "alloc_scratch",
     "alloc_activation_saves",
     "kernel_sequence_loss",
+    "kernel_loss_autograd",
     "per_position_final_normed",
     "MegakernelTrainStep",
 ]
