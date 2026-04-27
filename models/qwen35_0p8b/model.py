@@ -8,12 +8,12 @@ NUM_LAYERS = 24
 HIDDEN_SIZE = 1024
 INTERMEDIATE_SIZE = 3584
 VOCAB_SIZE = 248320
-MAX_SEQ_LEN = 32768  # KV cache row count for the Decoder. Bumped from 2048
-                    # so long-context rollouts (up to 32K) work without
-                    # rebuilding the kernel — both decode and prefill take
-                    # max_seq as a runtime parameter and use it for the
-                    # FA cache stride. Memory cost: ~384 MB extra at
-                    # 32K (vs 2048) per Decoder, fine on B200.
+MAX_SEQ_LEN = 65536  # KV cache row count for the Decoder. Sized for 64K-
+                    # token rollouts. Both decode and prefill take max_seq
+                    # as a runtime parameter and use it for the FA cache
+                    # stride. Memory cost: ~768 MB total per Decoder
+                    # (6 FA layers × 2 (K+V) × 65536 rows × 2 KV heads
+                    # × 256 head_dim × 2 bytes), fine on B200's 192 GB.
 
 FA_NUM_Q_HEADS = 8
 FA_NUM_KV_HEADS = 2

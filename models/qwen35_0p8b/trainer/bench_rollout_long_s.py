@@ -37,7 +37,8 @@ def time_fn(fn, runs=3, warm=1):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt-lens", type=int, nargs="+",
-                    default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768])
+                    default=[128, 256, 512, 1024, 2048, 4096, 8192,
+                             16384, 32768, 65536])
     ap.add_argument("--gen-tokens", type=int, default=32)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warm", type=int, default=1)
