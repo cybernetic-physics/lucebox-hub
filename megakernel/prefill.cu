@@ -217,19 +217,31 @@ pf_deltanet_recurrence(
         float beta = s_beta, decay = s_decay;
         __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
 
-        // State-in-registers recurrence. Write fp32 result to s_out so the
-        // gated-RMSNorm tail can read it without a bf16 round-trip through
-        // global memory.
+        // State-in-registers recurrence. Cache each lane's RPL=4 slice of
+        // s_q and s_k into registers once per step so the CPW=8 inner-loop
+        // iterations read from regs instead of shared (was 8×4×2 = 64
+        // shared reads per step per warp for s_k/s_q — now 4+4 once).
+        float sk_cache[RPL];
+        float sq_cache[RPL];
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++) {
+            sk_cache[ii] = s_k[lid + ii*32];
+            sq_cache[ii] = s_q[lid + ii*32];
+        }
+
+        #pragma unroll
         for (int jj = 0; jj < CPW; jj++) {
             int j = wid * CPW + jj;
             float kv = 0;
-            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid+ii*32];
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * sk_cache[ii];
             kv = pf_warp_sum(kv); kv = __shfl_sync(0xffffffff, kv, 0);
             float delta = (s_v[j] - decay * kv) * beta;
             float attn = 0;
+            #pragma unroll
             for (int ii = 0; ii < RPL; ii++) {
-                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + s_k[lid+ii*32] * delta;
-                attn += sreg[jj*RPL+ii] * s_q[lid+ii*32];
+                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + sk_cache[ii] * delta;
+                attn += sreg[jj*RPL+ii] * sq_cache[ii];
             }
             attn = pf_warp_sum(attn);
             if (lid == 0) s_out[j] = attn;
