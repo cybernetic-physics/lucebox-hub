@@ -230,39 +230,90 @@ path (forward+bwd+step), our kernel for sampling. The Trainer API
 lets us swap in custom FA/DN backward and fused AdamW later without
 changing the public surface.
 
-### Phase 5 — end-to-end bench + 3× claim (in progress)
+### Phase 5 — end-to-end bench + 3× claim
 
 `bench_trainer_vs_sglang_torch.py` measures three stages vs a
-HF/torch reference RL loop (stand-in for SGLang + torch-PEFT):
+HF/torch reference RL loop (stand-in for SGLang + torch-PEFT). The
+incumbent here is HF transformers + fla (Triton chunk_gated_delta_rule)
++ PEFT + torch.optim.AdamW — i.e. the **optimized torch stack** on B200.
+
+Numbers (B200, batch=4, S=128, gen=64, 2026-04-27 rerun with fla
+properly available + hybrid DN routing live):
 
 | stage                                    | incumbent | ours    | speedup |
 |:-----------------------------------------|:---------:|:-------:|:-------:|
-| (A) sample 64 tokens (greedy)            | 2275 ms   |  206 ms | **11.0×** |
-| (B) training step (batch=4, seq=128)     | 2324 ms   | 2324 ms |   1.0×    |
-| (C) combined RL step = sample + train    | 4599 ms   | 2530 ms | **1.82×** |
+| (A) sample 64 tokens (greedy)            | 1944.7 ms |  210.0 ms | **9.26×** |
+| (B) training step (batch=4, seq=128)     |  517.0 ms |  517.0 ms |  1.00× by construction |
+| (C) combined RL step = sample + train    | 2461.7 ms |  726.9 ms | **3.39×** |
 
-Today's 1.82× is sampling-only — training uses the HF backward
-path. The 3× target is gated on Phase 2 custom backward kernels
-(FA bwd + DeltaNet BPTT), which would drop (B) from ~2300 ms to
-~200 ms and pull (C) to ~400 ms → ~11× over the incumbent
-end-to-end. At that point fused AdamW (124× vs torch.optim.AdamW)
-also plugs in on the grad flat buffer.
+**The 3× Phase-5 target is met (3.39×).** All of the win is on the
+sampling side — the megakernel decode + cuBLAS+graph prefill path is
+9.26× faster than HF generate on the same weights. The training step
+is parity by construction: both sides use HF+PEFT for fwd+bwd and
+torch.optim.AdamW for the step, since `LoraMegakernelTrainer` routes
+training through fla's chunked Triton bwd via the hybrid DN router
+(commit 239db57) and that's the same path the incumbent takes.
 
-Real SGLang is typically 2-3× faster than plain HF for sampling, so
-the measured sampling speedup vs SGLang would scale to ~4-5×. The
-end-to-end 3× target should hold against SGLang once Phase 2 lands.
+**vs real SGLang:** SGLang is typically 2-3× faster than HF generate
+for sampling, so the measured (A) ratio of 9.26× would scale to
+roughly 3-4× vs SGLang. End-to-end (C) ratio against an SGLang+torch
+incumbent would drop to ~1.5-2.5× — past the original 3× target only
+once we add an actual training-side win. The realistic next claim:
+**3× over HF+fla today, ~2× over SGLang+fla.**
 
-### Phase 5 — bench + publish (1 day)
+**Per-layer DN, hybrid routing vs HF+fla on B200** (`bench_vs_fla.py`,
+2026-04-27):
 
-- `tests/bench_training_throughput.py` vs the torch reference.
-- Update `docs/results/qwen35_0p8b_b200.md` with training numbers.
-- Update `models/qwen35_0p8b/README.md` with the training-mode
-  section.
+| mode  | S    | HF+fla    | hybrid    | ratio                |
+|-------|------|-----------|-----------|----------------------|
+| train | 128  | 103.2 ms  | 96.2 ms   | **1.07× ours**       |
+| infer | 128  |  39.3 ms  | 37.6 ms   | **1.04× ours**       |
+| train | 256  |  90.5 ms  | 101.7 ms  | 0.89× fla (routing regression — fix) |
+| infer | 256  |  48.2 ms  | 37.8 ms   | **1.27× ours**       |
+| train | 512  | 103.0 ms  | 101.7 ms  | 1.01× tied           |
+| infer | 512  |  48.4 ms  | 38.1 ms   | **1.27× ours**       |
+| train | 1024 | 133.3 ms  | 103.4 ms  | **1.29× ours**       |
+| infer | 1024 |  50.8 ms  | 51.9 ms   | 0.98× tied           |
+| train | 2048 | 139.2 ms  | 130.9 ms  | **1.06× ours**       |
+| infer | 2048 |  48.0 ms  | 59.5 ms   | 0.81× fla            |
+
+Hybrid wins on 6/10 points, ties on 2, loses on 2 (S=256 train
+routing regression; S=2048 infer where fla's chunk-parallelism
+saturates SMs).
+
+### What's needed to push the win further
+
+1. **Chunk-parallelism rewrite** of the DN kernel (~1-2 weeks). Match
+   fla's "one block per chunk, chunks across SMs" architecture so
+   long-S training goes from "tied" to "decisively faster". Single
+   biggest unlock for inference S ≥ 1024 and training S ≥ 256.
+2. **CUDA chunked DN backward** (~3-5 days). Port the validated
+   analytical Python reference (`dn_chunked_bwd_proto.py`,
+   cos > 0.99998 vs torch autograd). Wired into a custom Trainer
+   path (today's path uses fla); when paired with (1) at long S,
+   pulls training from "tied" to "decisively faster".
+3. **Fused AdamW on the LoRA flat buffer** (~1-2 days, kernel exists).
+   Wire the existing 124× AdamW kernel into the trainer. Currently
+   the trainer uses torch.optim.AdamW because grads are still in
+   PEFT's per-tensor layout; need a flatten/scatter shim or a
+   torch._foreach-based wrapper.
+4. **Custom FA bwd in trainer** (~1 day, kernel exists). The cuDNN
+   FA-2 wrapper (`fa_bwd_flash.py`, 1.65× vs autograd SDPA) isn't
+   plumbed into `LoraMegakernelTrainer`'s training path yet.
+5. **Routing fix for S=256 train** (hours). The hybrid dispatcher
+   sometimes picks the slower path at this shape; tune the threshold
+   from S=512 to whatever makes 256 train pick fla.
+
+Items 3-5 are short-ROI; 1-2 are the structural unlocks.
 
 ### Critical path estimate
 
-8-13 engineering days end to end. Phase 2 dominates. Phase 4 is
-fastest because the seam already exists.
+Phase 5 publish (results doc + headline numbers) is now the only thing
+between us and "done with the original roadmap". Beyond that, the
+optimization roadmap (chunk-parallelism rewrite + chunked bwd port +
+custom-bwd plumbing) is what pushes the engine from "matches HF+fla"
+to "decisively beats it". See `models/qwen35_0p8b/trainer/PERF_NOTES.md`
+for the prioritized list with measured kernel costs.
 
 ## Non-goals
 

@@ -7,6 +7,157 @@ Snapshot of where we are and what each optimization buys, by shape regime.
 > fla isn't installed) is much slower than HF + fla (production). Numbers
 > below distinguish the two.
 
+## What the profile says (2026-04-27)
+
+`torch.profiler` runs of `LoraMegakernelTrainer` on B200 (GPU 0/1),
+batch=4, S=128, gen=64. **Both phases of the RL step are CPU-overhead-
+bound, not compute-bound.** The DN kernel optimizations enumerated
+below the fold (Tiers 1-5) are real, but they are *not the binding
+constraint today.*
+
+### RL rollout (sample 64 tokens) — 206 ms wall
+
+The headline 9.26× sampling speedup was measured against HF — but our
+own rollout still has a glaring inefficiency:
+
+| measurement                                          | value          |
+|------------------------------------------------------|----------------|
+| total wall                                           | 206.3 ms       |
+| `qwen35_megakernel_bf16_C::decode` calls / rollout   | **191** (= 127 prompt + 64 gen) |
+| per-call decode kernel time                          | ~937 µs        |
+| `cudaStreamSynchronize` CPU time / rollout           | 200.7 ms (97%) |
+| Memcpy D→H per rollout                               | 191            |
+
+**`LoraMegakernelTrainer.sample` runs the prompt one token at a time
+through `Decoder.step()`** instead of using the cuBLAS+graph
+`prefill_bf16_with_lora` op that already exists and processes 128
+tokens in 6.5 ms. For a 128-token prompt, that's **127 decode steps =
+~119 ms wasted** before sampling even starts.
+
+Per-step decode also `.item()`s the next token back to host on every
+step, forcing a D→H sync × 191. For greedy decode, the token only
+needs to move host-side once at the end.
+
+### Training step (fwd+bwd+optim) — 442 ms wall, batch=4 S=128
+
+| measurement                                          | value          |
+|------------------------------------------------------|----------------|
+| total wall (fwd+bwd+optim)                           | 442.8 ms       |
+| total **GPU** time (sum of all CUDA kernels)         | **64.4 ms**    |
+| **GPU utilization**                                  | **~15%**       |
+| total kernel **launches** / step                     | **~19,500**    |
+| per-launch CPU cost (cudaLaunchKernel)               | ~7.0 µs        |
+| total CPU launch overhead / step                     | **~140 ms**    |
+| autograd / PEFT bookkeeping (the rest of the gap)    | **~240 ms**    |
+
+GPU compute breakdown per step (64 ms total):
+
+| bucket                                     | ms/step | share |
+|--------------------------------------------|--------:|------:|
+| matmuls (cuBLAS Blackwell `nvjet_*`)       |   17.6  | 27%   |
+| element-wise (mul/add/copy/silu/cast/...)  |   30.0  | 47%   |
+| DN fwd+bwd (fla Triton)                    |    7.0  | 11%   |
+| RMSNorm + reductions                       |    4.0  |  6%   |
+| conv1d fwd+bwd (depthwise)                 |    2.0  |  3%   |
+| AdamW (torch.optim)                        |    1.6  |  2%   |
+| other                                      |    2.2  |  4%   |
+
+**The DN kernel is 11% of the GPU time and 1.6% of wall.** Our long
+analysis below about chunk-parallelism and tcgen05 ports addresses a
+problem that contributes ~7 ms to a 442 ms step. Even a 10× DN kernel
+speedup saves 6 ms of wall — under 2%.
+
+What actually dominates is launch overhead from PEFT's per-projection
+LoraLinear (24 layers × 13 LoRA'd projections × autograd-graph-
+creation per fwd+bwd call) and the autograd engine itself.
+
+## What to ship first, grounded in this profile
+
+The order below is deliberately different from the (still-correct,
+but lower-leverage) tiered list further down. **Ship in this order
+because each item saves measurably more wall-time than the next.**
+
+### Tier 0 — fix the wall, not the kernels (do these first)
+
+**0.1 — Use `prefill_bf16_with_lora` for the rollout prompt.**
+   - Replace `for tid in prompt[:-1]: decoder.step(tid)` with one
+     prefill call into the same `dn_states` / `fa_k_cache` /
+     `fa_v_cache` buffers the decoder uses.
+   - Rollout 206 ms → ~85 ms = **2.4× faster sampling.**
+   - Combined RL step 727 ms → ~600 ms = **4.1× over HF+fla** (vs
+     today's 3.39×).
+   - Effort: ~1 day. The op already exists; needs a glue path that
+     populates the Decoder's internal state from prefill output.
+
+**0.2 — Replace HF+PEFT training path with our cuBLAS+graph forward
++ existing custom backward kernels.**
+   - Forward: `prefill_bf16_train_step` — already saves the 4 per-
+     layer activation slabs the bwd needs. ~6.5 ms at S=128.
+   - Backward: stitch together the kernels we *already shipped* into
+     a single autograd.Function:
+       - CE + LM head bwd (`bwd_ce_lm_head_kernel`)
+       - RMSNorm bwd (`bwd_rmsnorm_kernel`)
+       - SwiGLU/MLP bwd + LoRA-linear bwd (in `kernel.cu`)
+       - FA bwd via cuDNN FA-2 (`fa_bwd_flash.py`, 1.65× vs autograd)
+       - DN bwd: the recurrent CUDA bwd at S ≤ 512, fla otherwise
+         (mirror the hybrid-routing logic from `dn_hf_patch.py`)
+   - Optimizer: wire the **fused AdamW** (`launch_fused_adamw`,
+     measured 124× faster than torch.optim.AdamW on the LoRA flat
+     buffer). Needs a flatten/scatter shim from PEFT's per-tensor
+     grads → contiguous flat buffer.
+   - Training step 442 ms → ~30-50 ms = **~10× faster training.**
+   - Combined RL step (with 0.1): ~85 + 40 = **~125 ms** vs
+     incumbent 2461 ms = **~20× combined** over HF+fla.
+   - Effort: ~3-5 days. All kernels exist; this is wiring, not
+     kernel work.
+
+**0.3 — CUDA Graph wrap of the full training step.**
+   - The graph version (`cuda_graph_train.GraphedTrainStep`) exists
+     and is validated at 1.16× on the *current* HF+PEFT path. After
+     0.2 the graph would replace ~50 ms of remaining launch overhead
+     (~50 launches × 7 µs) plus eliminate autograd graph-build cost.
+   - Independent of 0.2 the graph path is also worth landing today
+     for the 1.16× free, since it's already shipped.
+   - Combined with 0.2: training step ~30-40 ms → ~20-25 ms.
+   - Effort: ~1 day to wire into `LoraMegakernelTrainer`.
+
+**0.4 — Single-call decode-N-tokens** (eliminate per-step D→H sync).
+   - Instead of host-loop `for _ in range(N): tok = decoder.step()`,
+     have one kernel that loops N steps internally. EOS check on
+     device; only memcpy the final token list back at the end.
+   - Cuts 64 D→H syncs/rollout to 1.
+   - Worth ~5-10 ms/rollout (small relative to 0.1, but easy after
+     0.1's prefill path is in place).
+   - Effort: 1-2 days; the cooperative-kernel decode loop is small
+     enough to wrap.
+
+### Tier 1 — DN kernel work (after Tier 0)
+
+These move the needle once Tier 0 has eliminated launch overhead and
+the per-DN-kernel cost actually shows up in the wall time. Today
+they're 11% of GPU and 1.6% of wall; after Tier 0 they'd be ~25-35%
+of a much smaller wall — *then* worth the engineering.
+
+(See the existing tiered analysis below for details on
+chunk-parallelism rewrite, chunked CUDA bwd, tcgen05, etc.)
+
+### Tier 2 — element-wise / RMSNorm fusions
+
+47% of the *current* GPU time is in 13k+ tiny element-wise ops
+(broadcast muls, casts, residual adds). Many are inserted by
+autograd's view/transpose handling. After Tier 0.2 (custom autograd
+Function) most of these collapse into ~25 fused kernels per layer,
+which is automatic from the megakernel rewrite. Don't optimize them
+in isolation.
+
+If after Tier 0 + 1 we still see element-wise dominating, candidates
+are: fuse the post-attn residual + RMSNorm into one kernel; fuse
+RMSNorm + next matmul (already done in the inference megakernel via
+`pf_rmsnorm`); fuse swiglu's `silu(x) * y` with the down-proj input
+load.
+
+
+
 ## Where the time goes today
 
 Three reference points (all per-layer, isolated kernel calls):

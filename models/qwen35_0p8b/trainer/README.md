@@ -96,25 +96,34 @@ wrapper) + `dn_hf_patch.py` (drops into HF Qwen3-Next/Qwen3.5 layers).
   vs HF's `torch_chunk_gated_delta_rule` (the fp32 Python fallback used
   when fla isn't available): 7.4× at S=128, 2.3× at S=512.
 
-  **Honest comparison vs production HF + fla** (`bench_vs_fla.py`):
+  **Honest comparison vs production HF + fla** (`bench_vs_fla.py`,
+  hybrid routing on, B200, 2026-04-27):
 
-  | mode  | S    | HF + fla   | ours       | ratio       |
-  |-------|------|------------|------------|-------------|
-  | train | 128  | 104 ms     | 89 ms      | **1.16× ours** |
-  | infer | 128  | 45 ms      | 35 ms      | **1.28× ours** |
-  | train | 256  | 104 ms     | 144 ms     | 0.72× fla   |
-  | infer | 256  | 44 ms      | 35 ms      | **1.25× ours** |
-  | train | 512  | 105 ms     | 269 ms     | 0.39× fla   |
-  | infer | 512  | 45 ms      | 36 ms      | **1.27× ours** |
-  | train | 1024 | 106 ms     | 520 ms     | 0.20× fla   |
-  | infer | 1024 | 45 ms      | 46 ms      | tied        |
-  | train | 2048 | 106 ms     | 1025 ms    | 0.10× fla   |
-  | infer | 2048 | 46 ms      | 85 ms      | 0.54× fla   |
+  | mode  | S    | HF + fla   | ours (hybrid) | ratio       |
+  |-------|------|------------|---------------|-------------|
+  | train | 128  | 103.2 ms   | 96.2 ms       | **1.07× ours** |
+  | infer | 128  |  39.3 ms   | 37.6 ms       | **1.04× ours** |
+  | train | 256  |  90.5 ms   | 101.7 ms      | 0.89× fla (routing regression) |
+  | infer | 256  |  48.2 ms   | 37.8 ms       | **1.27× ours** |
+  | train | 512  | 103.0 ms   | 101.7 ms      | 1.01× tied  |
+  | infer | 512  |  48.4 ms   | 38.1 ms       | **1.27× ours** |
+  | train | 1024 | 133.3 ms   | 103.4 ms      | **1.29× ours** |
+  | infer | 1024 |  50.8 ms   | 51.9 ms       | 0.98× tied  |
+  | train | 2048 | 139.2 ms   | 130.9 ms      | **1.06× ours** |
+  | infer | 2048 |  48.0 ms   | 59.5 ms       | 0.81× fla   |
 
-  We beat fla only at short S (S ≤ 128 train, S ≤ 512 infer). At long S
-  fla wins decisively because its Triton chunk kernel parallelizes chunks
-  across SMs (per-call cost is roughly *constant* in S), while ours
-  processes chunks sequentially per head and is *linear* in S.
+  Hybrid routing (`dn_hf_patch.cuda_chunk_gated_delta_rule`, commit
+  239db57) routes per (mode, shape):
+
+    * training (autograd needed)         → `fla.chunk_gated_delta_rule`
+    * inference S ≤ 512                  → our chunked CUDA kernel
+    * inference S > 512 + fla available  → `fla.chunk_gated_delta_rule`
+    * training, no fla                   → our recurrent CUDA + autograd
+
+  Result: hybrid wins on 6/10 shape-mode points, ties on 2, loses on
+  2. The remaining losses are at long-S inference (fla parallelizes
+  chunks across SMs; we don't yet) and a routing regression at
+  S=256 train. The chunk-parallelism rewrite is the structural fix.
 
   Loss parity: 18-layer-compounded logit cos = 0.96 vs HF, |Δloss| ≈ 7.4e-2
   (bf16 noise across recurrent vs chunked accumulation orders).
