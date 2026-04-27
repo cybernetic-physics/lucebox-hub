@@ -187,7 +187,9 @@ def dn_attn_backward(d_attn_out: torch.Tensor, saves: dict) -> torch.Tensor:
 
     # --- Step 1: out_proj bwd (frozen). Returns d(attn_pre_o). -----------
     # attn_out = attn_pre_o @ out_proj_W.T → d(attn_pre_o) = d_attn_out @ out_proj_W
-    d_attn_pre_o = (d_attn_out.float() @ out_proj_W.float())             # [B, S, 2048] fp32
+    # bf16 input + bf16 weight uses Blackwell tensor cores (fp32 accum).
+    # Result is bf16 — fp32-cast on demand below.
+    d_attn_pre_o = (d_attn_out.to(torch.bfloat16) @ out_proj_W).float()  # [B, S, 2048] fp32
 
     # --- Step 2: gate split (sigmoid silu(z) * y_normed_pre_gate) ---------
     d_attn_pre_o_h = d_attn_pre_o.view(B, S, Hh, D)
@@ -277,26 +279,27 @@ def dn_attn_backward(d_attn_out: torch.Tensor, saves: dict) -> torch.Tensor:
     d_qkv_raw = d_qkv_t.transpose(1, 2).contiguous()                     # [B, S, 6144] fp32
 
     # --- Step 8: in_proj_qkv bwd (no LoRA) -------------------------------
-    # qkv_raw = npa @ W.T → d(npa)_from_qkv = d(qkv_raw) @ W (fp32 matmul)
-    d_npa_from_qkv = d_qkv_raw @ in_proj_qkv_W.float()                    # [B, S, HIDDEN] fp32
+    # qkv_raw = npa @ W.T → d(npa)_from_qkv = d(qkv_raw) @ W
+    # bf16 matmul on Blackwell tensor cores; fp32 accum.
+    d_npa_from_qkv = (d_qkv_raw.to(torch.bfloat16) @ in_proj_qkv_W).float()  # [B, S, HIDDEN]
 
     # --- Step 9: in_proj_z bwd -------------------------------------------
     d_z_flat = d_z.reshape(B, S, VD).contiguous()                          # [B, S, 2048]
-    d_npa_from_z = d_z_flat @ in_proj_z_W.float()                          # [B, S, HIDDEN]
+    d_npa_from_z = (d_z_flat.to(torch.bfloat16) @ in_proj_z_W).float()    # [B, S, HIDDEN]
 
     # --- Step 10: in_proj_b / in_proj_a bwd ------------------------------
     # beta = sigmoid(b_raw); db_logit = dbeta * sigmoid * (1-sigmoid)
     b_raw_f = saves["b_raw"].float()
     sig_b = torch.sigmoid(b_raw_f)
     db_logit = dbeta * sig_b * (1.0 - sig_b)                               # [B, S, 16] fp32
-    d_npa_from_b = db_logit @ in_proj_b_W.float()                          # [B, S, HIDDEN]
+    d_npa_from_b = (db_logit.to(torch.bfloat16) @ in_proj_b_W).float()    # [B, S, HIDDEN]
 
     # g_log = -A_log.exp() * softplus(a_raw + dt_bias)
     # da = dg * (-A_log.exp()) * sigmoid(a_raw + dt_bias)   (softplus' = sigmoid)
     a_raw_f = saves["a_raw"].float()
     sig_a = torch.sigmoid(a_raw_f + dt_bias.float())
     da = dg * (-A_log.float().exp()) * sig_a                                # [B, S, 16] fp32
-    d_npa_from_a = da @ in_proj_a_W.float()                                 # [B, S, HIDDEN]
+    d_npa_from_a = (da.to(torch.bfloat16) @ in_proj_a_W).float()           # [B, S, HIDDEN]
 
     # --- Step 11: combine npa grads --------------------------------------
     d_npa = d_npa_from_qkv + d_npa_from_z + d_npa_from_b + d_npa_from_a    # [B, S, HIDDEN]
