@@ -43,6 +43,7 @@ sources = [
     "prefill.cu",
     "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
     "dn_chunked.cu",     # chunked DN forward (bf16 tensor cores) used by prefill.cu
+    "dn_chunked_vsplit.cu",  # V-split variant: 64 blocks instead of 16 on B200
 ]
 libraries = ["cublas"]
 cxx_args = ["-O3"]

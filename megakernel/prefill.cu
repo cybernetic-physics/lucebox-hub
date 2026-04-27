@@ -979,6 +979,20 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     int y_stride,
     cudaStream_t stream);
 
+// V-split chunked DN forward — defined in dn_chunked_vsplit.cu. Same
+// math as launch_dn_chunked_fwd, but launches H*V_SPLITS=64 blocks (one
+// per (head, v_split)) so a B200's 148 SMs aren't 89% idle during DN.
+// Per-block V slice is 32; matmul fragments at Dv/2=16 fit one WMMA tile.
+extern "C" cudaError_t launch_dn_chunked_vsplit_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g, const float *state_in,
+    __nv_bfloat16 *y, float *state_out,
+    float *state_chunks,
+    int S, int H,
+    int qkd_stride, int v_stride, int bd_stride,
+    int y_stride,
+    cudaStream_t stream);
+
 static void cublas_bf16_gemm(cublasHandle_t h,
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
     int S, int N, int K) {
@@ -1082,19 +1096,26 @@ static void prefill_bf16_body(
             int nwarps_want = dn_block_size / 32;
             while (v_slice < nwarps_want) { dn_block_size >>= 1; nwarps_want = dn_block_size / 32; }
 
-            // Chunked DN forward via bf16 tensor cores (dn_chunked.cu) —
-            // chunk-parallel, ~3-5x faster than the serial-over-t recurrence
-            // at S>=1k. Default behavior:
-            //   MEGAKERNEL_DN_CHUNKED unset / "0" -> recurrence (default)
-            //   MEGAKERNEL_DN_CHUNKED = "1"       -> chunked
-            //   MEGAKERNEL_DN_CHUNKED = "auto"    -> chunked when S>=1024
+            // DN forward kernel selection:
+            //   default                                     -> V-split recurrence
+            //   MEGAKERNEL_DN_CHUNKED=1                      -> chunked (1 block/head)
+            //   MEGAKERNEL_DN_CHUNKED=auto                   -> chunked when S>=1024
+            //   MEGAKERNEL_DN_VSPLIT_CHUNKED=1               -> chunked + V-split (64 blocks)
+            //   MEGAKERNEL_DN_VSPLIT_CHUNKED=auto            -> vsplit-chunked when S>=1024
             bool use_chunked = false;
-            if (const char *env = std::getenv("MEGAKERNEL_DN_CHUNKED")) {
-                if (env[0] == '1') use_chunked = true;
-                else if (env[0] == 'a' || env[0] == 'A') use_chunked = (S >= 1024);
+            bool use_vsplit_chunked = false;
+            if (const char *env = std::getenv("MEGAKERNEL_DN_VSPLIT_CHUNKED")) {
+                if (env[0] == '1') use_vsplit_chunked = true;
+                else if (env[0] == 'a' || env[0] == 'A') use_vsplit_chunked = (S >= 1024);
+            }
+            if (!use_vsplit_chunked) {
+                if (const char *env = std::getenv("MEGAKERNEL_DN_CHUNKED")) {
+                    if (env[0] == '1') use_chunked = true;
+                    else if (env[0] == 'a' || env[0] == 'A') use_chunked = (S >= 1024);
+                }
             }
 
-            if (use_chunked) {
+            if (use_chunked || use_vsplit_chunked) {
                 // pf_dn_prep wrote `decay` to alpha_buf; the chunked kernel
                 // wants `g = log(decay)`. Convert in-place.
                 int conv_blocks = (S * DN_HEADS + 255) / 256;
@@ -1112,27 +1133,29 @@ static void prefill_bf16_body(
                     state_layer, g_dn_state_scratch,
                     DN_HEADS, DN_VAL, DN_KEY);
 
-                // q / k / v slices live inside qkv_proj at offsets
-                //   q : 0
-                //   k : DN_QK_SIZE
-                //   v : 2 * DN_QK_SIZE
-                // with stride DN_CONV_CH between successive S rows. y goes
-                // to dn_out_buf which has stride DN_V_SIZE.
-                launch_dn_chunked_fwd(
-                    proj_buf,                                // q
-                    proj_buf + DN_QK_SIZE,                   // k
-                    proj_buf + 2 * DN_QK_SIZE,               // v
-                    beta_buf, alpha_buf,                     // g (now log(decay))
-                    g_dn_state_scratch,                      // state_in [H,Dk,Dv]
-                    dn_out_buf,                              // y
-                    g_dn_state_scratch,                      // state_out [H,Dk,Dv]
-                    nullptr,                                 // state_chunks (training-only)
-                    S, DN_HEADS,
-                    /*qkd_stride=*/DN_CONV_CH,
-                    /*v_stride=*/  DN_CONV_CH,
-                    /*bd_stride=*/ DN_HEADS,
-                    /*y_stride=*/  DN_V_SIZE,
-                    stream);
+                if (use_vsplit_chunked) {
+                    launch_dn_chunked_vsplit_fwd(
+                        proj_buf, proj_buf + DN_QK_SIZE, proj_buf + 2 * DN_QK_SIZE,
+                        beta_buf, alpha_buf,
+                        g_dn_state_scratch,
+                        dn_out_buf,
+                        g_dn_state_scratch,
+                        nullptr,
+                        S, DN_HEADS,
+                        DN_CONV_CH, DN_CONV_CH, DN_HEADS, DN_V_SIZE,
+                        stream);
+                } else {
+                    launch_dn_chunked_fwd(
+                        proj_buf, proj_buf + DN_QK_SIZE, proj_buf + 2 * DN_QK_SIZE,
+                        beta_buf, alpha_buf,
+                        g_dn_state_scratch,
+                        dn_out_buf,
+                        g_dn_state_scratch,
+                        nullptr,
+                        S, DN_HEADS,
+                        DN_CONV_CH, DN_CONV_CH, DN_HEADS, DN_V_SIZE,
+                        stream);
+                }
 
                 // Transpose state back into recurrence layout for the next
                 // call (decode kernel + the same layer's next prefill).
