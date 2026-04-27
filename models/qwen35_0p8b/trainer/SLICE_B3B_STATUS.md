@@ -8,15 +8,15 @@ which pulls combined RL step toward ~18× over HF+fla.
 
 ## Wall-time bench (`bench_kernel_bwd.py`)
 
-After hand-rolled DN bwd shipped (2026-04-27, this commit):
+After hand-rolled DN bwd + npa-reuse shipped (2026-04-27):
 
 ```
-path                                   ms/step
---------------------------------------------------
-HF+PEFT autograd (default)              609.2ms
-Kernel-driven Slice B.3b                558.8ms
---------------------------------------------------
-Kernel path is 1.09× FASTER than HF+PEFT.
+path                                   ms/step (3-run avg)
+-----------------------------------------------------------
+HF+PEFT autograd (default)              ~540 ms
+Kernel-driven Slice B.3b                ~485 ms
+-----------------------------------------------------------
+Kernel path 1.08× – 1.15× FASTER (run-to-run variance ~5%).
 ```
 
 Progression across this session:
@@ -25,7 +25,8 @@ Progression across this session:
 |---------------------|-------------|------------------|
 | pre-FA-handrolled   |  674.5 ms   | 1.33× SLOWER     |
 | FA bwd handrolled   |  663.1 ms   | 1.21× slower     |
-| **DN bwd handrolled** |  **558.8 ms** | **1.09× FASTER** |
+| DN bwd handrolled   |  558.8 ms   | 1.09× FASTER     |
+| **+npa reuse**      |  **~485 ms** | **~1.11× FASTER** |
 
 The hand-rolled DN bwd (`dn_attn_handrolled.py`) replaces the autograd-
 through-HF.linear_attn path with a Python forward that calls fla's
