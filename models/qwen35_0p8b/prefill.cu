@@ -809,7 +809,50 @@ __global__ void pf_qk_norm_rope(
     }
 }
 
+// ===== sigmoid-gate epilogue for the cuDNN FA-2 path =====
+// `attn_out` is the FA-2 output [S, FA_Q_HEADS, FA_HEAD_DIM] (flat).
+// `q_proj` is the QKV-proj output in the [S, FA_Q_HEADS, 2, FA_HEAD_DIM]
+// layout pf_qk_norm_rope writes — the second slot per head is the gate.
+// `out` receives sigmoid(gate) * attn_out, same flat layout as attn_out.
+// Used by launch_fa_attn_aten in fa_attn_aten.cpp.
+__global__ void pf_apply_gate(
+    const __nv_bfloat16 *attn_out,
+    const __nv_bfloat16 *q_proj,
+    __nv_bfloat16 *out,
+    int S)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    if (idx >= total) return;
+    int d    = idx % FA_HEAD_DIM;
+    int rest = idx / FA_HEAD_DIM;
+    int h    = rest % FA_Q_HEADS;
+    int pos  = rest / FA_Q_HEADS;
+    int o_off    = pos * FA_Q_SIZE + h * FA_HEAD_DIM + d;
+    int gate_off = pos * FA_QPROJ_SIZE + h * 2 * FA_HEAD_DIM + FA_HEAD_DIM + d;
+    float a = __bfloat162float(attn_out[o_off]);
+    float g = __bfloat162float(q_proj[gate_off]);
+    float sg = 1.0f / (1.0f + __expf(-g));
+    out[o_off] = __float2bfloat16(a * sg);
+}
+
+extern "C" void pf_apply_gate_launch(
+    const __nv_bfloat16 *attn_out,
+    const __nv_bfloat16 *q_proj,
+    __nv_bfloat16 *out,
+    int S,
+    cudaStream_t stream)
+{
+    int total = S * FA_Q_HEADS * FA_HEAD_DIM;
+    int blocks = (total + 255) / 256;
+    pf_apply_gate<<<blocks, 256, 0, stream>>>(attn_out, q_proj, out, S);
+}
+
 // ===== Causal attention (bf16 Q/K/V, f32 accumulation, bf16 output) =====
+// Legacy O(S²)-walking-keys-per-query attention. Retained for short-S
+// validation against the new FA-2 path; the production code path now
+// uses launch_fa_attn_aten (cuDNN FA-2) for everything because it
+// scales linearly in S where this kernel is quadratic.
 __global__ void pf_causal_attn(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
     const __nv_bfloat16 *v, __nv_bfloat16 *out, int S)
 {
@@ -975,6 +1018,18 @@ struct SavedActivationsPF {
     __nv_bfloat16 *attn_out_pre_o;
     __nv_bfloat16 *h_post_attn;
 };
+
+// cuDNN FA-2 forward via aten — defined in fa_attn_aten.cpp. The
+// implementation lives in a separate .cpp because aten/torch headers
+// don't compile cleanly under nvcc.
+extern "C" void launch_fa_attn_aten(
+    const __nv_bfloat16 *q_proj,
+    const __nv_bfloat16 *k_cache,
+    const __nv_bfloat16 *v_cache,
+    __nv_bfloat16 *out,
+    int S,
+    int max_seq,
+    cudaStream_t stream);
 
 static inline void save_bf16_slab(__nv_bfloat16 *dst, const __nv_bfloat16 *src,
                                   int layer_idx, int S, int dim, cudaStream_t stream) {
@@ -1186,8 +1241,15 @@ static void prefill_bf16_body(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
                 fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq);
 
-            pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
-                proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+            // cuDNN FA-2 forward (linear in S; replaces the O(S²)
+            // pf_causal_attn). Reads Q + Gate from proj_buf, K/V from
+            // the cache slice, writes sigmoid(Gate) * attn_out to
+            // dn_out_buf in [S, FA_Q_SIZE] layout.
+            launch_fa_attn_aten(
+                proj_buf,
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride,
+                dn_out_buf,
+                S, max_seq, stream);
 
             // Save the o_proj input (causal-attention output, pre-o_proj) for bwd.
             save_bf16_slab(saved.attn_out_pre_o, dn_out_buf, li, S, FA_Q_SIZE, stream);

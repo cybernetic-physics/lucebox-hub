@@ -40,6 +40,7 @@ setup(
                 "kernel_gb10_nvfp4.cu",
                 "prefill.cu",
                 "prefill_megakernel.cu",
+                "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
