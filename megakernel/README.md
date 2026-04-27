@@ -122,11 +122,14 @@ python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 - PyTorch 2.0+
 - ~1.5 GB VRAM for BF16 weights
 
-**Blackwell (sm_120 / sm_121a):** runs on Blackwell consumer GPUs (RTX 5090)
-and the NVIDIA DGX Spark (GB10) via an NVFP4 decode path. The build
-auto-detects your GPU and `final_bench.py` dispatches to the right backend;
-use `--backend nvfp4` to force it. First DGX Spark numbers are in
-[RESULTS.md](RESULTS.md#nvidia-dgx-spark-gb10-sm_121a).
+**Blackwell (sm_100 / sm_120 / sm_121a):** runs on Blackwell datacenter
+GPUs (NVIDIA B200 / DGX B200), Blackwell consumer GPUs (RTX 5090), and
+the NVIDIA DGX Spark (GB10). The build auto-detects your GPU. On
+sm_120 / sm_121a `final_bench.py` defaults to the NVFP4 decode path;
+on B200 use `--backend bf16` for the tuned BF16 megakernel
+(40,635 pp520 / 719 tg128). First DGX Spark numbers are in
+[RESULTS.md](RESULTS.md#nvidia-dgx-spark-gb10-sm_121a); B200 numbers are in
+[RESULTS_B200.md](RESULTS_B200.md).
 
 **Optional:** Set a power limit to find your GPU's sweet spot:
 ```bash
