@@ -65,9 +65,14 @@ def dn_attn_forward(
     out_proj_W: torch.Tensor,               # [HIDDEN, 2048]  bf16
     rms_eps: float = 1e-6,
     layer_norm_eps: float = 1e-6,
+    npa_precomputed: torch.Tensor | None = None,  # [B, S, HIDDEN] bf16
 ) -> tuple[torch.Tensor, dict]:
     """Run DN attention forward in pure Python (matches HF.linear_attn
     semantically). Returns (attn_out, saves_for_bwd).
+
+    If ``npa_precomputed`` is given, the input RMSnorm step is skipped
+    (the kernel already saved this tensor as ``saves["normalized_in"][L]``,
+    so passing it in saves ~0.1 ms/call of redundant compute).
 
     saves_for_bwd is a dict with the intermediates the manual bwd needs.
     """
@@ -79,8 +84,11 @@ def dn_attn_forward(
     CC = _DN_CONV_CH           # 6144
     KK = _DN_CONV_K
 
-    # 1. Input RMSnorm.
-    npa = _qwen_rms(h_in, input_norm_w, eps=rms_eps)                   # bf16
+    # 1. Input RMSnorm (skipped when caller supplies npa_precomputed).
+    if npa_precomputed is not None:
+        npa = npa_precomputed
+    else:
+        npa = _qwen_rms(h_in, input_norm_w, eps=rms_eps)               # bf16
 
     # 2. Linear projections (no LoRA on DN attention).
     qkv_raw = npa @ in_proj_qkv_W.t()                                  # [B, S, 6144] bf16

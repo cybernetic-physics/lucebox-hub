@@ -761,6 +761,7 @@ def per_layer_bwd_dn(
     dh_out: torch.Tensor,                 # [S, HIDDEN] fp32 — gradient into layer's output
     # Saved activations (single-layer slices already taken):
     hidden_in: torch.Tensor,              # [S, HIDDEN] bf16
+    normalized_in: torch.Tensor,          # [S, HIDDEN] bf16 — kernel's saved npa
     normalized_post_attn: torch.Tensor,   # [S, HIDDEN] bf16
     mlp_inter: torch.Tensor,              # [S, INTER]  bf16
     h_post_attn: torch.Tensor,            # [S, HIDDEN] bf16
@@ -814,6 +815,7 @@ def per_layer_bwd_dn(
     rms_eps_dn = getattr(dn.norm, "eps",
                           getattr(dn.norm, "variance_epsilon", rms_eps))
     h_in_b = hidden_in.unsqueeze(0).contiguous()                       # [1, S, HIDDEN]
+    npa_b  = normalized_in.unsqueeze(0).contiguous()                   # [1, S, HIDDEN]
     _attn_out, saves = dn_attn_forward(
         h_in_b,
         input_norm_w=input_norm.weight,
@@ -826,6 +828,7 @@ def per_layer_bwd_dn(
         dn_norm_W=dn.norm.weight,
         out_proj_W=dn.out_proj.weight,
         rms_eps=rms_eps_in, layer_norm_eps=rms_eps_dn,
+        npa_precomputed=npa_b,
     )
     # Upstream is dh_post_attn (mlp + attention contribution to the
     # residual stream's outgoing gradient). dn_attn_backward returns
@@ -1033,6 +1036,7 @@ def run_layer_walking_bwd(
             out = per_layer_bwd_dn(
                 dn_idx=dn_idx, dh_out=dh,
                 hidden_in=hidden_in_L,
+                normalized_in=normalized_in_L,
                 normalized_post_attn=normalized_post_attn_L,
                 mlp_inter=mlp_inter_L,
                 h_post_attn=h_post_attn_L,
