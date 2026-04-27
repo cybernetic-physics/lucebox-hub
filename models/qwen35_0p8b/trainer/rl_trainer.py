@@ -325,29 +325,60 @@ class LoraMegakernelTrainer:
                 raise ValueError(f"unsupported loss_fn={loss_fn!r}")
             s = self._session(model_id)
             s.hf_model.zero_grad(set_to_none=True)
-            total_loss = torch.zeros((), dtype=torch.float32, device="cuda")
-            outputs = []
-            per_losses = []
+
+            items: list[tuple[torch.Tensor, torch.Tensor]] = []
             for d in data:
                 prompt, targets = _extract_prompt_targets(d)
                 if targets.numel() == 0:
                     continue
-                logp_selected = _sequence_logprobs(s.hf_model, prompt, targets)
-                loss = -logp_selected.mean()
-                total_loss = total_loss + loss
-                lv = float(loss.detach().item())
+                items.append((prompt, targets))
+
+            if not items:
+                return {
+                    "loss_fn_output_type": "TensorData",
+                    "loss_fn_outputs": [],
+                    "metrics": {"loss:mean": 0.0, "batch_size:mean": float(len(data))},
+                }
+
+            # If all examples share (prompt_len, target_len), pack into one
+            # batch and do a single forward — collapses ~B× the kernel
+            # launches and lets HF's batched fla path handle DN.
+            p0 = items[0][0].numel()
+            t0 = items[0][1].numel()
+            if all(p.numel() == p0 and t.numel() == t0 for p, t in items):
+                logp_per_item, per_loss = _batched_logprobs(s.hf_model, items)
+            else:
+                # Heterogeneous shapes — fall back to the per-example loop.
+                logps = []
+                losses = []
+                for prompt, targets in items:
+                    lp = _sequence_logprobs(s.hf_model, prompt, targets)
+                    logps.append(lp)
+                    losses.append(-lp.mean())
+                logp_per_item = logps
+                per_loss = torch.stack(losses)
+
+            total_loss = per_loss.sum()
+            (total_loss / max(len(items), 1)).backward()
+
+            # Materialize per-example outputs after backward (one bulk D→H
+            # for losses, one per-example .tolist() for logprobs).
+            losses_cpu = per_loss.detach().cpu().tolist()
+            outputs = []
+            per_losses = []
+            for b, lp in enumerate(logp_per_item):
+                lv = float(losses_cpu[b])
                 per_losses.append(lv)
                 outputs.append({
                     "logprobs": {
-                        "data": logp_selected.detach().cpu().tolist(),
+                        "data": lp.detach().cpu().tolist(),
                         "dtype": "float32",
-                        "shape": [int(logp_selected.numel())],
+                        "shape": [int(lp.numel())],
                     },
                     "loss": {"data": [lv], "dtype": "float32", "shape": [1]},
                 })
-            if data:
-                (total_loss / max(len(data), 1)).backward()
-            mean_loss = float(sum(per_losses) / max(len(per_losses), 1)) if per_losses else 0.0
+
+            mean_loss = float(sum(per_losses) / max(len(per_losses), 1))
             s.last_loss = mean_loss
             return {
                 "loss_fn_output_type": "TensorData",
@@ -524,6 +555,32 @@ def _sequence_logprobs(
     predict_logits = logits[pl - 1 : pl - 1 + tl]
     logp = torch.nn.functional.log_softmax(predict_logits, dim=-1)
     return logp.gather(1, target_ids.unsqueeze(1)).squeeze(1)
+
+
+def _batched_logprobs(
+    hf_model,
+    items: list[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Batched equivalent of `_sequence_logprobs` for shape-uniform items.
+
+    All (prompt, targets) tuples must share the same (P, T). Returns the
+    per-item logp tensor list (each shape [T]) and a [B] tensor of
+    per-item -mean(logp) losses.
+    """
+    B = len(items)
+    P = items[0][0].numel()
+    T = items[0][1].numel()
+    full_ids = torch.stack(
+        [torch.cat([p, t], dim=0) for p, t in items], dim=0
+    )  # [B, P+T]
+    out = hf_model(input_ids=full_ids, use_cache=False)
+    logits = out.logits.to(torch.float32)  # [B, P+T, V]
+    predict_logits = logits[:, P - 1 : P - 1 + T]  # [B, T, V]
+    log_probs = torch.nn.functional.log_softmax(predict_logits, dim=-1)
+    targets = torch.stack([t for _, t in items], dim=0)  # [B, T]
+    logp = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # [B, T]
+    per_loss = -logp.mean(dim=1)  # [B]
+    return [logp[b] for b in range(B)], per_loss
 
 
 __all__ = ["LoraMegakernelTrainer"]

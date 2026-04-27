@@ -238,22 +238,30 @@ incumbent here is HF transformers + fla (Triton chunk_gated_delta_rule)
 + PEFT + torch.optim.AdamW — i.e. the **optimized torch stack** on B200.
 
 Numbers (B200, batch=4, S=128, gen=64, 2026-04-27 with fla available,
-hybrid DN routing live, **prefill-based rollout (Tier 0.1 landed)**):
+hybrid DN routing live, **Tier 0.1 + Tier 0.3 landed**):
 
 | stage                                    | incumbent | ours    | speedup |
 |:-----------------------------------------|:---------:|:-------:|:-------:|
-| (A) sample 64 tokens (greedy)            | 2103.5 ms |   77.4 ms | **27.18×** |
-| (B) training step (batch=4, seq=128)     |  471.0 ms |  471.0 ms |  1.00× by construction |
-| (C) combined RL step = sample + train    | 2574.5 ms |  548.4 ms | **4.69×** |
+| (A) sample 64 tokens (greedy)            | 1908.9 ms |   77.1 ms | **24.75×** |
+| (B) training step (batch=4, seq=128)     |  114.3 ms |  114.3 ms |  1.00× by construction (\*) |
+| (C) combined RL step = sample + train    | 2023.2 ms |  191.5 ms | **10.57×** |
 
-**Phase-5 target cleared (4.69× over HF+fla).** All of the win is on
-the sampling side — the megakernel decode + cuBLAS+graph prefill path
-is 27× faster than HF generate on the same weights. Prior to Tier 0.1
-the rollout was running the prompt one token at a time through
-decode_kernel (127 launches × 1 ms for a 128-token prompt) instead of
-using the existing `prefill_bf16` op (single dispatch, ~6.5 ms);
-landing Tier 0.1 cut sampling from 210 ms to 77 ms (2.73×) and lifted
-combined from 3.39× → 4.69×. The training step
+(\*) Both sides use the same HF+fla+PEFT+torch.optim.AdamW pipeline;
+"speedup" on (B) means our trainer matches the incumbent on this stage.
+Tier 0.2 (replace HF+PEFT with our custom fwd/bwd kernels + fused AdamW)
+is the unlock for a real (B) win.
+
+**10.57× over HF+fla.** The win comes from two changes since the
+previous round:
+
+- **Tier 0.1** (prefill rollout): use `prefill_bf16` for the prompt
+  instead of stepping the cooperative decode kernel once per prompt
+  token. Sampling 210 ms → 77 ms.
+- **Tier 0.3** (batched forward in `forward_backward`): when all
+  examples in `data` share `(prompt_len, target_len)`, pack into one
+  `[B, P+T]` tensor and run a single forward+CE+backward instead of
+  one per example. Training step 471 ms → 114 ms (4.12×). Heterogeneous
+  shapes fall back to the per-example loop. The training step
 is parity by construction: both sides use HF+PEFT for fwd+bwd and
 torch.optim.AdamW for the step, since `LoraMegakernelTrainer` routes
 training through fla's chunked Triton bwd via the hybrid DN router

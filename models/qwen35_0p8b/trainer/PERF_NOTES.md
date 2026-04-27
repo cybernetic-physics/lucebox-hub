@@ -117,15 +117,23 @@ because each item saves measurably more wall-time than the next.**
    - Effort: ~3-5 days. All kernels exist; this is wiring, not
      kernel work.
 
-**0.3 — CUDA Graph wrap of the full training step.**
-   - The graph version (`cuda_graph_train.GraphedTrainStep`) exists
-     and is validated at 1.16× on the *current* HF+PEFT path. After
-     0.2 the graph would replace ~50 ms of remaining launch overhead
-     (~50 launches × 7 µs) plus eliminate autograd graph-build cost.
-   - Independent of 0.2 the graph path is also worth landing today
-     for the 1.16× free, since it's already shipped.
-   - Combined with 0.2: training step ~30-40 ms → ~20-25 ms.
-   - Effort: ~1 day to wire into `LoraMegakernelTrainer`.
+**0.3 — Batch the forward in `forward_backward`. ✅ SHIPPED 2026-04-27.**
+   - When all items in `data` share `(prompt_len, target_len)`, pack
+     into one `[B, P+T]` tensor and run a single forward+CE+backward
+     instead of B forwards. Heterogeneous shapes fall back to the
+     legacy per-example loop.
+   - **Measured:** training step 471 ms → 114 ms = **4.12×**.
+     Combined RL step 4.69× → **10.57× over HF+fla**.
+   - Mechanics: fla's chunked Triton kernel parallelizes chunks across
+     SMs *and* across batch — the same wall time absorbs B examples
+     instead of running B sequential calls. 75% of the per-step launches
+     also disappear once we go to one fwd+bwd cycle.
+   - Bench script: `bench_trainer_vs_sglang_torch.py`.
+   - Note: an *additional* CUDA-Graph wrap on top of this is harder
+     than initially scoped — the bench's batched `forward_backward`
+     uses per-target CE on variable `(P, T)`, so capturing as one
+     graph requires shape-cache + per-shape capture cost. Defer until
+     it's the binding constraint, which it isn't today.
 
 **0.4 — Single-call decode-N-tokens** (eliminate per-step D→H sync).
    - Instead of host-loop `for _ in range(N): tok = decoder.step()`,
