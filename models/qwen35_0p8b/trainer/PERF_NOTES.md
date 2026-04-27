@@ -96,26 +96,48 @@ because each item saves measurably more wall-time than the next.**
      same as before this change.
 
 **0.2 — Replace HF+PEFT training path with our cuBLAS+graph forward
-+ existing custom backward kernels.**
-   - Forward: `prefill_bf16_train_step` — already saves the 4 per-
-     layer activation slabs the bwd needs. ~6.5 ms at S=128.
-   - Backward: stitch together the kernels we *already shipped* into
-     a single autograd.Function:
-       - CE + LM head bwd (`bwd_ce_lm_head_kernel`)
-       - RMSNorm bwd (`bwd_rmsnorm_kernel`)
-       - SwiGLU/MLP bwd + LoRA-linear bwd (in `kernel.cu`)
-       - FA bwd via cuDNN FA-2 (`fa_bwd_flash.py`, 1.65× vs autograd)
-       - DN bwd: the recurrent CUDA bwd at S ≤ 512, fla otherwise
-         (mirror the hybrid-routing logic from `dn_hf_patch.py`)
-   - Optimizer: wire the **fused AdamW** (`launch_fused_adamw`,
-     measured 124× faster than torch.optim.AdamW on the LoRA flat
-     buffer). Needs a flatten/scatter shim from PEFT's per-tensor
-     grads → contiguous flat buffer.
-   - Training step 442 ms → ~30-50 ms = **~10× faster training.**
-   - Combined RL step (with 0.1): ~85 + 40 = **~125 ms** vs
-     incumbent 2461 ms = **~20× combined** over HF+fla.
-   - Effort: ~3-5 days. All kernels exist; this is wiring, not
-     kernel work.
++ existing custom backward kernels. (Slices A and B.1 SHIPPED 2026-04-27.)**
+
+   **Slice A ✅** — `lora_pack.pack_peft_to_flat(peft_model, rank)` and
+   `unpack_flat_to_peft(...)` translate between PEFT's per-projection
+   modules and the kernel's flat 26-tensor layout. Round-trip bit-exact;
+   `prefill_bf16_with_lora` on packed PEFT weights matches HF+PEFT
+   forward at cosine ≥ 0.998 on logits. See `test_lora_pack.py`.
+
+   **Slice B.1 ✅** — `lora_megakernel_step.kernel_sequence_loss(...)`
+   runs `prefill_bf16_train_step` + Python final-norm + lm_head and
+   computes the same per-target-position cross-entropy loss the trainer
+   uses today. Validated against HF+PEFT: loss Δ=5.2e-3, per-token logp
+   cosine 0.99998. Critical hypothesis confirmed (probe_hidden_buffer.py):
+   `sc["hidden"]` post-kernel contains pre-final-norm `h_out[NUM_LAYERS-1]`
+   for ALL S positions, bit-exactly — no kernel mod needed for per-
+   position logits. `MegakernelTrainStep` autograd.Function has full
+   forward, raises NotImplementedError in backward.
+
+   **Slice B.2 ⏳** — the layer-walking backward. Blocked on extra
+   activation saves the kernel doesn't currently produce:
+       - `attn_out_pre_o[L, S, max(FA_Q_SIZE, DN_V_SIZE)]` bf16 — input
+         to o_proj LoRA bwd
+       - `h_post_attn[L, S, HIDDEN]` bf16 — input to post-attn
+         RMSNorm bwd (RMSNorm bwd needs the pre-norm input; given y+w
+         alone, x is not recoverable)
+       - `dn_state_history[N_DN, S+1, DN_HEADS, DN_KEY, DN_VAL]` fp32 —
+         needed by `dn_bwd` (already produced by `dn_fwd_with_delta_save`,
+         not by `prefill_bf16_train_step`)
+   CUDA work: ~1-2 days to extend `prefill_bf16_train_step` with these
+   3 optional output slabs. Memory cost at S=128: ~6 MB attn_out_pre_o
+   + 6 MB h_post_attn + ~10 MB dn_state_history = ~22 MB extra per
+   training session. Trivial on B200's 192 GB.
+
+   With those saves wired, the backward (also ~3 days) follows the
+   per-layer template documented in `lora_megakernel_step.py`'s module
+   docstring. Plus fused-AdamW wiring (~1 day) and trainer integration
+   (~1 day).
+
+   - Training step 114 ms → ~30-50 ms = **~3× faster training.**
+   - Combined RL step (with 0.1+0.3): ~80 + ~40 = **~120 ms** vs
+     incumbent 2575 ms = **~20× combined** over HF+fla.
+   - Total remaining effort: ~6-7 engineer-days.
 
 **0.3 — Batch the forward in `forward_backward`. ✅ SHIPPED 2026-04-27.**
    - When all items in `data` share `(prompt_len, target_len)`, pack
