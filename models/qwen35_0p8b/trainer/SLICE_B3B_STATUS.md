@@ -6,6 +6,65 @@ roadmap). End goal: replace HF+PEFT autograd in
 walk for ~3× faster training step (114 ms → ~30-50 ms, projected),
 which pulls combined RL step toward ~18× over HF+fla.
 
+## Wall-time bench (`bench_kernel_bwd.py`, 2026-04-27)
+
+```
+path                                   ms/step
+--------------------------------------------------
+HF+PEFT autograd (default)              507.0ms
+Kernel-driven Slice B.3b                674.5ms
+--------------------------------------------------
+Kernel path is 1.33× SLOWER than HF+PEFT today.
+```
+
+**Why slower:** the autograd-based interior in `per_layer_bwd_dn`
+recomputes the HF GatedDeltaNet forward inside the bwd to get the
+autograd graph, so the kernel path does ~2× DN forward work (one in
+our kernel, one in autograd). HF+PEFT does 1× forward + bwd through
+the cached autograd graph.
+
+The decomposition of the 167 ms slowdown:
+  - 18 DN layers × ~10 ms HF-GatedDeltaNet recompute   ≈ 180 ms
+  - 6 FA layers × ~5 ms QKV+SDPA recompute              ≈ 30 ms
+  - Saved by no-full-model-autograd-graph build         ≈ -40 ms
+  - Net                                                  ≈ +170 ms
+
+The MLP bwd path (kernel-driven, no recompute) is actually faster
+than HF+PEFT per layer; the win is being eaten by attention recompute.
+
+**To make the kernel path faster than HF+PEFT** (projected: ~3× faster):
+
+1. **Hand-rolled DN bwd kernel** consuming kernel-saved DN
+   intermediates. Two flavours:
+   - Recurrent: our existing `dn_bwd` kernel; needs `state_history`
+     [N_DN, S+1, DN_HEADS, Dk, Dv] fp32 saved during forward
+     (~18 GB at S=128 — workable but heavy).
+   - Chunked: requires the chunked CUDA bwd port (Tier 1.6 — Python
+     reference at `dn_chunked_bwd_proto.py`, CUDA pending) plus the
+     existing `state_chunks` save from `dn_chunked_fwd`
+     (~50 MB at S=128 — clean).
+   Effort: 3-5 days for the recurrent path with `state_history`
+   wired into prefill_bf16_train_step; or wait for chunked bwd port.
+
+2. **Hand-rolled FA bwd via cuDNN** using saved Q, K, V, O, LSE
+   from forward (kernel mod to save these 5 extra slabs per FA
+   layer). cuDNN FA-2 bwd is what `fa_bwd_flash.py` already wraps —
+   just need to feed it the saved tensors. Effort: ~1-2 days.
+
+3. **Fused AdamW on the flat fp32 grad buffer** that
+   `run_layer_walking_bwd` already produces. Replaces
+   `torch.optim.AdamW` (~1.6 ms/step) with `fused_adamw_step`
+   (124× faster per the doc). Effort: 0.5 day.
+
+4. **CUDA Graph wrap** of the full kernel-only training step (after
+   1-3 are in place — graph capture won't work while autograd is
+   in the loop). Effort: ~1 day.
+
+With all four shipped: training step projected ~30-50 ms (vs today's
+507 ms HF+PEFT default), pulling combined RL step toward ~18× over
+HF+fla. Today's commit is the validated gradient chain that those
+optimizations have to match.
+
 ## ✅ Correctness-complete (commit 3745132, 2026-04-27)
 
 End-to-end kernel-driven training step converges:
