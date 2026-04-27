@@ -22,9 +22,37 @@ Kernel path is 1.21× slower (was 1.33× pre-handrolled-FA-bwd).
 The hand-rolled FA bwd (replaces autograd-through-recomputed-SDPA with
 direct cuDNN FA-2 bwd + manual reverse-RoPE / reverse-QKnorm / reverse-
 gate / kernel-driven LoRA bwd / kernel-driven RMSnorm bwd) recovered
-~10 ms/step from the FA path. The remaining ~115 ms slowdown is the
-DN-attention autograd interior in `per_layer_bwd_dn` — that's the next
-target.
+~10 ms/step from the FA path.
+
+### DN bwd headroom (investigated, then deprioritized)
+
+Profiled per-layer DN bwd at the bench shape:
+
+```
+calls                  72/step (4 items × 18 DN layers)
+mlp_bwd          ~1.41 ms/call (kernel-driven; already optimal)
+recompute_fwd    ~2.08 ms/call (autograd through HF.linear_attn)
+bwd              ~3.72 ms/call (autograd, fla's chunked Triton bwd)
+```
+
+The "recompute" piece looked like Python overhead, but a hand-rolled
+manual DN forward (skipping HF's wrappers, running the same fla op +
+GEMMs + conv1d directly) showed only **1.04× speedup** — i.e. virtually
+all of the 2 ms is genuine compute. fla's `chunk_gated_delta_rule` IS
+already calling fast Triton kernels.
+
+The realistic remaining wins for DN bwd are:
+1. Save fla's intermediate state (h_chunks, dh_chunks) during the kernel
+   forward and feed it to fla's underlying Triton bwd directly,
+   eliminating ~2 ms × 72 = ~144 ms forward recompute. Requires deeper
+   integration with fla's chunked GDR kernel internals.
+2. Batch the 4 items into a single varlen FA-2 forward + 1 bwd over all
+   18 layers, amortizing Python overhead across items (rather than
+   running 4 separate per-item bwd passes today).
+
+Both are multi-day efforts. Current path's 1.21× slowdown is acceptable
+as the kernel-bwd validated correctness baseline; further DN-bwd
+optimization waits behind those investments.
 
 **Why slower:** the autograd-based interior in `per_layer_bwd_dn`
 recomputes the HF GatedDeltaNet forward inside the bwd to get the
