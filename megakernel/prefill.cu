@@ -993,6 +993,17 @@ extern "C" cudaError_t launch_dn_chunked_vsplit_fwd(
     int y_stride,
     cudaStream_t stream);
 
+// Parallel-scan DN forward — defined in dn_parallel_scan.cu. Three-phase
+// pipeline: extract per-chunk operators, Hillis-Steele log-depth scan,
+// per-chunk output. Math validated by dn_parallel_scan_proto.py.
+extern "C" cudaError_t launch_dn_parallel_scan_fwd(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *beta, const float *g, const float *state_in,
+    __nv_bfloat16 *y, float *state_out,
+    int S, int H,
+    int qkd_stride, int v_stride, int bd_stride, int y_stride,
+    cudaStream_t stream);
+
 static void cublas_bf16_gemm(cublasHandle_t h,
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
     int S, int N, int K) {
@@ -1099,23 +1110,60 @@ static void prefill_bf16_body(
             // DN forward kernel selection:
             //   default                                     -> V-split recurrence
             //   MEGAKERNEL_DN_CHUNKED=1                      -> chunked (1 block/head)
-            //   MEGAKERNEL_DN_CHUNKED=auto                   -> chunked when S>=1024
-            //   MEGAKERNEL_DN_VSPLIT_CHUNKED=1               -> chunked + V-split (64 blocks)
-            //   MEGAKERNEL_DN_VSPLIT_CHUNKED=auto            -> vsplit-chunked when S>=1024
+            //   MEGAKERNEL_DN_VSPLIT_CHUNKED=1               -> chunked + V-split
+            //   MEGAKERNEL_DN_PARALLEL_SCAN=1                -> Phase A/D/C parallel scan
+            //   any of the above with "auto"                 -> enabled when S>=1024
             bool use_chunked = false;
             bool use_vsplit_chunked = false;
-            if (const char *env = std::getenv("MEGAKERNEL_DN_VSPLIT_CHUNKED")) {
-                if (env[0] == '1') use_vsplit_chunked = true;
-                else if (env[0] == 'a' || env[0] == 'A') use_vsplit_chunked = (S >= 1024);
+            bool use_parallel_scan = false;
+            if (const char *env = std::getenv("MEGAKERNEL_DN_PARALLEL_SCAN")) {
+                if (env[0] == '1') use_parallel_scan = true;
+                else if (env[0] == 'a' || env[0] == 'A') use_parallel_scan = (S >= 1024);
             }
-            if (!use_vsplit_chunked) {
+            if (!use_parallel_scan) {
+                if (const char *env = std::getenv("MEGAKERNEL_DN_VSPLIT_CHUNKED")) {
+                    if (env[0] == '1') use_vsplit_chunked = true;
+                    else if (env[0] == 'a' || env[0] == 'A') use_vsplit_chunked = (S >= 1024);
+                }
+            }
+            if (!use_vsplit_chunked && !use_parallel_scan) {
                 if (const char *env = std::getenv("MEGAKERNEL_DN_CHUNKED")) {
                     if (env[0] == '1') use_chunked = true;
                     else if (env[0] == 'a' || env[0] == 'A') use_chunked = (S >= 1024);
                 }
             }
 
-            if (use_chunked || use_vsplit_chunked) {
+            if (use_parallel_scan) {
+                // pf_dn_prep wrote `decay` to alpha_buf; convert to g.
+                int conv_blocks = (S * DN_HEADS + 255) / 256;
+                pf_decay_to_g<<<conv_blocks, 256, 0, stream>>>(alpha_buf, S * DN_HEADS);
+
+                // Transpose state from recurrence layout [H, Dv, Dk] to
+                // chunked layout [H, Dk, Dv] in scratch.
+                static float *g_dn_state_scratch = nullptr;
+                if (!g_dn_state_scratch) {
+                    cudaMalloc(&g_dn_state_scratch,
+                               (size_t)DN_HEADS * DN_KEY * DN_VAL * sizeof(float));
+                }
+                float *state_layer = dn_states + dn_idx*dn_stride;
+                pf_dn_state_transpose<<<DN_HEADS, 256, 0, stream>>>(
+                    state_layer, g_dn_state_scratch,
+                    DN_HEADS, DN_VAL, DN_KEY);
+
+                launch_dn_parallel_scan_fwd(
+                    proj_buf, proj_buf + DN_QK_SIZE, proj_buf + 2 * DN_QK_SIZE,
+                    beta_buf, alpha_buf,
+                    g_dn_state_scratch,
+                    dn_out_buf,
+                    g_dn_state_scratch,
+                    S, DN_HEADS,
+                    DN_CONV_CH, DN_CONV_CH, DN_HEADS, DN_V_SIZE,
+                    stream);
+
+                pf_dn_state_transpose<<<DN_HEADS, 256, 0, stream>>>(
+                    g_dn_state_scratch, state_layer,
+                    DN_HEADS, DN_KEY, DN_VAL);
+            } else if (use_chunked || use_vsplit_chunked) {
                 // pf_dn_prep wrote `decay` to alpha_buf; the chunked kernel
                 // wants `g = log(decay)`. Convert in-place.
                 int conv_blocks = (S * DN_HEADS + 255) / 256;
