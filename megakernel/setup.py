@@ -12,7 +12,9 @@ def _detect_arch():
         import torch
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability()
-            if major == 12 and minor in (0, 1):
+            # Blackwell archs need the architecture-specific "a" suffix
+            # to enable FP4 / NVFP4 / cuBLASLt FP8E8M0-scaled intrinsics.
+            if (major, minor) == (10, 0) or major == 12 and minor in (0, 1):
                 return f"sm_{major}{minor}a"
             return f"sm_{major}{minor}"
     except Exception:
@@ -25,7 +27,11 @@ def _int_env(name, default):
 
 
 arch = _detect_arch()
-is_blackwell = arch.startswith("sm_12")
+# Blackwell datacenter (sm_100, B200) and Blackwell consumer/edge
+# (sm_120 RTX 50, sm_121a DGX Spark / GB10) all share the new
+# Blackwell ISA features the gb10 path relies on (cp.async, NVFP4
+# packing, cuBLASLt fp4/MXFP4 GEMMs).
+is_blackwell = arch.startswith("sm_10") or arch.startswith("sm_12")
 num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 82)
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
 lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 512)

@@ -19,8 +19,8 @@
  * RTX 3090 build; see setup.py.
  */
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
-#error "prefill_megakernel.cu requires CUDA arch >= sm_120 (Blackwell)"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+#error "prefill_megakernel.cu requires CUDA arch >= sm_100 (Blackwell)"
 #endif
 
 #include <cuda_bf16.h>

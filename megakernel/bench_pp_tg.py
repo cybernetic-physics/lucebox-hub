@@ -17,7 +17,7 @@ _p.add_argument("--backend", default="auto", choices=("auto", "bf16", "nvfp4"))
 _a, _rest = _p.parse_known_args()
 _backend = _a.backend
 if _backend == "auto":
-    _backend = "nvfp4" if (_torch.cuda.is_available() and _torch.cuda.get_device_capability()[0] >= 12) else "bf16"
+    _backend = "nvfp4" if (_torch.cuda.is_available() and _torch.cuda.get_device_capability()[0] >= 10) else "bf16"
 if _backend == "nvfp4":
     _here = _os.path.dirname(_os.path.abspath(__file__))
     _os.execv(_sys.executable, [_sys.executable, _os.path.join(_here, "bench_pp_tg_nvfp4.py"), *_rest])

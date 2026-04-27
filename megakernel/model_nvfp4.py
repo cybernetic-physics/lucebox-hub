@@ -16,9 +16,11 @@ import torch
 if not torch.cuda.is_available():
     raise RuntimeError("model_nvfp4 requires CUDA")
 _cap_major, _cap_minor = torch.cuda.get_device_capability()
-if _cap_major < 12:
+# Blackwell datacenter (sm_100, B200), Blackwell consumer (sm_120, RTX 50),
+# and Blackwell embedded (sm_121a, GB10) all share the NVFP4 path.
+if _cap_major < 10:
     raise RuntimeError(
-        f"model_nvfp4 requires Blackwell (sm_120/sm_121a); detected "
+        f"model_nvfp4 requires Blackwell (sm_100/sm_120/sm_121a); detected "
         f"sm_{_cap_major}{_cap_minor}. Use megakernel.model for sm_86 and earlier."
     )
 

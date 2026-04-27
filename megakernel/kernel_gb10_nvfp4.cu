@@ -6,11 +6,12 @@
  * (sm_86) build excludes this translation unit entirely; see setup.py.
  */
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
-#error "kernel_gb10_nvfp4.cu requires CUDA arch >= sm_120 (Blackwell)"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+#error "kernel_gb10_nvfp4.cu requires CUDA arch >= sm_100 (Blackwell)"
 #endif
 
 #include <cuda_bf16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
