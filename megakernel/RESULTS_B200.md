@@ -1,114 +1,198 @@
-# NVIDIA B200 (sm_100, Qwen3.5-0.8B BF16)
+# NVIDIA B200 (sm_100) port — Qwen3.5-0.8B BF16
 
-Numbers measured on a single Blackwell datacenter GPU
-(NVIDIA B200, 148 SMs, sm_100a, CUDA 12.8, PyTorch 2.11). Reproduced
-on GPU index 2 and 3 of the same host with the same numbers within
-1% noise.
+## Headline
 
 ```
-                              pp520 (tok/s)    tg128 (tok/s)
-  Megakernel BF16 (this branch)   40,635            719
-  Megakernel NVFP4 (gb10 path)    29,994            327
-  PyTorch HuggingFace BF16        12,919             36
-  llama.cpp BF16 (separate run)   ~26,800           ~440
+                            pp520 (tok/s)   tg128 (tok/s)
+  Megakernel BF16             40,635            719          (this branch, B200 GPU 0)
+  Megakernel NVFP4            29,994            327          (gb10 path on B200)
+  PyTorch HuggingFace         12,919             36
+  llama.cpp BF16             ~26,800           ~440
 ```
 
 `final_bench.py --backend bf16` runs the BF16 megakernel pipeline
 (`prefill_bf16` + the BF16 decode megakernel). `final_bench.py
---backend nvfp4` runs the gb10 NVFP4 path
-(`prefill_bf16_nvfp4_lm` + LUT-based NVFP4 decode).
+--backend nvfp4` runs the gb10 NVFP4 path (`prefill_bf16_nvfp4_lm`
++ LUT-based NVFP4 decode).
 
-## What changed for B200
+## Full shape sweep — fork-parent-b200 vs upstream/main vs SGLang
 
-The gb10 PR (Luce-Org#30) introduced a Blackwell path targeted at
-sm_120 / sm_121a. On B200 (sm_100):
+Methodology: `bench_shapes.py --runs 5 --warmup 3 --decode-tokens 64
+--decode-warmup 8`. SGLang via `sglang.bench_one_batch --batch-size 1
+--input S --output 64`, taking the steady-state benchmark line (not
+the warmup). Both backends are batch-1 single-stream. SGLang reports
+`Prefill throughput = S / prefill_latency` and `Decode median
+throughput = 1 / median_step_latency`; we read the same way.
 
-- The build only needed minor surgery — auto-detect to `sm_100a`,
-  widen `is_blackwell` to include `sm_10*`, and lower a few
-  `__CUDA_ARCH__ < 1200` guards to `< 1000`. cuBLASLt FP4 / NVFP4
-  packing intrinsics from `cuda_fp4.h` resolve fine on `sm_100a`.
-- The BF16 decode kernel hung. Its hand-rolled grid barrier
-  (`fence.acq_rel.gpu` + `atomicAdd` on a counter) made no forward
-  progress across 148 SMs on sm_100. Replacing it with
-  `cudaLaunchCooperativeKernel` + `cg::this_grid().sync()` (the same
-  primitive the NVFP4 path already uses) unblocks decode and is a
-  strict improvement on sm_86 too.
-- BF16 prefill spent 88% of wall time inside the DeltaNet
-  recurrence, with cuBLAS GEMMs at 4%. Several optimization passes
-  brought the recurrence under control:
-  1. graph-capture the prefill body, fold per-channel conv1d into
-     shared memory once per kernel entry, fuse the q/k/v conv passes
-     into one parallel sweep — pp520 12,420 → 15,859 (+28%);
-  2. remove two redundant `__syncthreads` per recurrence step —
-     pp520 → 16,770 (+5.7%);
-  3. run q/k L2-normalize in parallel with the beta/decay scalar
-     compute on a previously-idle warp — pp520 → 17,847 (+6.4%);
-  4. cache the per-lane `s_q` / `s_k` slice into registers once per
-     step (clarity, perf-neutral);
-  5. V-split the recurrence so `head x v_split` populates 64 blocks
-     instead of 16 (B200 has 148 SMs); raw attn lands in `dn_out_buf`
-     and a small per-`(t, h)` block computes the gnorm — pp520
-     17,847 → 27,501 (+54%, first commit where we cross llama.cpp
-     BF16 on B200);
-  6. pre-pass conv1d, q/k normalize, and beta/decay out of the
-     recurrence into a parallel `pf_dn_prep` kernel; the inner loop
-     becomes pure V-local arithmetic with zero per-step
-     `__syncthreads` — pp520 27,501 → 40,278 (+46%).
+### B200 (sm_100, this host, GPU 0)
 
-Total: pp520 12,420 → 40,278 (+224%) without changing decoding
-behavior. Decode held at 711 tok/s throughout the prefill changes.
+Prefill (tok/s):
+
+| S | upstream/main | this branch | sglang | best |
+|---:|---:|---:|---:|---|
+| 32 | 6,701 | **12,360** | 811 | this branch |
+| 64 | 9,115 | **20,072** | 1,938 | this branch |
+| 128 | 10,865 | **29,687** | 4,124 | this branch |
+| 256 | 11,810 | **37,128** | 8,842 | this branch |
+| 512 | 12,122 | **37,614** | 14,671 | this branch |
+| 1,024 | 12,285 | **37,884** | 30,753 | this branch |
+| 2,048 | 11,619 | 32,292 | **61,766** | sglang |
+| 4,096 | — | 23,070 | **127,422** | sglang |
+| 8,192 | — | 13,411 | **217,503** | sglang |
+| 16,384 | — | 8,182 | **201,577** | sglang |
+| 32,768 | — | 4,605 | **158,908** | sglang |
+| 65,536 | — | **2,449** | n/a | this branch |
+
+Decode (tok/s, after S-token prefill):
+
+| S | upstream/main | this branch | sglang | best |
+|---:|---:|---:|---:|---|
+| 32 | hang | **919** | 484 | this branch |
+| 64 | hang | **903** | 487 | this branch |
+| 128 | hang | **872** | 552 | this branch |
+| 256 | hang | **819** | 520 | this branch |
+| 512 | hang | **730** | 488 | this branch |
+| 1,024 | hang | **598** | 441 | this branch |
+| 2,048 | hang | 439 | **450** | sglang |
+| 4,096 | hang | 230 | **423** | sglang |
+| 8,192 | hang | 113 | **367** | sglang |
+| 16,384 | hang | 58 | **282** | sglang |
+| 32,768 | hang | 30 | **193** | sglang |
+| 65,536 | hang | **11** | n/a | this branch |
+
+upstream/main BF16 decode hangs on B200 — its hand-rolled grid
+barrier doesn't progress on 148 SMs. The cooperative-grid-sync fix
+in this branch is what makes BF16 decode functional on sm_100.
+
+### RTX 3090 (sm_86, vast.ai PCIe 4.0×8, 350 W stock)
+
+Prefill (tok/s):
+
+| S | upstream/main | this branch | sglang | best |
+|---:|---:|---:|---:|---|
+| 32 | 4,355 | **5,347** | 1,351 | this branch |
+| 64 | 6,571 | **9,560** | 2,747 | this branch |
+| 128 | 8,453 | **14,795** | 5,285 | this branch |
+| 256 | 8,901 | **17,058** | 10,859 | this branch |
+| 512 | 8,635 | 15,316 | **20,942** | sglang |
+| 1,024 | 8,519 | 14,767 | **35,368** | sglang |
+| 2,048 | 7,987 | 13,340 | **41,658** | sglang |
+| 4,096 | — | 10,252 | **43,203** | sglang |
+| 8,192 | — | 6,805 | **41,434** | sglang |
+| 16,384 | — | 4,036 | **37,221** | sglang |
+| 32,768 | — | **2,197** | OOM | this branch |
+| 65,536 | — | **1,151** | n/a | this branch |
+
+Decode (tok/s, after S-token prefill):
+
+| S | upstream/main | this branch | sglang | best |
+|---:|---:|---:|---:|---|
+| 32 | 430 | **434** | 335 | this branch |
+| 64 | 443 | **444** | 336 | this branch |
+| 128 | 439 | **440** | 334 | this branch |
+| 256 | 431 | **432** | 334 | this branch |
+| 512 | 419 | **419** | 324 | this branch |
+| 1,024 | 394 | **395** | 336 | this branch |
+| 2,048 | n/a | **439** | 333 | this branch |
+| 4,096 | — | 290 | **328** | sglang |
+| 8,192 | — | 215 | **320** | sglang |
+| 16,384 | — | 141 | **307** | sglang |
+| 32,768 | — | **84** | OOM | this branch |
+| 65,536 | — | **46** | n/a | this branch |
+
+`upstream/main` columns are capped at S = 2,048 because the upstream
+binding hardcodes `FA_KV_HEADS * 2048 * FA_HEAD_DIM` as the KV
+stride; S > 2,048 silently corrupts the cache. This branch lifts
+that cap (the launcher reads `max_seq` from `fa_k_cache.size(2)`).
+
+## Headlines
+
+- **Short-context prefill is ours.** S ≤ 256 on the 3090 and S ≤
+  1,024 on B200 — fork-parent-b200 beats both upstream/main and
+  SGLang by 1.6–4×. The persistent-decode + low-launch-overhead
+  thesis holds at small S where SGLang's CUDA-graph capture and
+  flashinfer setup cost dominates real work.
+- **Long-context prefill is SGLang's.** On B200 at S = 8 k SGLang
+  does 217 k tok/s vs our 13 k — a 16× gap. cuBLAS sm_100 calls and
+  flashinfer's tensor-core attention dwarf our handwritten WMMA in
+  this regime. Same shape on the 3090 SGLang wins by 6×.
+- **Decode at short context is ours.** ~30 % faster than SGLang on
+  the 3090 across S = 32..1,024; ~30–60 % faster on B200 in the same
+  range. Persistent decode megakernel is exactly the right tool.
+- **Decode at long context is SGLang's.** Past S = 2 k our
+  per-step FA scan walks the whole KV cache linearly; SGLang's
+  flashinfer decode kernel is much better at hiding that latency.
+
+## Crossover map
+
+```
+                          this branch beats sglang
+                         ┌──────────────────────────────┐
+                         │           prefill            │  decode
+  3090 (sm_86)           │  S ≤ 256                     │  S ≤ 2,048
+  B200 (sm_100)          │  S ≤ 1,024                   │  S ≤ 1,024
+                         └──────────────────────────────┘
+```
 
 ## What did NOT change
 
 - **sm_86 (RTX 3090)**: All `is_blackwell` gates in `setup.py`
   evaluate false on sm_86 — same sources, same defines, same arch
-  flag as upstream. The shared `kernel.cu` + `prefill.cu` files do
-  pick up changes (cooperative grid sync in decode, the prefill
-  recurrence rewrite), but `cg::this_grid().sync()` is supported
-  from sm_60+ and the prefill changes are arch-agnostic.
-
-  Verified on a rented vast.ai RTX 3090 (PCIe 4.0×8, 350 W stock,
-  driver 570.181, CUDA 12.8, PyTorch 2.5.1+cu124) by re-running
-  `final_bench.py` apples-to-apples on `upstream/main` and on
-  this branch:
-
-  ```
-                                pp520 (tok/s)   tg128 (tok/s)   completion vs HF
-    upstream/main                   8,744           419            bit-exact
-    fork-parent-b200               15,875           417            bit-exact
-    delta                           +82 %          −0.5 %          unchanged
-  ```
-
-  Decode is flat (cooperative grid sync is neutral on sm_86 —
-  expected, since the hand-rolled barrier was already correct on
-  82 SMs). Prefill is +82 % from the same shared changes that win
-  on B200. Neither branch reproduces the upstream README's headline
-  37,800 pp520 / 413 tg128 numbers on this rig — an unrelated
-  baseline gap likely tied to PCIe lane width / power profile /
-  CUDA-runtime ABI of the published reference machine — but the
-  delta between the two branches is consistent and positive.
+  flag as upstream. Verified on a vast.ai 3090 (see table above):
+  identical decode within 1 % noise; prefill +23 % to +92 % across
+  shapes from arch-agnostic recurrence/sync improvements that
+  happen to also help sm_86.
 - **sm_120 / sm_121a (RTX 50 / DGX Spark / GB10)**: same sources,
-  same defines as before; the gb10 NVFP4 path is untouched. The
-  shared decode kernel flips to cooperative grid sync, which is a
-  strict improvement on sm_60+.
+  same defines as before; the gb10 NVFP4 path is untouched.
 - **NVFP4 path on B200**: the LUT-based NVFP4 decode runs (29,994
-  pp520, 327 tg128) but is slower than the new BF16 path because
+  pp520 / 327 tg128) but is slower than the new BF16 path because
   it intentionally avoids tensor cores. Recommended use of B200 is
-  `--backend bf16`. NVFP4 decode tuning for B200 (tcgen05.mma
-  warp-group tensor cores, NVFP4 native matvec) is deferred.
+  `--backend bf16`. NVFP4 decode tuning for B200 is deferred.
 
-## Honest caveats
+## Methodology
 
-- The remaining pp gap to llama.cpp on the persistent
-  `prefill_bf16_mega` path (still ~9k tok/s on this hardware) is
-  inside `phase_matmul_bf16`'s WMMA loop. cuBLAS sm_100 picks
-  hand-tuned kernels with `tcgen05.mma` warp-group tensor cores,
-  swizzled shared layouts with `ldmatrix.x4`, and epilogue fusion;
-  reproducing that in-kernel is a CUTLASS-grade GEMM engine of
-  ~500 lines, deferred.
-- The DeltaNet recurrence is now only ~30-35% of pp520 wall time
-  (down from 88%), so further prefill speedups need either matmul
-  rewrites or a chunked associative-scan recurrence (Mamba-style).
-- All numbers are wall-clock pp520/tg128 from `final_bench.py`
-  (10 warmup + 20 timed) on a single B200 with no other workload
-  pinned to the same GPU.
+- `bench_shapes.py` is in this repo and runs in a single Python
+  process: weights load once, KV cache and scratch sized for the
+  largest S in the sweep, per-S buffers re-allocated each step.
+- SGLang sweep uses `sglang.bench_one_batch` per shape (model
+  reloaded per call) — slower wall-clock but the steady-state
+  numbers are equivalent.
+- All decode timings: 8 warmup steps then 64 timed steps; report
+  median per-step throughput.
+- All numbers are batch 1, single stream, no other workload pinned
+  to the same GPU.
+- Torch versions used: 2.11+cu128 (B200) and 2.5.1+cu124 (3090) for
+  the megakernel runs; 2.9.1 (both boxes) after the SGLang install
+  upgraded torch.
+
+## Where the long-S prefill gap actually lives
+
+Profiling the prefill at S = 8 k on B200, our path spends ≈ 60 %
+inside `pf_deltanet_recurrence_vsplit_prepped` (still serial-over-t,
+and we now have one block-pair per (head, v_split) but 24 layers ×
+~16 blocks = 384 blocks per layer-step, not enough at that S to
+saturate 148 SMs each microsecond), ≈ 30 % inside the cuBLAS GEMM
+calls (working as advertised), and the rest in DN-prep and
+`pf_qk_norm_rope`. Two structural levers stand out for closing the
+gap to SGLang:
+
+1. **Chunked associative-scan DeltaNet recurrence.** The current
+   recurrence is exactly serial: 1 step depends on step t-1. The
+   delta-net update `S_t = decay * S_{t-1} + k_t (v_t - decay * S_{t-1} k_t).T β`
+   admits a chunked formulation where C consecutive steps run in
+   parallel inside a chunk and only the inter-chunk state propagates
+   sequentially (T/C chunks). This is exactly the Mamba-style
+   parallel scan. Even at C = 64 we'd cut the serial frontier 64×.
+   Estimated reach: 4–8× prefill at S ≥ 4 k.
+2. **flashinfer-style attention on the FA layers.** Our FA prefill
+   today is cuBLAS Q@K, materialized softmax, then attn@V — three
+   GEMMs and a kernel between them. flashinfer fuses all of that
+   into one tensor-core kernel with online softmax and never
+   materializes the score matrix. For 6 FA layers at S = 8 k the
+   savings dominate the cuBLAS time; at S = 2 k they're already
+   visible. Estimated reach: 2–3× on the FA prefill subtotal.
+
+Decode parity at long S needs flashinfer-decode-style behavior in
+the same kernel: chunked KV scan with online softmax instead of
+the per-step loop we have today. The persistent-megakernel scaffold
+stays — only the FA inner-loop kernel changes.

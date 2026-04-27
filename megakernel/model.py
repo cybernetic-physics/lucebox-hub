@@ -143,13 +143,15 @@ class Decoder:
     """Stateful decoder for Qwen3.5-0.8B bf16 megakernel."""
 
     def __init__(self, weights=None, tokenizer=None,
-                 model_name="Qwen/Qwen3.5-0.8B", verbose=True):
+                 model_name="Qwen/Qwen3.5-0.8B", verbose=True,
+                 max_seq_len=MAX_SEQ_LEN):
         _load_op()
 
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
+        self._max_seq_len = max_seq_len
         self._weights = weights
         self._embed_weight = weights["embed_weight"]
         self._final_norm_weight = weights["final_norm_weight"]
@@ -162,7 +164,7 @@ class Decoder:
         u32 = dict(dtype=torch.uint32, device="cuda")
 
         n_fa = sum(1 for t in LAYER_TYPE if t == 1)
-        self._fa_k_cache = torch.zeros(n_fa, FA_NUM_KV_HEADS, MAX_SEQ_LEN, FA_HEAD_DIM, **bf16)
+        self._fa_k_cache = torch.zeros(n_fa, FA_NUM_KV_HEADS, max_seq_len, FA_HEAD_DIM, **bf16)
         self._fa_v_cache = torch.zeros_like(self._fa_k_cache)
 
         n_dn = sum(1 for t in LAYER_TYPE if t == 0)
@@ -204,7 +206,7 @@ class Decoder:
             self._barrier_counter, self._barrier_generation,
             self._block_max_vals, self._block_max_idxs,
             self._lm_sync_counter,
-            self._position, MAX_SEQ_LEN,
+            self._position, self._max_seq_len,
         )
         self._position += 1
         return self._out_token.item()

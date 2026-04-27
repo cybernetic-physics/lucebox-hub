@@ -888,7 +888,7 @@ static void cublas_bf16_gemm(cublasHandle_t h,
 static void prefill_bf16_body(
     cublasHandle_t cublas,
     const PFLayerWeights *hl,              // host-side mirror of layers[]
-    const int *token_ids, int S, int *output_token,
+    const int *token_ids, int S, int max_seq, int *output_token,
     const __nv_bfloat16 *embed_weight,
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
@@ -905,7 +905,7 @@ static void prefill_bf16_body(
     int bk = (S*HIDDEN+255)/256;
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
 
-    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    int fa_stride = FA_KV_HEADS * max_seq * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
     int fa_idx = 0, dn_idx = 0;
 
@@ -1017,7 +1017,7 @@ static void prefill_bf16_body(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq);
 
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
@@ -1052,6 +1052,7 @@ static void prefill_bf16_body(
 //       runs, so after the first one we pay ~no per-call overhead. =====
 struct PrefillGraphKey {
     int seq_len;
+    int max_seq;
     const int *token_ids;
     int *output_token;
     const void *embed_weight;
@@ -1096,7 +1097,7 @@ static bool keys_equal(const PrefillGraphKey &a, const PrefillGraphKey &b) {
 
 // ===== Main orchestrator =====
 extern "C" void launch_prefill_bf16(
-    const int *token_ids, int seq_len, int *output_token,
+    const int *token_ids, int seq_len, int max_seq, int *output_token,
     const __nv_bfloat16 *embed_weight, const PFLayerWeights *layers,
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
@@ -1134,6 +1135,7 @@ extern "C" void launch_prefill_bf16(
 
     PrefillGraphKey key{};
     key.seq_len = seq_len;
+    key.max_seq = max_seq;
     key.token_ids = token_ids;
     key.output_token = output_token;
     key.embed_weight = embed_weight;
@@ -1201,7 +1203,7 @@ extern "C" void launch_prefill_bf16(
     if (disable_graph || (hit && hit->eager_runs < eager_warmups)) {
         prefill_bf16_body(
             cublas, hl_local,
-            token_ids, seq_len, output_token,
+            token_ids, seq_len, max_seq, output_token,
             embed_weight, final_norm_w, lm_head_w,
             fa_k_cache, fa_v_cache, dn_states, conv_bufs,
             hidden, residual, normalized,
@@ -1224,7 +1226,7 @@ extern "C" void launch_prefill_bf16(
         }
         prefill_bf16_body(
             cublas, hl_local,
-            token_ids, seq_len, output_token,
+            token_ids, seq_len, max_seq, output_token,
             embed_weight, final_norm_w, lm_head_w,
             fa_k_cache, fa_v_cache, dn_states, conv_bufs,
             hidden, residual, normalized,
@@ -1254,7 +1256,7 @@ extern "C" void launch_prefill_bf16(
     }
     prefill_bf16_body(
         cublas, hl_local,
-        token_ids, seq_len, output_token,
+        token_ids, seq_len, max_seq, output_token,
         embed_weight, final_norm_w, lm_head_w,
         fa_k_cache, fa_v_cache, dn_states, conv_bufs,
         hidden, residual, normalized,
@@ -1302,7 +1304,7 @@ fallback_eager:
     cudaEventDestroy(join_evt);
     prefill_bf16_body(
         cublas, hl_local,
-        token_ids, seq_len, output_token,
+        token_ids, seq_len, max_seq, output_token,
         embed_weight, final_norm_w, lm_head_w,
         fa_k_cache, fa_v_cache, dn_states, conv_bufs,
         hidden, residual, normalized,

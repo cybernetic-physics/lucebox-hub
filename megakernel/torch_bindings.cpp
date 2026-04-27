@@ -334,7 +334,7 @@ void quantize_nvfp4_lm_out(
 // ===== Prefill BF16 =====
 
 extern "C" void launch_prefill_bf16(
-    const int *token_ids, int seq_len, int *output_token,
+    const int *token_ids, int seq_len, int max_seq, int *output_token,
     const void *embed_weight, const LayerWeights *layers,
     const void *final_norm_w, const void *lm_head_w,
     void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
@@ -358,8 +358,12 @@ void prefill_bf16(
     torch::Tensor final_normed, torch::Tensor hidden_bf16_out,
     torch::Tensor lm_bmv, torch::Tensor lm_bmi)
 {
+    // K/V cache layout is [n_fa_layers, FA_NUM_KV_HEADS, max_seq, FA_HEAD_DIM].
+    // The kernel needs max_seq for stride math; read it from the tensor so
+    // we don't have to keep model.py's MAX_SEQ_LEN and prefill.cu in sync.
+    int max_seq = static_cast<int>(fa_k_cache.size(2));
     launch_prefill_bf16(
-        (const int*)token_ids.data_ptr(), token_ids.size(0),
+        (const int*)token_ids.data_ptr(), token_ids.size(0), max_seq,
         (int*)output_token.data_ptr(),
         embed_weight.data_ptr(),
         reinterpret_cast<const LayerWeights*>(layer_weights_packed.data_ptr()),
