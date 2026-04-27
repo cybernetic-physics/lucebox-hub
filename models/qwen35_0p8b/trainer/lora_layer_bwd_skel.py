@@ -34,9 +34,22 @@ from typing import Any
 sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
 sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
 
+import importlib.util  # noqa: E402
+
 import torch  # noqa: E402
 
-from lora_megakernel_step import HIDDEN, INTER, NUM_LAYERS, LAYER_TYPE  # noqa: E402
+# Import constants directly from outer model.py to avoid pulling in
+# lora_megakernel_step (which transitively imports the inference
+# extension). This file's helpers are pure-trainer-extension.
+_spec = importlib.util.spec_from_file_location(
+    "qwen_outer_model_consts",
+    "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+_outer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_outer)
+HIDDEN = _outer.HIDDEN_SIZE
+INTER = _outer.INTERMEDIATE_SIZE
+NUM_LAYERS = _outer.NUM_LAYERS
+LAYER_TYPE = _outer.LAYER_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +72,13 @@ def lora_linear_bwd(
     S, K_in = x.shape
     R = A.shape[1]
     K_out = B.shape[1]
-    grad_x = torch.empty(S, K_in, dtype=torch.float32, device="cuda")
-    grad_A = torch.empty(K_in, R, dtype=torch.float32, device="cuda")
-    grad_B = torch.empty(R, K_out, dtype=torch.float32, device="cuda")
-    ws_lora_h = torch.empty(S * R, dtype=torch.float32, device="cuda")
-    ws_grad_lora_h = torch.empty(S * R, dtype=torch.float32, device="cuda")
+    # zero-init: the kernel accumulates into grad_A / grad_B (matches the
+    # test_bwd_mlp.py call convention, where torch.zeros is used).
+    grad_x = torch.zeros(S, K_in, dtype=torch.float32, device="cuda")
+    grad_A = torch.zeros(K_in, R, dtype=torch.float32, device="cuda")
+    grad_B = torch.zeros(R, K_out, dtype=torch.float32, device="cuda")
+    ws_lora_h = torch.zeros(S, R, dtype=torch.float32, device="cuda")
+    ws_grad_lora_h = torch.zeros(S, R, dtype=torch.float32, device="cuda")
 
     torch.ops.train_megakernel_C.bwd_lora_linear(
         x.contiguous(), A.contiguous(), B.contiguous(), grad_y.contiguous(),
@@ -71,9 +86,13 @@ def lora_linear_bwd(
         ws_lora_h, ws_grad_lora_h,
         S, K_in, K_out, R, scaling,
     )
-    # Add base-path grad_x: d(y) @ base_W   →  [S, K_in] fp32
-    grad_x_base = grad_y.to(torch.bfloat16) @ base_W
-    grad_x = grad_x + grad_x_base.float()
+    # Add base-path grad_x: d(y) @ base_W   →  [S, K_in] fp32.
+    # Keep grad_y in fp32 here — casting to bf16 loses signal on small
+    # gradients (std ~1e-2) which the gate/up paths typically have. The
+    # extra precision is essentially free since cuBLAS does fp32 GEMM
+    # natively; only the weight tensor is cast to fp32.
+    grad_x_base = grad_y @ base_W.float()
+    grad_x = grad_x + grad_x_base
     return grad_x, grad_A, grad_B
 
 
@@ -114,6 +133,105 @@ def swiglu_bwd(
         dgate, dup, N,
     )
     return dgate, dup
+
+
+# ---------------------------------------------------------------------------
+# MLP-block reverse walk (FA-style: gate/up/down + post-attn RMSnorm)
+# ---------------------------------------------------------------------------
+
+def layer_mlp_bwd(
+    *,
+    h_post_attn: torch.Tensor,        # [S, HIDDEN] bf16 — pre-post-attn-rmsnorm residual
+    normalized_post_attn: torch.Tensor,  # [S, HIDDEN] bf16 — post-rmsnorm input to gate/up
+    mlp_inter: torch.Tensor,           # [S, INTER] bf16 — silu(gate)*up output, input to down
+    dh_out: torch.Tensor,              # [S, HIDDEN] fp32 — d(layer output residual stream)
+    # Frozen base weights for this layer:
+    post_attn_norm_w: torch.Tensor,    # [HIDDEN] bf16
+    gate_W: torch.Tensor,              # [INTER, HIDDEN] bf16
+    up_W: torch.Tensor,                # [INTER, HIDDEN] bf16
+    down_W: torch.Tensor,              # [HIDDEN, INTER] bf16
+    # LoRA tensors for this layer's MLP projections (single layer slice):
+    gate_A: torch.Tensor, gate_B: torch.Tensor,    # [HIDDEN, R], [R, INTER]
+    up_A: torch.Tensor,   up_B: torch.Tensor,
+    down_A: torch.Tensor, down_B: torch.Tensor,    # [INTER, R], [R, HIDDEN]
+    lora_scaling: float,
+    rms_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Reverse walk of the MLP block of one layer.
+
+    Forward (for reference):
+        h_post_attn  → rms_norm → normalized_post_attn
+        gate = gate_W·normalized_post_attn  (+ LoRA)
+        up   = up_W  ·normalized_post_attn  (+ LoRA)
+        mlp_inter = silu(gate) * up
+        mlp_out = down_W·mlp_inter  (+ LoRA)
+        h_out   = h_post_attn + mlp_out
+
+    Backward returns:
+        dh_post_attn : [S, HIDDEN] fp32 — gradient flowing back to the
+                       attention output (= dh_residual + dh_through_rmsnorm).
+        grad_gate_A, grad_gate_B   : LoRA gate grads
+        grad_up_A,   grad_up_B     : LoRA up grads
+        grad_down_A, grad_down_B   : LoRA down grads
+
+    Uses bwd_lora_linear, bwd_swiglu, bwd_rmsnorm. The FA o_proj /
+    attention bwd / qkv bwd / input rmsnorm bwd are NOT included
+    here — those are the "rest" of the layer walk (steps 8-15 in the
+    skeleton's docstring).
+    """
+    S, H = h_post_attn.shape
+    INTER_dim = mlp_inter.shape[1]
+
+    # --- Step 1: residual split -----------------------------------------
+    # h_out = h_post_attn + mlp_out, so:
+    #   dmlp_out = dh_out
+    #   dh_post_attn (residual contribution) = dh_out
+    dmlp_out = dh_out
+    dh_post_attn = dh_out.clone()
+
+    # --- Step 2: down LoRA bwd ------------------------------------------
+    # mlp_out = down_W·mlp_inter + scaling·(mlp_inter·down_A)·down_B
+    # → dmlp_inter, dA_down, dB_down
+    dmlp_inter, grad_down_A, grad_down_B = lora_linear_bwd(
+        x=mlp_inter, A=down_A, B=down_B, base_W=down_W,
+        grad_y=dmlp_out, scaling=lora_scaling)
+
+    # --- Step 3: SwiGLU bwd ---------------------------------------------
+    # mlp_inter = silu(gate) * up. We didn't save gate/up — recompute them.
+    # gate = normalized_post_attn @ gate_W.T + scaling * (npa @ gate_A) @ gate_B
+    # Same pattern for up.
+    npa = normalized_post_attn
+    gate = npa.float() @ gate_W.float().t()
+    gate = gate + lora_scaling * ((npa.float() @ gate_A.float()) @ gate_B.float())
+    up = npa.float() @ up_W.float().t()
+    up = up + lora_scaling * ((npa.float() @ up_A.float()) @ up_B.float())
+    gate_bf = gate.to(torch.bfloat16).contiguous()
+    up_bf = up.to(torch.bfloat16).contiguous()
+
+    dgate, dup = swiglu_bwd(gate_bf, up_bf, dmlp_inter)
+
+    # --- Step 4: gate, up LoRA bwd → accumulate into dnorm_post_attn ----
+    dnpa_from_gate, grad_gate_A, grad_gate_B = lora_linear_bwd(
+        x=npa, A=gate_A, B=gate_B, base_W=gate_W,
+        grad_y=dgate, scaling=lora_scaling)
+    dnpa_from_up, grad_up_A, grad_up_B = lora_linear_bwd(
+        x=npa, A=up_A, B=up_B, base_W=up_W,
+        grad_y=dup, scaling=lora_scaling)
+    dnpa = dnpa_from_gate + dnpa_from_up
+
+    # --- Step 5: post-attn RMSnorm bwd ----------------------------------
+    # rms_norm(h_post_attn, post_attn_norm_w) = normalized_post_attn
+    # bwd_rmsnorm gives d(h_post_attn) given d(normalized_post_attn).
+    dh_through_norm = rmsnorm_bwd(
+        x=h_post_attn, w=post_attn_norm_w, dy=dnpa, eps=rms_eps)
+    dh_post_attn = dh_post_attn + dh_through_norm
+
+    return {
+        "dh_post_attn": dh_post_attn,
+        "grad_gate_A": grad_gate_A, "grad_gate_B": grad_gate_B,
+        "grad_up_A":   grad_up_A,   "grad_up_B":   grad_up_B,
+        "grad_down_A": grad_down_A, "grad_down_B": grad_down_B,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -236,5 +354,6 @@ def run_layer_walking_bwd(
 
 __all__ = [
     "lora_linear_bwd", "rmsnorm_bwd", "swiglu_bwd",
+    "layer_mlp_bwd",
     "per_layer_bwd_fa", "per_layer_bwd_dn", "run_layer_walking_bwd",
 ]

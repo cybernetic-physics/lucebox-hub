@@ -1,14 +1,24 @@
 #include <Python.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <torch/all.h>
 #include <torch/library.h>
+#include <cuda_bf16.h>  // after torch headers — including before them causes
+                        // TORCH_LIBRARY's TORCH_EXTENSION_NAME macro paste to
+                        // resolve to the literal string "TORCH_EXTENSION_NAME"
+                        // (silently un-registers all ops from this extension).
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 #define _STRINGIFY(A) #A
 #define STRINGIFY(A) _STRINGIFY(A)
+
+// Indirection so TORCH_EXTENSION_NAME (a -D macro) gets expanded before
+// being token-pasted by torch's TORCH_LIBRARY. Without this wrapper the
+// generated registrar uses the literal string "TORCH_EXTENSION_NAME" and
+// no ops are visible under torch.ops.train_megakernel_C.
+#define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
+
 #define REGISTER_EXTENSION(NAME)                                               \
   PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                     \
     static struct PyModuleDef module = {PyModuleDef_HEAD_INIT,                 \
@@ -205,7 +215,7 @@ void fused_adamw_step(
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, ops) {
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("train_mega_forward(Tensor out_token, Tensor token_ids, "
             "Tensor embed, Tensor layers_packed, "
             "Tensor final_norm_w, Tensor lm_head_w, "
