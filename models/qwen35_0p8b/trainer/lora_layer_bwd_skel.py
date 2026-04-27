@@ -494,64 +494,278 @@ def per_layer_bwd_fa(
 
 
 # ---------------------------------------------------------------------------
-# DN-layer reverse walk (stub)
+# DN-layer reverse walk
 # ---------------------------------------------------------------------------
+#
+# DN-attention has no LoRA in the trainer's default config (PEFT targets
+# q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj — none match
+# the DN attention modules in_proj_qkvz / in_proj_ba / out_proj). So
+# per_layer_bwd_dn only needs to:
+#   - compute dh_in (gradient flowing back to layer L-1)
+#   - compute MLP-side LoRA grads (dn_gate, dn_up, dn_down) — same kernel
+#     path as FA, just different LoRA tensor identities
+#
+# Approach: run autograd through the HF GatedDeltaNet module directly.
+# That module already uses fla.chunk_gated_delta_rule under the hood
+# (the same kernel our hybrid router calls during forward). The
+# autograd path is correct and ~2× a forward DN pass (recompute +
+# bwd). Future optimization: replace with our recurrent dn_bwd kernel
+# or the chunked CUDA bwd port (Tier 1.6).
 
 def per_layer_bwd_dn(
-    L: int,
-    dn_idx: int,                     # DN-only layer index in [0, N_DN)
-    dh_out: torch.Tensor,
-    saves: dict,
-    lora_flat: list[torch.Tensor],
-    base_weights_handle: Any,
-    lora_rank: int,
+    *,
+    dn_idx: int,                          # DN-only layer index in [0, N_DN)
+    dh_out: torch.Tensor,                 # [S, HIDDEN] fp32 — gradient into layer's output
+    # Saved activations (single-layer slices already taken):
+    hidden_in: torch.Tensor,              # [S, HIDDEN] bf16
+    normalized_post_attn: torch.Tensor,   # [S, HIDDEN] bf16
+    mlp_inter: torch.Tensor,              # [S, INTER]  bf16
+    h_post_attn: torch.Tensor,            # [S, HIDDEN] bf16
+    # HF layer module — used to run the DN attention forward under
+    # autograd. Provides: input_layernorm, linear_attn (the
+    # Qwen3NextGatedDeltaNet), and post-attn norm (consumed via
+    # post_attn_norm_w arg below).
+    hf_layer,
+    # Frozen MLP base weights:
+    post_attn_norm_w: torch.Tensor,       # [HIDDEN]
+    gate_W: torch.Tensor, up_W: torch.Tensor, down_W: torch.Tensor,
+    # Single-layer LoRA slices (DN attention LoRA tensors expected to
+    # be zero / not present; only MLP LoRAs matter):
+    dn_gate_A: torch.Tensor, dn_gate_B: torch.Tensor,
+    dn_up_A: torch.Tensor,   dn_up_B: torch.Tensor,
+    dn_down_A: torch.Tensor, dn_down_B: torch.Tensor,
     lora_scaling: float,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Reverse walk of one DN layer. TODO: implement. Mirrors the FA path but:
-      - The attention bwd is dn_bwd (recurrent CUDA, requires state_history)
-        OR dn_chunked_bwd (chunked CUDA — Tier 1.6, pending).
-      - The Q/K/V projections are 2 LoRA'd projections (in_proj_qkv, in_proj_z)
-        plus a non-LoRA conv1d path. Need conv1d bwd via at::conv_depthwise2d_bwd.
+    rms_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Reverse walk of one DN layer.
+
+    Returns:
+        dh_in: [S, HIDDEN] fp32 — gradient flowing OUT of this layer
+        grad_dn_{gate,up,down}_{A,B}: 6 LoRA grads for the MLP block
     """
-    raise NotImplementedError(
-        "per_layer_bwd_dn — same skeleton as per_layer_bwd_fa with DN-specific\n"
-        "attention and qkv handling. The state_history requirement is the\n"
-        "main blocker; either:\n"
-        "  (a) Use the recurrent dn_bwd kernel (bit-exact, but requires\n"
-        "      ~1 MB × S × N_DN of state_history HBM — 18 GB at S=128).\n"
-        "  (b) Run dn_fwd_with_delta_save once before bwd to materialize\n"
-        "      state_history (extra forward pass — costs ~30% wall).\n"
-        "  (c) Wait for chunked CUDA bwd port (Tier 1.6) which only needs\n"
-        "      state_chunks (~50 MB at S=128).\n"
+    # MLP block bwd via our kernel (identical to FA's MLP path).
+    mlp_out = layer_mlp_bwd(
+        h_post_attn=h_post_attn,
+        normalized_post_attn=normalized_post_attn,
+        mlp_inter=mlp_inter,
+        dh_out=dh_out,
+        post_attn_norm_w=post_attn_norm_w,
+        gate_W=gate_W, up_W=up_W, down_W=down_W,
+        gate_A=dn_gate_A, gate_B=dn_gate_B,
+        up_A=dn_up_A,     up_B=dn_up_B,
+        down_A=dn_down_A, down_B=dn_down_B,
+        lora_scaling=lora_scaling, rms_eps=rms_eps,
     )
 
+    # DN attention block bwd via autograd through HF's actual layer.
+    # We need to backward from d(attn_out) (= dh_through_attn) through
+    # input_layernorm + linear_attn (= Qwen3NextGatedDeltaNet).
+    h_in = hidden_in.unsqueeze(0).detach().clone().requires_grad_(True)  # [1, S, HIDDEN]
+    npa = hf_layer.input_layernorm(h_in)
+    attn_out = hf_layer.linear_attn(npa)
+    h_post_attn_recomp = h_in + attn_out
+    # Upstream gradient is mlp_out["dh_post_attn"] in [S, HIDDEN] fp32;
+    # HF expects [B=1, S, HIDDEN] in the same dtype as h_post_attn.
+    upstream = mlp_out["dh_post_attn"].unsqueeze(0).to(h_post_attn_recomp.dtype)
+    h_post_attn_recomp.backward(upstream)
+
+    return {
+        "dh_in":         h_in.grad[0].detach(),
+        "grad_dn_gate_A": mlp_out["grad_gate_A"], "grad_dn_gate_B": mlp_out["grad_gate_B"],
+        "grad_dn_up_A":   mlp_out["grad_up_A"],   "grad_dn_up_B":   mlp_out["grad_up_B"],
+        "grad_dn_down_A": mlp_out["grad_down_A"], "grad_dn_down_B": mlp_out["grad_down_B"],
+    }
+
 
 # ---------------------------------------------------------------------------
-# Top-level driver (stub)
+# Top-level driver: iterate 24 layers in reverse, dispatch per-layer bwd
 # ---------------------------------------------------------------------------
+
+# Canonical kernel order (matches lora_pack._KERNEL_ORDER and the
+# torch_bindings.cpp SET(idx, name) table). Each entry is a (name,
+# A_shape_per_layer, B_shape_per_layer) tuple where the per-layer
+# shapes are looked up in the flat tensors via the head_idx (fa_idx
+# or dn_idx).
+N_FA_TOTAL = 6
+N_DN_TOTAL = 18
+
+
+def _allocate_flat_grads(lora_flat: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Returns a list of 26 fp32 zero-tensors with the same shape as
+    each LoRA tensor in lora_flat. These accumulate per-layer grads."""
+    return [torch.zeros_like(t, dtype=torch.float32) for t in lora_flat]
+
+
+# Indices into lora_flat (matching lora_pack._KERNEL_ORDER):
+#   FA: 0..6 are (q, k, v, o, gate, up, down) × A then B → tensor pairs
+#       at indices 0/1, 2/3, 4/5, 6/7, 8/9, 10/11, 12/13
+#   DN: indices 14/15 (qkv), 16/17 (z), 18/19 (out),
+#               20/21 (gate), 22/23 (up), 24/25 (down)
+_FA_FLAT_IDX = {
+    "q":    (0, 1),
+    "k":    (2, 3),
+    "v":    (4, 5),
+    "o":    (6, 7),
+    "gate": (8, 9),
+    "up":   (10, 11),
+    "down": (12, 13),
+}
+_DN_FLAT_IDX = {
+    "qkv":  (14, 15),
+    "z":    (16, 17),
+    "out":  (18, 19),
+    "gate": (20, 21),
+    "up":   (22, 23),
+    "down": (24, 25),
+}
+
 
 def run_layer_walking_bwd(
-    grad_h_pre_norm: torch.Tensor,
-    saves: dict,
-    lora_flat: list[torch.Tensor],
-    base_weights_handle: Any,
+    *,
+    grad_h_pre_norm: torch.Tensor,    # [S, HIDDEN] fp32 — entry from kernel_loss_autograd
+    saves: dict,                       # 6 activation slabs, each [NUM_LAYERS, S, *]
+    lora_flat: list[torch.Tensor],     # 26 packed bf16 LoRA tensors
+    final_norm_weight: torch.Tensor,   # [HIDDEN] bf16
+    hf_model,                          # PEFT-wrapped HF model, used for DN bwd
+                                        #   + base-weight access on a per-layer basis
     lora_rank: int,
     lora_scaling: float,
-) -> dict[str, torch.Tensor]:
-    """Iterate layers in reverse, accumulating per-projection LoRA grads.
+    rms_eps: float = 1e-6,
+) -> list[torch.Tensor]:
+    """Walk layers in reverse, dispatching to per_layer_bwd_fa or
+    per_layer_bwd_dn per LAYER_TYPE. Accumulates per-layer LoRA grads
+    into a flat 26-tensor list of fp32 grad tensors (matching the
+    lora_flat layout) which the caller passes to fused AdamW.
 
-    Returns a dict mapping projection name (e.g. 'fa_q_A') to its full
-    [n_layers_of_type, K_in_or_R, R_or_K_out] gradient tensor.
+    Computes d(h_pre_norm) → backward through final RMSnorm → dh_out for
+    the last layer → walk → dh_out for first layer's input. The first
+    layer's dh_in flows back to the embedding (which has no LoRA, so
+    discarded).
     """
-    raise NotImplementedError(
-        "Iterate L from NUM_LAYERS-1 down to 0:\n"
-        "  - look up LAYER_TYPE[L]\n"
-        "  - if FA: dh_in, layer_grads = per_layer_bwd_fa(L, fa_idx, dh_out, ...)\n"
-        "  - if DN: dh_in, layer_grads = per_layer_bwd_dn(L, dn_idx, dh_out, ...)\n"
-        "  - accumulate layer_grads into the flat 26-tensor grad buffer at the\n"
-        "    correct (kernel_idx, ...) slice.\n"
-        "  - dh_out for next iter = dh_in.\n"
-    )
+    S = grad_h_pre_norm.shape[0]
+
+    # --- final RMSnorm bwd: d(h_pre_norm) → d(h_out[NUM_LAYERS-1]) ---
+    # h_out[NUM_LAYERS-1] is the input to the final RMSnorm, h_pre_norm
+    # in our terminology. We need to backward through:
+    #   final_normed = rms_norm(h_pre_norm, final_norm_weight)
+    # to get d(h_pre_norm) — but grad_h_pre_norm IS d(h_pre_norm).
+    # Wait: kernel_loss_autograd returns grad of loss wrt h_pre_norm
+    # (the pre-final-norm hidden), which is exactly the output residual
+    # of the last layer. So no extra bwd-rmsnorm here; dh_out for layer
+    # NUM_LAYERS-1 is grad_h_pre_norm directly.
+
+    flat_grads = _allocate_flat_grads(lora_flat)
+    # bwd_lora_linear and bwd_rmsnorm both require fp32 dy. Autograd's
+    # grad on a bf16 leaf comes back as bf16, so cast once at entry and
+    # at every per-layer boundary (see end of loop).
+    dh = grad_h_pre_norm.to(torch.float32).contiguous()
+
+    fa_idx = N_FA_TOTAL - 1
+    dn_idx = N_DN_TOTAL - 1
+    # Iterate from last layer to first.
+    for L in range(NUM_LAYERS - 1, -1, -1):
+        layer_type = LAYER_TYPE[L]
+        hf_layer = hf_model.base_model.model.model.layers[L]
+
+        # Pull per-layer activation slices.
+        hidden_in_L            = saves["hidden_in"][L]               # [S, HIDDEN] bf16
+        normalized_post_attn_L = saves["normalized_post_attn"][L]    # [S, HIDDEN] bf16
+        mlp_inter_L            = saves["mlp_inter"][L]               # [S, INTER]  bf16
+        h_post_attn_L          = saves["h_post_attn"][L]             # [S, HIDDEN] bf16
+
+        # Pull per-layer base norm + MLP weights via the HF module.
+        post_attn_norm_w = hf_layer.post_attention_layernorm.weight
+        gate_W = hf_layer.mlp.gate_proj.base_layer.weight if hasattr(hf_layer.mlp.gate_proj, "base_layer") else hf_layer.mlp.gate_proj.weight
+        up_W   = hf_layer.mlp.up_proj.base_layer.weight   if hasattr(hf_layer.mlp.up_proj, "base_layer")   else hf_layer.mlp.up_proj.weight
+        down_W = hf_layer.mlp.down_proj.base_layer.weight if hasattr(hf_layer.mlp.down_proj, "base_layer") else hf_layer.mlp.down_proj.weight
+
+        if layer_type == 1:
+            # Full attention layer.
+            input_norm_w = hf_layer.input_layernorm.weight
+            sa = hf_layer.self_attn
+            q_W = sa.q_proj.base_layer.weight if hasattr(sa.q_proj, "base_layer") else sa.q_proj.weight
+            k_W = sa.k_proj.base_layer.weight if hasattr(sa.k_proj, "base_layer") else sa.k_proj.weight
+            v_W = sa.v_proj.base_layer.weight if hasattr(sa.v_proj, "base_layer") else sa.v_proj.weight
+            o_W = sa.o_proj.base_layer.weight if hasattr(sa.o_proj, "base_layer") else sa.o_proj.weight
+            q_nw = sa.q_norm.weight
+            k_nw = sa.k_norm.weight
+
+            # FA-side LoRA slices for this layer.
+            slices = {
+                "fa_q_A":    lora_flat[_FA_FLAT_IDX["q"][0]][fa_idx],
+                "fa_q_B":    lora_flat[_FA_FLAT_IDX["q"][1]][fa_idx],
+                "fa_k_A":    lora_flat[_FA_FLAT_IDX["k"][0]][fa_idx],
+                "fa_k_B":    lora_flat[_FA_FLAT_IDX["k"][1]][fa_idx],
+                "fa_v_A":    lora_flat[_FA_FLAT_IDX["v"][0]][fa_idx],
+                "fa_v_B":    lora_flat[_FA_FLAT_IDX["v"][1]][fa_idx],
+                "fa_o_A":    lora_flat[_FA_FLAT_IDX["o"][0]][fa_idx],
+                "fa_o_B":    lora_flat[_FA_FLAT_IDX["o"][1]][fa_idx],
+                "fa_gate_A": lora_flat[_FA_FLAT_IDX["gate"][0]][fa_idx],
+                "fa_gate_B": lora_flat[_FA_FLAT_IDX["gate"][1]][fa_idx],
+                "fa_up_A":   lora_flat[_FA_FLAT_IDX["up"][0]][fa_idx],
+                "fa_up_B":   lora_flat[_FA_FLAT_IDX["up"][1]][fa_idx],
+                "fa_down_A": lora_flat[_FA_FLAT_IDX["down"][0]][fa_idx],
+                "fa_down_B": lora_flat[_FA_FLAT_IDX["down"][1]][fa_idx],
+            }
+
+            out = per_layer_bwd_fa(
+                fa_idx=fa_idx, dh_out=dh,
+                hidden_in=hidden_in_L,
+                normalized_post_attn=normalized_post_attn_L,
+                mlp_inter=mlp_inter_L,
+                h_post_attn=h_post_attn_L,
+                input_norm_w=input_norm_w,
+                q_W=q_W, k_W=k_W, v_W=v_W,
+                q_nw=q_nw, k_nw=k_nw, o_W=o_W,
+                post_attn_norm_w=post_attn_norm_w,
+                gate_W=gate_W, up_W=up_W, down_W=down_W,
+                **slices,
+                lora_scaling=lora_scaling, rms_eps=rms_eps,
+            )
+
+            # Scatter grads into flat_grads at fa_idx.
+            for proj, (a_i, b_i) in _FA_FLAT_IDX.items():
+                flat_grads[a_i][fa_idx] += out[f"grad_{proj}_A"].to(flat_grads[a_i].dtype)
+                flat_grads[b_i][fa_idx] += out[f"grad_{proj}_B"].to(flat_grads[b_i].dtype)
+            fa_idx -= 1
+        else:
+            # DN layer — uses the HF GatedDeltaNet under autograd for
+            # the attention block; MLP path identical to FA.
+            slices = {
+                "dn_gate_A": lora_flat[_DN_FLAT_IDX["gate"][0]][dn_idx],
+                "dn_gate_B": lora_flat[_DN_FLAT_IDX["gate"][1]][dn_idx],
+                "dn_up_A":   lora_flat[_DN_FLAT_IDX["up"][0]][dn_idx],
+                "dn_up_B":   lora_flat[_DN_FLAT_IDX["up"][1]][dn_idx],
+                "dn_down_A": lora_flat[_DN_FLAT_IDX["down"][0]][dn_idx],
+                "dn_down_B": lora_flat[_DN_FLAT_IDX["down"][1]][dn_idx],
+            }
+            out = per_layer_bwd_dn(
+                dn_idx=dn_idx, dh_out=dh,
+                hidden_in=hidden_in_L,
+                normalized_post_attn=normalized_post_attn_L,
+                mlp_inter=mlp_inter_L,
+                h_post_attn=h_post_attn_L,
+                hf_layer=hf_layer,
+                post_attn_norm_w=post_attn_norm_w,
+                gate_W=gate_W, up_W=up_W, down_W=down_W,
+                **slices,
+                lora_scaling=lora_scaling, rms_eps=rms_eps,
+            )
+
+            # Scatter MLP grads (DN attention LoRA grads aren't computed
+            # because the trainer's default config doesn't target them).
+            for proj in ("gate", "up", "down"):
+                a_i, b_i = _DN_FLAT_IDX[proj]
+                flat_grads[a_i][dn_idx] += out[f"grad_dn_{proj}_A"].to(flat_grads[a_i].dtype)
+                flat_grads[b_i][dn_idx] += out[f"grad_dn_{proj}_B"].to(flat_grads[b_i].dtype)
+            dn_idx -= 1
+
+        # The bwd_lora_linear kernel requires grad_y in fp32. Autograd-
+        # generated grads on bf16 leaf tensors are bf16; cast back at the
+        # layer boundary so the next layer's MLP-down LoRA bwd is happy.
+        dh = out["dh_in"].to(torch.float32).contiguous()
+
+    return flat_grads
 
 
 __all__ = [

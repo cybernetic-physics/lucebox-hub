@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import threading
@@ -46,6 +47,28 @@ from safetensors.torch import load_file, save_file
 try:
     import transformers.utils.import_utils as _iu
     _iu.is_flash_linear_attention_available = lambda: False
+except Exception:
+    pass
+
+# PEFT >= 0.19 unconditionally probes torchao via a strict version check
+# during LoRA module dispatch — even when the target Linear isn't a
+# torchao quantized module. On boxes with torchao < 0.16 (e.g. our
+# B200 box: torchao 0.9.0) PEFT raises ImportError before reaching the
+# regular Linear dispatcher. Short-circuit the check so dispatcher
+# falls through to the standard nn.Linear path. This is safe because
+# the trainer doesn't use torchao quantized weights. We patch the check
+# at every place PEFT imports it from — peft.import_utils and the
+# already-imported reference inside peft.tuners.lora.torchao.
+def _peft_no_torchao(*_a, **_kw):
+    return False
+try:
+    import peft.import_utils as _peft_iu
+    _peft_iu.is_torchao_available = _peft_no_torchao
+except Exception:
+    pass
+try:
+    import peft.tuners.lora.torchao as _peft_lora_torchao
+    _peft_lora_torchao.is_torchao_available = _peft_no_torchao
 except Exception:
     pass
 
@@ -340,6 +363,15 @@ class LoraMegakernelTrainer:
                     "metrics": {"loss:mean": 0.0, "batch_size:mean": float(len(data))},
                 }
 
+            # Optional Slice-B.3b path: kernel-driven forward + per-layer
+            # custom backward, bypassing HF+PEFT autograd entirely. Opt-in
+            # via env var; the default HF+PEFT path stays the production
+            # default until the kernel path's full convergence is verified.
+            if os.environ.get("MEGAKERNEL_USE_KERNEL_BWD") == "1":
+                return self._forward_backward_kernel_path(
+                    s=s, items=items, total_data_len=len(data),
+                )
+
             # If all examples share (prompt_len, target_len), pack into one
             # batch and do a single forward — collapses ~B× the kernel
             # launches and lets HF's batched fla path handle DN.
@@ -388,6 +420,95 @@ class LoraMegakernelTrainer:
                     "batch_size:mean": float(len(data)),
                 },
             }
+
+    # ---------- Slice B.3b kernel-driven backward path ----------
+    def _forward_backward_kernel_path(
+        self, *, s: "_Session", items: list, total_data_len: int,
+    ) -> dict[str, Any]:
+        """forward_backward via kernel_loss_autograd + run_layer_walking_bwd.
+
+        Per item:
+          1) pack PEFT LoRA → 26 flat tensors
+          2) run kernel forward → (loss, grad_h_pre_norm, saves)
+          3) run layer-walking bwd → 26 flat fp32 grad tensors
+          4) scatter into PEFT params' .grad (accumulating across items)
+
+        After the loop, optim_step() (the HF+PEFT one) consumes the
+        scattered grads. No code change to optim_step.
+        """
+        # Lazy imports to avoid pulling in fla / extensions when the kernel
+        # path is disabled. The trainer is normally imported at startup
+        # before all the C++ extensions exist.
+        from lora_pack import pack_peft_to_flat, scatter_flat_grads_to_peft
+        from lora_megakernel_step import (
+            kernel_loss_autograd, load_base_model,
+        )
+        from lora_layer_bwd_skel import run_layer_walking_bwd
+
+        # Lazy-load + cache the base-model handle on first kernel-path call.
+        if not hasattr(self, "_kernel_base_handle"):
+            self._kernel_base_handle = load_base_model(self.BASE_MODEL,
+                                                       verbose=False)
+        handle = self._kernel_base_handle
+
+        lora_flat = pack_peft_to_flat(s.hf_model, s.lora_rank)
+
+        per_losses: list[float] = []
+        outputs: list[dict] = []
+        for prompt, targets in items:
+            out = kernel_loss_autograd(
+                handle=handle,
+                prompt_tokens=prompt,
+                target_tokens=targets,
+                lora_flat=lora_flat,
+                lora_rank=s.lora_rank,
+                lora_scaling=s.lora_scaling,
+            )
+            loss = out["loss"]
+            grad_h_pre_norm = out["grad_h_pre_norm"]
+            saves = out["saves"]
+
+            # Scale grad_h_pre_norm by 1/N so the accumulated gradient
+            # corresponds to mean-loss across items (matches HF+PEFT
+            # path's `(total_loss/N).backward()` convention).
+            scale = 1.0 / max(len(items), 1)
+            grad_h_pre_norm = grad_h_pre_norm * scale
+
+            flat_grads = run_layer_walking_bwd(
+                grad_h_pre_norm=grad_h_pre_norm,
+                saves=saves,
+                lora_flat=lora_flat,
+                final_norm_weight=handle.final_norm_weight,
+                hf_model=s.hf_model,
+                lora_rank=s.lora_rank,
+                lora_scaling=s.lora_scaling,
+            )
+
+            # Scatter into PEFT params' .grad. Accumulate across items.
+            scatter_flat_grads_to_peft(s.hf_model, flat_grads,
+                                        accumulate=True)
+
+            lv = float(loss.item())
+            per_losses.append(lv)
+            # Per-item logp output uses the pre-final-norm path; we don't
+            # have per-position logp natively from kernel_loss_autograd
+            # (it returns the scalar loss only by default). Pass empty
+            # logprobs back — rl/backend's logprobs metric is informational.
+            outputs.append({
+                "logprobs": {"data": [], "dtype": "float32", "shape": [0]},
+                "loss":     {"data": [lv], "dtype": "float32", "shape": [1]},
+            })
+
+        mean_loss = float(sum(per_losses) / max(len(per_losses), 1))
+        s.last_loss = mean_loss
+        return {
+            "loss_fn_output_type": "TensorData",
+            "loss_fn_outputs": outputs,
+            "metrics": {
+                "loss:mean": mean_loss,
+                "batch_size:mean": float(total_data_len),
+            },
+        }
 
     def optim_step(self, *, model_id: str, adam_params: dict[str, float]):
         with self._lock_for_model(model_id):

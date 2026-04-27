@@ -20,24 +20,31 @@ which the kernel treats as a no-op for that projection.
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
-
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
 
 from typing import Any
 
 import torch
 
-from model import (
-    LAYER_TYPE,
-    HIDDEN_SIZE as HIDDEN,
-    INTERMEDIATE_SIZE as INTER,
-    FA_QPROJ_SIZE,
-    FA_KV_SIZE,
-    FA_Q_SIZE,
-    DN_CONV_CHANNELS as DN_CONV_CH,
-    DN_V_SIZE,
-)
+# Load constants from the OUTER model.py via importlib to avoid the
+# prefill_megakernel/model.py sibling shadowing it on sys.path. The
+# outer model uses HIDDEN_SIZE / INTERMEDIATE_SIZE / DN_CONV_CHANNELS
+# names; the prefill_megakernel sibling uses shorter HIDDEN / INTER /
+# DN_CONV_CH and would fail this from-import.
+_spec = importlib.util.spec_from_file_location(
+    "qwen_outer_model_for_pack",
+    "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+_outer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_outer)
+LAYER_TYPE     = _outer.LAYER_TYPE
+HIDDEN         = _outer.HIDDEN_SIZE
+INTER          = _outer.INTERMEDIATE_SIZE
+FA_QPROJ_SIZE  = _outer.FA_QPROJ_SIZE
+FA_KV_SIZE     = _outer.FA_KV_SIZE
+FA_Q_SIZE      = _outer.FA_Q_SIZE
+DN_CONV_CH     = _outer.DN_CONV_CHANNELS
+DN_V_SIZE      = _outer.DN_V_SIZE
 
 
 N_FA = sum(1 for t in LAYER_TYPE if t == 1)
@@ -222,4 +229,76 @@ def unpack_flat_to_peft(peft_model: Any, flat: list[torch.Tensor]) -> int:
     return n_written
 
 
-__all__ = ["pack_peft_to_flat", "unpack_flat_to_peft", "N_FA", "N_DN"]
+def scatter_flat_grads_to_peft(
+    peft_model: Any,
+    flat_grads: list[torch.Tensor],
+    *,
+    accumulate: bool = False,
+) -> int:
+    """Scatter the 26-tensor flat-format LoRA gradient buffer (output of
+    `run_layer_walking_bwd`) into PEFT's per-projection ``.grad``.
+
+    Layout transform mirrors :func:`unpack_flat_to_peft`: ours
+    (K_in, R) / (R, K_out) → PEFT (R, K_in) / (K_out, R) via transpose.
+    Dtypes are preserved on PEFT's params (typically bf16).
+
+    If ``accumulate=True``, the new grad is added to any existing
+    ``.grad``; otherwise it overwrites. Returns the number of (A, B)
+    pairs scattered.
+    """
+    if len(flat_grads) != 26:
+        raise ValueError(f"expected 26 flat grad tensors, got {len(flat_grads)}")
+    by_name: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for i, name in enumerate(_KERNEL_ORDER):
+        by_name[name] = (flat_grads[2 * i], flat_grads[2 * i + 1])
+
+    layers = _peft_underlying_layers(peft_model)
+    fa_idx = dn_idx = 0
+    n_written = 0
+    for li, lt in enumerate(LAYER_TYPE):
+        layer = layers[li]
+        proj_map = _FA_PROJ_MAP if lt == 1 else _DN_PROJ_MAP
+        kernel_idx = fa_idx if lt == 1 else dn_idx
+        for (parent_attr, proj_attr), kernel_name in proj_map.items():
+            parent = getattr(layer, parent_attr, None)
+            if parent is None:
+                continue
+            mod = _get_lora_module(parent, proj_attr)
+            if mod is None:
+                continue
+            ab = _read_AB(mod)
+            if ab is None:
+                continue
+            A_grads_ours, B_grads_ours = by_name[kernel_name]
+            A_peft, B_peft = ab
+
+            # Layer-slice of our flat grads.
+            gA_ours = A_grads_ours[kernel_idx]                  # [K_in, R]
+            gB_ours = B_grads_ours[kernel_idx]                  # [R, K_out]
+
+            # Transpose to PEFT layout, cast to PEFT param dtype.
+            gA_peft = gA_ours.t().contiguous().to(A_peft.dtype)  # [R, K_in]
+            gB_peft = gB_ours.t().contiguous().to(B_peft.dtype)  # [K_out, R]
+
+            if accumulate and A_peft.grad is not None:
+                A_peft.grad += gA_peft
+            else:
+                A_peft.grad = gA_peft.clone()
+            if accumulate and B_peft.grad is not None:
+                B_peft.grad += gB_peft
+            else:
+                B_peft.grad = gB_peft.clone()
+
+            n_written += 1
+        if lt == 1:
+            fa_idx += 1
+        else:
+            dn_idx += 1
+    return n_written
+
+
+__all__ = [
+    "pack_peft_to_flat", "unpack_flat_to_peft",
+    "scatter_flat_grads_to_peft",
+    "N_FA", "N_DN",
+]
