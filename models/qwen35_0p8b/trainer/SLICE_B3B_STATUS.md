@@ -6,6 +6,30 @@ roadmap). End goal: replace HF+PEFT autograd in
 walk for ~3× faster training step (114 ms → ~30-50 ms, projected),
 which pulls combined RL step toward ~18× over HF+fla.
 
+## ✅ Correctness-complete (commit 3745132, 2026-04-27)
+
+End-to-end kernel-driven training step converges:
+
+```
+MEGAKERNEL_USE_KERNEL_BWD=1 test_kernel_bwd_e2e.py:
+    step 1  loss=1.1860
+    step 2  loss=0.3403
+    step 3  loss=0.0700
+    step 4  loss=0.0087
+    step 5  loss=0.0014
+[3] loss decreased 1.1860 → 0.0014 via kernel-driven bwd ✓
+[4] sample after training: ', in a world where the sun was always shining brightly...'
+```
+
+vs. HF+PEFT autograd reference (`test_rl_trainer_e2e.py`):
+`1.1835 → 0.0016 in 5 steps`.
+
+Same convergence shape, same final loss tier. The kernel path
+correctly threads gradients through 24 layers in reverse and
+populates LoRA params' .grad for the standard torch.optim.AdamW
+to consume. Production code path stays HF+PEFT (default); the
+kernel path is opt-in via env var.
+
 ## Validated foundations (shipped)
 
 The path from loss to layer-output-residual gradient is solid:
