@@ -28,6 +28,18 @@ def time_fn(fn, runs=5, warm=2):
     return (time.perf_counter() - t0) * 1000.0 / runs
 
 
+def runs_warm_for_S(S: int) -> tuple[int, int]:
+    """Adaptive bench iteration counts so the long-S sweep finishes in a
+    reasonable wall time (per-call cost grows ~linearly in S for our
+    kernel and ~constant in S for fla). Long-S shapes still get >=2
+    timed runs which is enough to detect cold-cache outliers."""
+    if S <= 1024:
+        return 5, 2
+    if S <= 8192:
+        return 3, 1
+    return 2, 1
+
+
 def make_lora_model(base, rank):
     from peft import LoraConfig, get_peft_model
     cfg = LoraConfig(
@@ -53,8 +65,17 @@ def run(model, ids, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq-lens", type=int, nargs="+",
-                    default=[128, 256, 512, 1024, 2048])
+                    default=[128, 256, 512, 1024, 2048,
+                             4096, 8192, 16384, 32768])
     ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--modes", type=str, nargs="+",
+                    default=["train", "infer"],
+                    help="which modes to bench. Training above ~8K tends "
+                         "to OOM HF's autograd graph; pass `--modes infer` "
+                         "to bench inference-only at very long S.")
+    ap.add_argument("--max-train-s", type=int, default=8192,
+                    help="skip training mode for S > this (HF+fla autograd "
+                         "exhausts HBM at long context).")
     args = ap.parse_args()
 
     print("Loading Qwen3.5-0.8B (with fla available)...")
@@ -75,21 +96,26 @@ def main():
     print(f"  patched {n} GatedDeltaNet layers in 'ours'")
 
     print()
-    print(f"{'mode':<6} {'S':>6} | {'HF+fla ms':>10} {'ours ms':>10} {'ratio':>8}")
-    print("-" * 48)
+    print(f"{'mode':<6} {'S':>6} | {'HF+fla ms':>11} {'ours ms':>11} {'ratio':>8} {'tok/s ours':>12}")
+    print("-" * 64)
     for S in args.seq_lens:
         ids = torch.randint(0, tok.vocab_size, (1, S), device="cuda", dtype=torch.long)
-        for mode in ("train", "infer"):
+        runs, warm = runs_warm_for_S(S)
+        for mode in args.modes:
+            if mode == "train" and S > args.max_train_s:
+                print(f"{mode:<6} {S:>6} | (skipped — > max_train_s={args.max_train_s})")
+                continue
             try:
-                ms_b = time_fn(lambda: run(m_base, ids, mode))
-                ms_o = time_fn(lambda: run(m_ours, ids, mode))
+                ms_b = time_fn(lambda: run(m_base, ids, mode), runs=runs, warm=warm)
+                ms_o = time_fn(lambda: run(m_ours, ids, mode), runs=runs, warm=warm)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 print(f"{mode:<6} {S:>6} | error: {str(e).splitlines()[0][:50]}")
                 torch.cuda.empty_cache()
                 continue
             ratio = ms_b / ms_o
-            tag = "ours faster" if ratio > 1.0 else "fla faster"
-            print(f"{mode:<6} {S:>6} | {ms_b:>10.2f} {ms_o:>10.2f} {ratio:>7.2f}x  ({tag})")
+            tag = "ours" if ratio > 1.0 else "fla "
+            tok_per_sec = S / (ms_o / 1000.0)
+            print(f"{mode:<6} {S:>6} | {ms_b:>11.2f} {ms_o:>11.2f} {ratio:>7.2f}x {tok_per_sec:>11.0f} ({tag})")
             torch.cuda.empty_cache()
 
 

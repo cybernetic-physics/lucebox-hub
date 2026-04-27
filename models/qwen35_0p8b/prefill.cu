@@ -1024,6 +1024,10 @@ static void prefill_bf16_body(
     // DISTINCT from proj_buf so blocks in pf_dn_prep don't race on reads
     // of the raw qkv values at (t-3..t-1) positions — see pf_dn_prep docs.
     __nv_bfloat16 *dn_qkv_prepped_scratch,
+    // FA KV cache row count (i.e. how many positions the cache can hold).
+    // Determines the per-head stride into fa_k_cache/fa_v_cache. The
+    // caller derives this from fa_k_cache.size(2) (KV row dim).
+    int max_seq,
     cudaStream_t stream)
 {
     int bk = (S*HIDDEN+255)/256;
@@ -1037,7 +1041,7 @@ static void prefill_bf16_body(
             lora_layer_ptr_b((B_BASE), (LAYER_IDX), (K_OUT), lora_rank),           \
             (Y), lora_h_ws, S, (K_OUT), (K_IN), lora_rank, lora_scaling)
 
-    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    int fa_stride = FA_KV_HEADS * max_seq * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
     int fa_idx = 0, dn_idx = 0;
 
@@ -1180,7 +1184,7 @@ static void prefill_bf16_body(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq);
 
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
@@ -1227,6 +1231,8 @@ static void prefill_bf16_body(
 //       runs, so after the first one we pay ~no per-call overhead. =====
 struct PrefillGraphKey {
     int seq_len;
+    int max_seq;       // KV cache row count — different max_seqs get
+                       // distinct cached graphs (different per-head strides).
     const int *token_ids;
     int *output_token;
     const void *embed_weight;
@@ -1296,6 +1302,9 @@ extern "C" void launch_prefill_bf16(
     __nv_bfloat16 *lora_h_ws,
     // Saved activations for training backward (optional — all-null = off)
     SavedActivationsPF saved,
+    // FA KV cache row count — controls per-head stride into fa_k/v_cache.
+    // Caller derives this from fa_k_cache.size(2) (the KV row dim).
+    int max_seq,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -1333,6 +1342,7 @@ extern "C" void launch_prefill_bf16(
 
     PrefillGraphKey key{};
     key.seq_len = seq_len;
+    key.max_seq = max_seq;
     key.token_ids = token_ids;
     key.output_token = output_token;
     key.embed_weight = embed_weight;
@@ -1412,7 +1422,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, max_seq, stream);
         if (hit) hit->eager_runs++;
         return;
     }
@@ -1435,7 +1445,7 @@ extern "C" void launch_prefill_bf16(
             proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
             beta_buf, alpha_buf,
             final_normed, hidden_bf16_out,
-            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);  // to body
+            lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, max_seq, stream);
         return;
     }
 
@@ -1465,7 +1475,7 @@ extern "C" void launch_prefill_bf16(
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, capture_stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, max_seq, capture_stream);
     {
         cudaGraph_t graph = nullptr;
         err = cudaStreamEndCapture(capture_stream, &graph);
@@ -1513,7 +1523,7 @@ fallback_eager:
         proj_buf, proj_buf2, attn_buf, mlp_buf, dn_out_buf,
         beta_buf, alpha_buf,
         final_normed, hidden_bf16_out,
-        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, stream);
+        lm_bmv, lm_bmi, lora, lora_rank, lora_scaling, lora_h_ws, saved, dn_qkv_prepped, max_seq, stream);
     if (hit) {
         hit->eager_runs++;  // stay in warmup until capture finally works
     }

@@ -215,7 +215,16 @@ extern "C" void launch_prefill_bf16(
     void *lm_bmv, void *lm_bmi,
     LoraPFSet lora, int lora_rank, float lora_scaling, void *lora_h_ws,
     SavedActivationsPF saved,
+    int max_seq,
     cudaStream_t stream);
+
+// Helper to derive the FA KV cache row count from its tensor shape.
+// fa_k_cache shape is [n_fa, FA_NUM_KV_HEADS, MAX_SEQ_LEN, FA_HEAD_DIM].
+static inline int fa_max_seq_from_cache(const torch::Tensor &fa_k_cache) {
+    TORCH_CHECK(fa_k_cache.dim() == 4,
+                "fa_k_cache must be 4-D [n_fa, kv_heads, max_seq, head_dim]");
+    return (int)fa_k_cache.size(2);
+}
 
 extern "C" void launch_prefill_bf16_mega(
     const int *token_ids, int seq_len, int *output_token,
@@ -259,6 +268,7 @@ void prefill_bf16(
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
         lora, 0, 0.0f, nullptr,
         SavedActivationsPF{},
+        fa_max_seq_from_cache(fa_k_cache),
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -330,6 +340,7 @@ void prefill_bf16_with_lora(
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
         lora, (int)lora_rank, (float)lora_scaling, lora_h_ws.data_ptr(),
         SavedActivationsPF{},
+        fa_max_seq_from_cache(fa_k_cache),
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -418,6 +429,7 @@ void prefill_bf16_train_step(
         lm_bmv.data_ptr(), lm_bmi.data_ptr(),
         lora, (int)lora_rank, (float)lora_scaling, lora_h_ws.data_ptr(),
         saved,
+        fa_max_seq_from_cache(fa_k_cache),
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
