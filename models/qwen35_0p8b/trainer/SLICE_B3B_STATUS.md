@@ -6,9 +6,7 @@ roadmap). End goal: replace HF+PEFT autograd in
 walk for ~3× faster training step (114 ms → ~30-50 ms, projected),
 which pulls combined RL step toward ~18× over HF+fla.
 
-## Wall-time bench (`bench_kernel_bwd.py`)
-
-After hand-rolled DN bwd + npa-reuse shipped (2026-04-27):
+## Wall-time bench (`bench_kernel_bwd.py`, hybrid routing 2026-04-28)
 
 ```
 path                                   ms/step (3-run avg)
@@ -16,8 +14,34 @@ path                                   ms/step (3-run avg)
 HF+PEFT autograd (default)              ~540 ms
 Kernel-driven Slice B.3b                ~485 ms
 -----------------------------------------------------------
-Kernel path 1.08× – 1.15× FASTER (run-to-run variance ~5%).
+Kernel path 1.08× – 1.15× FASTER on heterogeneous shapes.
 ```
+
+### Cross-shape sweep (4 items per step, hybrid routing active)
+
+```
+                     HOMOGENEOUS (all 4 items same P, T)
+S=12   HF=127.6  Kernel=126.9  speedup=1.005x   ✓
+S=48   HF=127.9  Kernel=127.7  speedup=1.002x   ✓
+S=192  HF=133.8  Kernel=128.1  speedup=1.044x   ✓
+S=384  HF=128.8  Kernel=129.2  speedup=0.997x   ≈ (within noise)
+S=640  HF=149.5  Kernel=130.3  speedup=1.147x   ✓
+
+                     HETEROGENEOUS (mixed P, T)
+mixed (8,4)/(32,16)/(16,8)/(24,12):
+  HF=493.8  Kernel=472.0  speedup=1.046x        ✓
+```
+
+The kernel path defers to HF+PEFT's `_batched_logprobs` when items
+share shapes (hybrid routing in `forward_backward`). PEFT packs all
+items into a single B=N forward there; our kernel processes one item
+at a time today, so HF wins decisively at homogeneous + small-S. Hand
+HF the batched-shapes case; we win the heterogeneous case where
+HF can't batch either.
+
+To beat HF on homogeneous shapes too, the kernel needs batched-input
+support (process [B, S] in one call instead of B sequential single-
+sequence calls). Multi-day kernel refactor — separate workstream.
 
 Progression across this session:
 
