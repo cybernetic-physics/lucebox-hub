@@ -367,10 +367,24 @@ class LoraMegakernelTrainer:
             # custom backward, bypassing HF+PEFT autograd entirely. Opt-in
             # via env var; the default HF+PEFT path stays the production
             # default until the kernel path's full convergence is verified.
+            #
+            # Hybrid routing: HOMOGENEOUS shapes (all items share P,T) are
+            # routed to the HF+PEFT batched path because PEFT's
+            # `_batched_logprobs` packs all items into a single B=N forward
+            # while our kernel processes one item at a time (the kernel
+            # itself is single-sequence today). Hand HF the batched case;
+            # we win on the heterogeneous case where HF can't batch either.
             if os.environ.get("MEGAKERNEL_USE_KERNEL_BWD") == "1":
-                return self._forward_backward_kernel_path(
-                    s=s, items=items, total_data_len=len(data),
-                )
+                p0 = items[0][0].numel()
+                t0 = items[0][1].numel()
+                shapes_uniform = (len(items) > 1 and
+                                   all(p.numel() == p0 and t.numel() == t0
+                                       for p, t in items))
+                if not shapes_uniform:
+                    return self._forward_backward_kernel_path(
+                        s=s, items=items, total_data_len=len(data),
+                    )
+                # else: fall through to HF+PEFT batched path below.
 
             # If all examples share (prompt_len, target_len), pack into one
             # batch and do a single forward — collapses ~B× the kernel
