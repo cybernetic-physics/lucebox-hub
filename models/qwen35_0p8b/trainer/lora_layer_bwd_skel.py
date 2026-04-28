@@ -767,6 +767,10 @@ def per_layer_bwd_dn(
     h_post_attn: torch.Tensor,            # [S, HIDDEN] bf16
     # HF layer module — used to read the DN attention base weights.
     hf_layer,
+    # Optional: pre-computed DN attention saves dict (from
+    # `lora_megakernel_step.precompute_dn_saves`). When provided, the
+    # bwd skips `dn_attn_forward` entirely and uses these saves directly.
+    dn_saves: dict | None = None,
     # Frozen MLP base weights:
     post_attn_norm_w: torch.Tensor,       # [HIDDEN]
     gate_W: torch.Tensor, up_W: torch.Tensor, down_W: torch.Tensor,
@@ -808,28 +812,32 @@ def per_layer_bwd_dn(
 
     # DN attention block: hand-rolled forward + manual fla-bwd.
     # The forward includes input_layernorm; bwd returns dh_in directly.
-    input_norm = hf_layer.input_layernorm
-    dn = hf_layer.linear_attn
-    rms_eps_in = getattr(input_norm, "eps",
-                          getattr(input_norm, "variance_epsilon", rms_eps))
-    rms_eps_dn = getattr(dn.norm, "eps",
-                          getattr(dn.norm, "variance_epsilon", rms_eps))
-    h_in_b = hidden_in.unsqueeze(0).contiguous()                       # [1, S, HIDDEN]
-    npa_b  = normalized_in.unsqueeze(0).contiguous()                   # [1, S, HIDDEN]
-    _attn_out, saves = dn_attn_forward(
-        h_in_b,
-        input_norm_w=input_norm.weight,
-        in_proj_qkv_W=dn.in_proj_qkv.weight,
-        in_proj_z_W=dn.in_proj_z.weight,
-        in_proj_b_W=dn.in_proj_b.weight,
-        in_proj_a_W=dn.in_proj_a.weight,
-        conv1d_W=dn.conv1d.weight,
-        A_log=dn.A_log, dt_bias=dn.dt_bias,
-        dn_norm_W=dn.norm.weight,
-        out_proj_W=dn.out_proj.weight,
-        rms_eps=rms_eps_in, layer_norm_eps=rms_eps_dn,
-        npa_precomputed=npa_b,
-    )
+    if dn_saves is not None:
+        # Forward already done at fwd-time via precompute_dn_saves.
+        saves = dn_saves
+    else:
+        input_norm = hf_layer.input_layernorm
+        dn = hf_layer.linear_attn
+        rms_eps_in = getattr(input_norm, "eps",
+                              getattr(input_norm, "variance_epsilon", rms_eps))
+        rms_eps_dn = getattr(dn.norm, "eps",
+                              getattr(dn.norm, "variance_epsilon", rms_eps))
+        h_in_b = hidden_in.unsqueeze(0).contiguous()                       # [1, S, HIDDEN]
+        npa_b  = normalized_in.unsqueeze(0).contiguous()                   # [1, S, HIDDEN]
+        _attn_out, saves = dn_attn_forward(
+            h_in_b,
+            input_norm_w=input_norm.weight,
+            in_proj_qkv_W=dn.in_proj_qkv.weight,
+            in_proj_z_W=dn.in_proj_z.weight,
+            in_proj_b_W=dn.in_proj_b.weight,
+            in_proj_a_W=dn.in_proj_a.weight,
+            conv1d_W=dn.conv1d.weight,
+            A_log=dn.A_log, dt_bias=dn.dt_bias,
+            dn_norm_W=dn.norm.weight,
+            out_proj_W=dn.out_proj.weight,
+            rms_eps=rms_eps_in, layer_norm_eps=rms_eps_dn,
+            npa_precomputed=npa_b,
+        )
     # Upstream is dh_post_attn (mlp + attention contribution to the
     # residual stream's outgoing gradient). dn_attn_backward returns
     # gradient on the residual-stream input via the input-norm path;
@@ -1041,6 +1049,8 @@ def run_layer_walking_bwd(
                 mlp_inter=mlp_inter_L,
                 h_post_attn=h_post_attn_L,
                 hf_layer=hf_layer,
+                dn_saves=saves.get("dn_attn_saves", [None]*NUM_LAYERS)[L]
+                          if "dn_attn_saves" in saves else None,
                 post_attn_norm_w=post_attn_norm_w,
                 gate_W=gate_W, up_W=up_W, down_W=down_W,
                 **slices,

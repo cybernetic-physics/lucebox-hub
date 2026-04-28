@@ -453,6 +453,52 @@ class MegakernelTrainStep(torch.autograd.Function):
         )
 
 
+def precompute_dn_saves(
+    hf_model,
+    saves: dict,
+) -> list[dict | None]:
+    """Run dn_attn_forward for each DN layer at forward time, storing the
+    saves dict the bwd path will consume. Indexed by ABSOLUTE layer index
+    (so FA layers get None entries; DN layers get a saves dict).
+
+    This eliminates the bwd-time dn_attn_forward recompute. The work
+    moves from bwd to fwd; net wall time is reduced because fwd-time
+    Python ops can be issued without contending with bwd-time critical
+    path, and the saves dict is reused as-is by dn_attn_backward.
+    """
+    from dn_attn_handrolled import dn_attn_forward
+    layers = hf_model.base_model.model.model.layers
+    out: list[dict | None] = [None] * NUM_LAYERS
+    for L in range(NUM_LAYERS):
+        if LAYER_TYPE[L] != 0:
+            continue
+        hf_layer = layers[L]
+        input_norm = hf_layer.input_layernorm
+        dn = hf_layer.linear_attn
+        rms_eps_in = getattr(input_norm, "eps",
+                              getattr(input_norm, "variance_epsilon", 1e-6))
+        rms_eps_dn = getattr(dn.norm, "eps",
+                              getattr(dn.norm, "variance_epsilon", 1e-6))
+        h_in_b = saves["hidden_in"][L].unsqueeze(0).contiguous()
+        npa_b  = saves["normalized_in"][L].unsqueeze(0).contiguous()
+        _, layer_saves = dn_attn_forward(
+            h_in_b,
+            input_norm_w=input_norm.weight,
+            in_proj_qkv_W=dn.in_proj_qkv.weight,
+            in_proj_z_W=dn.in_proj_z.weight,
+            in_proj_b_W=dn.in_proj_b.weight,
+            in_proj_a_W=dn.in_proj_a.weight,
+            conv1d_W=dn.conv1d.weight,
+            A_log=dn.A_log, dt_bias=dn.dt_bias,
+            dn_norm_W=dn.norm.weight,
+            out_proj_W=dn.out_proj.weight,
+            rms_eps=rms_eps_in, layer_norm_eps=rms_eps_dn,
+            npa_precomputed=npa_b,
+        )
+        out[L] = layer_saves
+    return out
+
+
 def kernel_loss_autograd(
     handle: BaseModelHandle,
     prompt_tokens: torch.Tensor,     # [P]
@@ -460,6 +506,8 @@ def kernel_loss_autograd(
     lora_flat: list[torch.Tensor],
     lora_rank: int,
     lora_scaling: float,
+    *,
+    hf_model=None,
 ) -> dict:
     """Run kernel forward, then backward to d(h_pre_norm) via torch autograd.
 
@@ -522,6 +570,12 @@ def kernel_loss_autograd(
     grad_h_pre_norm, = torch.autograd.grad(loss, h_pre_norm,
                                             retain_graph=False,
                                             create_graph=False)
+
+    # Pre-compute DN attention saves at forward time (eliminates the
+    # bwd-side dn_attn_forward recompute). Per-layer Python forward
+    # using fla directly. Saves are keyed by absolute layer index.
+    if hf_model is not None:
+        saves["dn_attn_saves"] = precompute_dn_saves(hf_model, saves)
     return {
         "loss": loss.detach(),
         "grad_h_pre_norm": grad_h_pre_norm,    # [S, HIDDEN] fp32

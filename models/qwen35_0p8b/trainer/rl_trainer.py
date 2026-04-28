@@ -463,6 +463,7 @@ class LoraMegakernelTrainer:
                 lora_flat=lora_flat,
                 lora_rank=s.lora_rank,
                 lora_scaling=s.lora_scaling,
+                hf_model=s.hf_model,
             )
             loss = out["loss"]
             grad_h_pre_norm = out["grad_h_pre_norm"]
