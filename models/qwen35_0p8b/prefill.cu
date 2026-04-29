@@ -255,7 +255,7 @@ __global__ void pf_dn_conv_buf_update(
 //
 // Expected reduction vs the in-kernel-prep vsplit: removes ~50 % of
 // per-step compute AND both per-step __syncthreads.
-__global__ void __launch_bounds__(512, 1)
+__global__ void __launch_bounds__(1024, 1)
 pf_deltanet_recurrence_vsplit_prepped(
     const __nv_bfloat16 *qkv_proj_prepped,   // from pf_dn_prep: post-silu, post-norm
     const float *beta_buf_prepped,            // sigmoid(raw beta)
@@ -1196,14 +1196,18 @@ static void prefill_bf16_body(
                 if (sm_count_for_dn <= 0) sm_count_for_dn = 82;
             }
             int num_v_splits = (sm_count_for_dn >= 128) ? 8 : 4;
-            int dn_block_size = 512;
+            // BLK=1024 (max for SM86) wins by 6-7.5% over 512 with V_SPLITS=4
+            // because each warp owns CPW_V=1 j-slot — perfect coverage of the
+            // V slice with the most warps for latency hiding. Requires the
+            // kernel's __launch_bounds__ to be raised from 512 to 1024.
+            int dn_block_size = 1024;
             if (const char *env = std::getenv("MEGAKERNEL_DN_V_SPLITS")) {
                 int v = std::atoi(env);
                 if (v == 1 || v == 2 || v == 4 || v == 8) num_v_splits = v;
             }
             if (const char *env = std::getenv("MEGAKERNEL_DN_BLOCK_SIZE")) {
                 int b = std::atoi(env);
-                if (b == 128 || b == 256 || b == 512) dn_block_size = b;
+                if (b == 128 || b == 256 || b == 512 || b == 1024) dn_block_size = b;
             }
             int v_slice = DN_V_SIZE / num_v_splits;
             int nwarps_want = dn_block_size / 32;
