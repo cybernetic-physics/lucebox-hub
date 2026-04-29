@@ -1182,7 +1182,20 @@ static void prefill_bf16_body(
             // V-split recurrence: each block owns a V-slice of one head's
             // recurrence state and runs the full S sequential steps on it.
             // Reads pre-processed q/k/v/beta/decay from dn_qkv_prepped.
-            int num_v_splits = 8;
+            // Default V_SPLITS picks block-count vs SM-count carefully:
+            // 3090 (82 SMs) hates oversubscription, B200 (148) wants full.
+            //
+            //   DN_HEADS * V_SPLITS = block count this layer.
+            //   16 * 4 = 64  fits 3090 with headroom (82 SMs)
+            //   16 * 8 = 128 fits B200 (148 SMs); on 3090 forces a
+            //                second wave that costs 17-20% wall.
+            static int sm_count_for_dn = 0;
+            if (sm_count_for_dn == 0) {
+                int dev = 0; cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(&sm_count_for_dn, cudaDevAttrMultiProcessorCount, dev);
+                if (sm_count_for_dn <= 0) sm_count_for_dn = 82;
+            }
+            int num_v_splits = (sm_count_for_dn >= 128) ? 8 : 4;
             int dn_block_size = 512;
             if (const char *env = std::getenv("MEGAKERNEL_DN_V_SPLITS")) {
                 int v = std::atoi(env);
