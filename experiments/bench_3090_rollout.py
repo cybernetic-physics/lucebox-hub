@@ -20,11 +20,22 @@ VARIANTS = {
     # name -> (qwen35 dir, decoder import path)
     "head": (
         "/home/freiza/lucebox-hub/models/qwen35_0p8b",
-        # uses our model.Decoder
         "head",
     ),
-    "fpb200": (
+    "fpb200~2": (
         "/home/freiza/lucebox-hub-fpb200/megakernel",
+        "fpb200",
+    ),
+    "fpb200~3": (
+        "/home/freiza/lucebox-hub-fpb200-3/megakernel",
+        "fpb200",
+    ),
+    "fpb200~4": (
+        "/home/freiza/lucebox-hub-fpb200-4/megakernel",
+        "fpb200",
+    ),
+    "fpb200~5": (
+        "/home/freiza/lucebox-hub-fpb200-5/megakernel",
         "fpb200",
     ),
 }
