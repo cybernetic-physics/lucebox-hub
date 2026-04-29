@@ -40,6 +40,7 @@ setup(
                 "kernel_gb10_nvfp4.cu",
                 "prefill.cu",
                 "prefill_megakernel.cu",
+                "dn_chunked_3090.cu",  # 3090-tuned chunked DN forward (V_SPLITS=4, C=32)
                 "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
             ],
             extra_compile_args={

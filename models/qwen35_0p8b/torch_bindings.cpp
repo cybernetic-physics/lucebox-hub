@@ -234,6 +234,50 @@ static inline int fa_max_seq_from_cache(const torch::Tensor &fa_k_cache) {
     return (int)fa_k_cache.size(2);
 }
 
+// 3090-tuned chunked DN forward (V_SPLITS=4, C=32). Used for inference S>=
+// some threshold; matches HF torch_chunk_gated_delta_rule output within
+// bf16 noise. See dn_chunked_3090.cu for the kernel itself.
+extern "C" void launch_dn_chunked_3090(
+    const void *q_base, const void *k_base, const void *v_base,
+    const float *beta_base, const float *g_base,
+    const float *state_in_base,
+    void *y_base, float *state_out_base,
+    int S, int H,
+    int qkd_pos_stride, int v_pos_stride, int bd_pos_stride, int y_pos_stride,
+    cudaStream_t stream);
+
+extern "C" void launch_pf_decay_to_g_inplace(float *buf, int N, cudaStream_t stream);
+
+void dn_chunked_3090(
+    torch::Tensor q,           // [S, H, Dk] or strided [S, *] bf16
+    torch::Tensor k,           // [S, H, Dk] or strided [S, *] bf16
+    torch::Tensor v,           // [S, H, Dv] or strided [S, *] bf16
+    torch::Tensor beta,        // [S, H] fp32 (sigmoid already applied)
+    torch::Tensor g,           // [S, H] fp32 = log(decay)
+    torch::Tensor state_in,    // [H, Dk, Dv] fp32
+    torch::Tensor y,           // [S, H, Dv] bf16 (output)
+    torch::Tensor state_out)   // [H, Dk, Dv] fp32 (output, may be empty)
+{
+    int64_t S = q.size(0);
+    int64_t H = (q.dim() == 3) ? q.size(1) : (q.size(1) / 128);
+    int64_t Dk = 128;
+    int64_t Dv = 128;
+    int qkd_stride = (int)(q.stride(0));      // tokens-to-tokens stride (in elements)
+    int v_stride   = (int)(v.stride(0));
+    int bd_stride  = (int)(beta.stride(0));
+    int y_stride   = (int)(y.stride(0));
+    float *state_out_ptr = state_out.numel() > 0 ? state_out.data_ptr<float>() : nullptr;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    launch_dn_chunked_3090(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(),
+        beta.data_ptr<float>(), g.data_ptr<float>(),
+        state_in.data_ptr<float>(),
+        y.data_ptr(), state_out_ptr,
+        (int)S, (int)H,
+        qkd_stride, v_stride, bd_stride, y_stride,
+        stream);
+}
+
 extern "C" void launch_prefill_bf16_mega(
     const int *token_ids, int seq_len, int *output_token,
     const void *embed_weight, const LayerWeights *layers,
@@ -583,6 +627,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def("quantize_nvfp4_out(Tensor packed_out, Tensor scales_out, Tensor weight, int group_size) -> ()");
     ops.impl("quantize_nvfp4_out", torch::kCUDA, &quantize_nvfp4_out);
+
+    ops.def("dn_chunked_3090(Tensor q, Tensor k, Tensor v, "
+            "Tensor beta, Tensor g, Tensor state_in, "
+            "Tensor(a!) y, Tensor(b!) state_out) -> ()");
+    ops.impl("dn_chunked_3090", torch::kCUDA, &dn_chunked_3090);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
