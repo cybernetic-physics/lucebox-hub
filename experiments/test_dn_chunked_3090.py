@@ -70,10 +70,14 @@ def run_one(S: int, H: int = 16, Dk: int = 128, Dv: int = 128, seed: int = 0):
     y_ref_2 = y_ref.squeeze(0)
     sN_ref_2 = sN_ref.squeeze(0)
 
+    # Our kernel writes state in [H, Dv, Dk] layout (matches the
+    # decode/recurrence kernels in inference). fla returns [H, Dk, Dv].
+    # Transpose ours before comparing.
     y_cos = cos(y_ours, y_ref_2)
-    sN_cos = cos(sN_ours, sN_ref_2)
+    sN_ours_T = sN_ours.transpose(-2, -1).contiguous()
+    sN_cos = cos(sN_ours_T, sN_ref_2)
     y_max = float((y_ours.float() - y_ref_2).abs().max())
-    sN_max = float((sN_ours - sN_ref_2).abs().max())
+    sN_max = float((sN_ours_T - sN_ref_2).abs().max())
     # Per-chunk slice cos: first 32 tokens, first 32 v columns of head 0.
     y_chunk0_slice = y_ours[:32, 0, :32]
     y_ref_chunk0_slice = y_ref_2[:32, 0, :32]

@@ -236,11 +236,15 @@ dn_chunked_3090_fwd_kernel(
     __nv_bfloat16 *buf_attn_bf = buf_vbeta + C * Dvb;                   // [C, C]
 
     // ----- Load initial state slice -----
-    // state_in_h is [Dk, Dv]; we own columns [v_off, v_off+Dvb).
+    // External layout (matches the decode/recurrence kernels): [Dv, Dk]
+    // i.e. state_in_h[v * Dk + k]. Internally we keep [Dk, Dv_block]
+    // because that's what the matmuls in this kernel are wired for.
+    // Transpose at load and store.
     for (int i = tid; i < Dk * Dvb; i += nt) {
-        int row = i / Dvb;
-        int col = i - row * Dvb;
-        state[row * Dvb + col] = state_in_h[row * Dv + v_off + col];
+        int row = i / Dvb;        // k index (0..Dk)
+        int col = i - row * Dvb;  // local v index (0..Dvb)
+        int v_global = v_off + col;
+        state[row * Dvb + col] = state_in_h[v_global * Dk + row];
     }
     __syncthreads();
 
@@ -468,12 +472,14 @@ dn_chunked_3090_fwd_kernel(
         __syncthreads();
     }
 
-    // Persist final state slice into state_out (caller owns layout).
+    // Persist final state slice into state_out, transposing to the
+    // external [Dv, Dk] layout that decode/recurrence read.
     if (state_out_h) {
         for (int i = tid; i < Dk * Dvb; i += nt) {
-            int row = i / Dvb;
-            int col = i - row * Dvb;
-            state_out_h[row * Dv + v_off + col] = state[i];
+            int row = i / Dvb;        // k index
+            int col = i - row * Dvb;  // local v index
+            int v_global = v_off + col;
+            state_out_h[v_global * Dk + row] = state[i];
         }
     }
 }

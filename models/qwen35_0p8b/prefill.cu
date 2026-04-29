@@ -1028,6 +1028,22 @@ struct SavedActivationsPF {
     float         *fa_lse_save;
 };
 
+// 3090-tuned chunked DN forward — defined in dn_chunked_3090.cu.
+extern "C" void launch_dn_chunked_3090(
+    const __nv_bfloat16 *q_base,
+    const __nv_bfloat16 *k_base,
+    const __nv_bfloat16 *v_base,
+    const float *beta_base,
+    const float *g_base,
+    const float *state_in_base,
+    __nv_bfloat16 *y_base,
+    float *state_out_base,
+    int S, int H,
+    int qkd_pos_stride, int v_pos_stride, int bd_pos_stride, int y_pos_stride,
+    cudaStream_t stream);
+
+extern "C" void launch_pf_decay_to_g_inplace(float *buf, int N, cudaStream_t stream);
+
 // cuDNN FA-2 forward via aten — defined in fa_attn_aten.cpp. The
 // implementation lives in a separate .cpp because aten/torch headers
 // don't compile cleanly under nvcc.
@@ -1212,10 +1228,44 @@ static void prefill_bf16_body(
             int v_slice = DN_V_SIZE / num_v_splits;
             int nwarps_want = dn_block_size / 32;
             while (v_slice < nwarps_want) { dn_block_size >>= 1; nwarps_want = dn_block_size / 32; }
-            pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
-                dn_qkv_prepped_scratch, beta_buf, alpha_buf,
-                dn_states + dn_idx*dn_stride,
-                dn_out_buf, S, num_v_splits);
+
+            // 3090-only chunked DN forward (V_SPLITS=4, C=32, ~76 KB smem).
+            // Bit-correct vs fla; 1.15-3.3x faster than the V-split recurrence
+            // on RTX 3090 across S=128..32K. Default ON for SM<90; off for
+            // B200/Hopper which still uses the V-split recurrence path until
+            // a B200-tuned chunked variant is built. Override via env.
+            bool use_chunked_dn = (sm_count_for_dn < 128);
+            if (const char *env = std::getenv("MEGAKERNEL_DN_USE_CHUNKED")) {
+                use_chunked_dn = std::atoi(env) != 0;
+            }
+            if (use_chunked_dn && sm_count_for_dn < 128) {
+                // Convert alpha_buf (decay = exp(g)) to g in place; the chunked
+                // kernel takes log-decay.
+                launch_pf_decay_to_g_inplace(alpha_buf, S * DN_HEADS, stream);
+                // Per-head pointers into the packed dn_qkv_prepped row [S, DN_CONV_CH]:
+                //   q at offset 0, k at offset DN_QK_SIZE, v at offset 2*DN_QK_SIZE.
+                const __nv_bfloat16 *qkv = (const __nv_bfloat16 *)dn_qkv_prepped_scratch;
+                launch_dn_chunked_3090(
+                    qkv,                                  // q_base (head 0 q starts here)
+                    qkv + DN_QK_SIZE,                     // k_base
+                    qkv + 2 * DN_QK_SIZE,                 // v_base
+                    beta_buf,
+                    alpha_buf,                            // now holds g (log-decay)
+                    dn_states + dn_idx*dn_stride,         // state_in
+                    (__nv_bfloat16 *)dn_out_buf,          // y_base
+                    dn_states + dn_idx*dn_stride,         // state_out (in-place)
+                    S, DN_HEADS,
+                    DN_CONV_CH,                           // qkd_pos_stride (row width)
+                    DN_CONV_CH,                           // v_pos_stride (same row)
+                    DN_HEADS,                             // bd_pos_stride
+                    DN_V_SIZE,                            // y_pos_stride [S, H*Dv]
+                    stream);
+            } else {
+                pf_deltanet_recurrence_vsplit_prepped<<<DN_HEADS * num_v_splits, dn_block_size, 0, stream>>>(
+                    dn_qkv_prepped_scratch, beta_buf, alpha_buf,
+                    dn_states + dn_idx*dn_stride,
+                    dn_out_buf, S, num_v_splits);
+            }
             // Gnorm + silu-mul with z, applied across full V per (t, head).
             pf_deltanet_gnorm<<<S * DN_HEADS, 128, 0, stream>>>(
                 dn_out_buf, proj_buf2, dn_norm, S);
