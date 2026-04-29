@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 import time
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 # fla shim must come before any HF import that triggers fla.
 import _fla_torch_compile_shim  # noqa: F401, E402

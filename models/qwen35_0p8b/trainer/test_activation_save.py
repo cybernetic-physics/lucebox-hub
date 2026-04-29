@@ -15,9 +15,9 @@ from __future__ import annotations
 import sys
 import torch
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/prefill_megakernel")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/prefill_megakernel")
 
 import qwen35_megakernel_bf16_C  # noqa: F401
 import train_megakernel_C         # noqa: F401

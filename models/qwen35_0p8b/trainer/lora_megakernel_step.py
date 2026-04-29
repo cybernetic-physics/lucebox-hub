@@ -69,14 +69,14 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b")
 
 import qwen35_megakernel_bf16_C  # noqa: F401
 
 # Outer model module (constants + helpers).
 _spec = importlib.util.spec_from_file_location(
     "qwen_outer_model",
-    "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+    "/home/freiza/lucebox-hub/models/qwen35_0p8b/model.py")
 _outer = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_outer)
 _load_weights = _outer.load_weights
 _pack_layer_weights = _outer._pack_layer_weights

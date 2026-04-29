@@ -10,7 +10,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 from dn_chunked_proto import chunked_fwd
 from dn_chunked_bwd_proto import chunked_fwd_with_state_chunks, chunked_bwd
 

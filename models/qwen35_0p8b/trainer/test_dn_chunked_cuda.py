@@ -9,7 +9,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 import train_megakernel_C  # noqa: F401
 from dn_chunked_proto import chunked_fwd as proto_fwd
 

@@ -24,7 +24,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 # fla import (with the existing torch.compile shim).
 import _fla_torch_compile_shim  # noqa: F401

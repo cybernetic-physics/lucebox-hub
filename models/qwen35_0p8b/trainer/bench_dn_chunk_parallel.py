@@ -13,7 +13,7 @@ import sys
 import time
 
 # Shim so fla can be imported without breaking transformers' fla detect.
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 import _fla_torch_compile_shim  # noqa: F401
 
 import torch  # noqa: E402

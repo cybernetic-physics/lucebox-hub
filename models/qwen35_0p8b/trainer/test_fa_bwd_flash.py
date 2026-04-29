@@ -17,7 +17,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 from fa_bwd_flash import fa_forward_flash, fa_backward_flash
 
 

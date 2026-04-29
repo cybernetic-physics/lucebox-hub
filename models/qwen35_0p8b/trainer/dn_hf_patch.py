@@ -40,7 +40,16 @@ except Exception:
 
 # At what S do we switch from our chunked fwd to fla for inference?
 # Bench data: ours wins up to S=512 (1.27x at S=512); fla wins at S=1024.
+# On SM86 (RTX 3090) the chunked kernel asks for ~217 KB shared memory and
+# the launch fails (per-block opt-in cap is ~99 KB). Disable on SM<90 until
+# the 3090-tuned variant lands.
 _OURS_INFER_MAX_S = 512
+try:
+    _CC = torch.cuda.get_device_capability()
+    if _CC[0] < 9:
+        _OURS_INFER_MAX_S = 0
+except Exception:
+    pass
 
 
 def _l2norm(x, dim=-1, eps=1e-6):

@@ -17,7 +17,7 @@ import time
 # importing the trainer. Just import normally; the trainer reads the
 # env var INSIDE forward_backward each call.
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 import torch  # noqa: E402
 

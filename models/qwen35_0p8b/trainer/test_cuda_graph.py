@@ -13,7 +13,7 @@ _iu.is_flash_linear_attention_available = lambda: False
 
 import torch
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 from dn_hf_patch import patch_hf_qwen3_deltanet
 
 

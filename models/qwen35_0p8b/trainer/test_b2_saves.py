@@ -23,8 +23,8 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 import torch  # noqa: E402
 
@@ -137,7 +137,7 @@ def main():
         import importlib.util as _u
         _spec = _u.spec_from_file_location(
             "qwen_outer_model",
-            "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+            "/home/freiza/lucebox-hub/models/qwen35_0p8b/model.py")
         _outer = _u.module_from_spec(_spec); _spec.loader.exec_module(_outer)
         LAYER_TYPE = _outer.LAYER_TYPE
 

@@ -16,7 +16,7 @@ import argparse
 import sys
 import time
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 import torch  # noqa: E402
 

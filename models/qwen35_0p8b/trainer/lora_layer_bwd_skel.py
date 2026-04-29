@@ -31,8 +31,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b/trainer")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 
 import importlib.util  # noqa: E402
 
@@ -43,7 +43,7 @@ import torch  # noqa: E402
 # extension). This file's helpers are pure-trainer-extension.
 _spec = importlib.util.spec_from_file_location(
     "qwen_outer_model_consts",
-    "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+    "/home/freiza/lucebox-hub/models/qwen35_0p8b/model.py")
 _outer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_outer)
 HIDDEN = _outer.HIDDEN_SIZE

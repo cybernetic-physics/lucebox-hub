@@ -418,6 +418,7 @@ __device__ void full_attention_layer(
     float *__restrict__ g_kv,                 // [FA_KV_SIZE*2] f32
     float *__restrict__ g_attn_out,           // [FA_Q_SIZE] f32
     float *__restrict__ g_mlp_inter,          // [INTER] f32
+    float *__restrict__ g_fa_partials,        // [num_blocks * FA_NUM_Q_HEADS * (FA_HEAD_DIM+2)]
     __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
     __nv_bfloat16 *__restrict__ shmem)
@@ -487,59 +488,129 @@ __device__ void full_attention_layer(
     }
     grid.sync();
 
-    // Phase 3: Attention decode (online softmax + sigmoid gate)
+    // Phase 3: Split-K attention decode (online softmax + sigmoid gate).
+    //
+    // Old design: one block per query head; the rest of the SMs sat idle
+    // during the FA scan. At long S that capped decode hard — only 8 of
+    // 148 SMs busy.
+    //
+    // New design: each block handles one (query head, K-split) pair.
+    //   block_id mod FA_NUM_Q_HEADS  -> my_qh
+    //   block_id div FA_NUM_Q_HEADS  -> my_split
+    // Active blocks fill the grid up to FA_NUM_Q_HEADS * num_splits; the
+    // tail of blocks (if any) idle this phase but are needed for other
+    // phases. Each active block computes a partial (max, sum_exp,
+    // out_acc) over its slice of K positions, writes to a global
+    // partials buffer, and grid-syncs. After the sync, blocks 0..7 each
+    // reduce all splits for their query head into the final output.
     {
         int cache_len = position + 1;
         float attn_scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
-        int hpb = (FA_NUM_Q_HEADS + num_blocks - 1) / num_blocks;
-        int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
-        __shared__ float s_max_score[NUM_WARPS];
-        __shared__ float s_sum_exp[NUM_WARPS];
         constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
+        constexpr int PARTIAL_STRIDE = FA_HEAD_DIM + 2;     // out + max + sum
 
-        for (int qh = hs; qh < he; qh++) {
-            int kvh = qh / FA_GQA_RATIO;
-            float *q_head = g_q + qh * FA_HEAD_DIM * 2;
-            float *out_head = g_attn_out + qh * FA_HEAD_DIM;
-            float max_score = -INFINITY, sum_exp = 0;
-            float out_acc[EPL], q_local[EPL];
-            for (int e = 0; e < EPL; e++) { out_acc[e] = 0; q_local[e] = q_head[lane_id*EPL+e]; }
+        int num_splits = num_blocks / FA_NUM_Q_HEADS;
+        if (num_splits < 1) num_splits = 1;
+        int my_qh    = block_id % FA_NUM_Q_HEADS;
+        int my_split = block_id / FA_NUM_Q_HEADS;
+        bool active = (block_id < FA_NUM_Q_HEADS * num_splits);
 
-            for (int pos = warp_id; pos < cache_len; pos += NUM_WARPS) {
+        // Per-block warp-combine scratch lives in shared memory so it's
+        // private to the block (no cross-block race).
+        __shared__ float s_max[NUM_WARPS];
+        __shared__ float s_sum[NUM_WARPS];
+        __shared__ float s_out[NUM_WARPS * FA_HEAD_DIM];
+
+        if (active) {
+            int positions_per_split = (cache_len + num_splits - 1) / num_splits;
+            int pos_start = my_split * positions_per_split;
+            int pos_end   = min(pos_start + positions_per_split, cache_len);
+            int kvh = my_qh / FA_GQA_RATIO;
+            const float *q_head = g_q + my_qh * FA_HEAD_DIM * 2;
+
+            float q_local[EPL];
+            for (int e = 0; e < EPL; e++) q_local[e] = q_head[lane_id*EPL+e];
+
+            float partial_max = -INFINITY, partial_sum = 0;
+            float partial_acc[EPL];
+            for (int e = 0; e < EPL; e++) partial_acc[e] = 0;
+
+            for (int pos = pos_start + warp_id; pos < pos_end; pos += NUM_WARPS) {
                 const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
                 const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
                 float score = 0;
                 for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
                 score = warp_reduce_sum(score) * attn_scale;
                 score = __shfl_sync(0xffffffff, score, 0);
-                float old_max = max_score; max_score = fmaxf(max_score, score);
-                float exp_diff = fast_exp(old_max - max_score);
-                sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
-                float wt = fast_exp(score - max_score);
+                float old_max = partial_max; partial_max = fmaxf(partial_max, score);
+                float exp_diff = fast_exp(old_max - partial_max);
+                partial_sum = partial_sum * exp_diff + fast_exp(score - partial_max);
+                float wt = fast_exp(score - partial_max);
                 for (int e = 0; e < EPL; e++)
-                    out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+                    partial_acc[e] = partial_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
             }
-            if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
-            for (int e = 0; e < EPL; e++) g_activations[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+            if (lane_id == 0) { s_max[warp_id] = partial_max; s_sum[warp_id] = partial_sum; }
+            for (int e = 0; e < EPL; e++) s_out[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = partial_acc[e];
             __syncthreads();
 
+            // Warp 0 combines warp-partials inside the block, then writes
+            // to the global per-(split, qh) partials slot.
             if (warp_id == 0) {
-                float gm = -INFINITY; for (int ww = 0; ww < NUM_WARPS; ww++) if (s_max_score[ww] > -INFINITY) gm = fmaxf(gm, s_max_score[ww]);
-                float ts = 0; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0;
+                float bm = -INFINITY;
+                for (int ww = 0; ww < NUM_WARPS; ww++) if (s_max[ww] > bm) bm = s_max[ww];
+                float bs = 0;
+                float bo[EPL]; for (int e = 0; e < EPL; e++) bo[e] = 0;
                 for (int ww = 0; ww < NUM_WARPS; ww++) {
-                    if (s_max_score[ww] > -INFINITY) {
-                        float s = fast_exp(s_max_score[ww]-gm); ts += s_sum_exp[ww]*s;
-                        for (int e = 0; e < EPL; e++) fo[e] += g_activations[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
+                    if (s_max[ww] > -INFINITY) {
+                        float scale = fast_exp(s_max[ww] - bm);
+                        bs += s_sum[ww] * scale;
+                        for (int e = 0; e < EPL; e++) bo[e] += s_out[ww*FA_HEAD_DIM + lane_id*EPL+e] * scale;
                     }
                 }
-                float *gate_ptr = q_head + FA_HEAD_DIM;
-                float rcp = 1.0f / ts;
-                for (int e = 0; e < EPL; e++) {
-                    int idx = lane_id*EPL+e;
-                    out_head[idx] = fo[e]*rcp * fast_sigmoid(gate_ptr[idx]);
+                float *p = g_fa_partials + (my_split * FA_NUM_Q_HEADS + my_qh) * PARTIAL_STRIDE;
+                for (int e = 0; e < EPL; e++) p[lane_id*EPL+e] = bo[e];
+                if (lane_id == 0) { p[FA_HEAD_DIM] = bm; p[FA_HEAD_DIM+1] = bs; }
+            }
+        }
+    }
+    grid.sync();
+
+    // Reduce phase: blocks 0..FA_NUM_Q_HEADS-1 each combine all splits
+    // for their query head into the final attention output.
+    {
+        constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
+        constexpr int PARTIAL_STRIDE = FA_HEAD_DIM + 2;
+        int num_splits = num_blocks / FA_NUM_Q_HEADS;
+        if (num_splits < 1) num_splits = 1;
+
+        if (block_id < FA_NUM_Q_HEADS && warp_id == 0) {
+            int qh = block_id;
+            float *q_head = g_q + qh * FA_HEAD_DIM * 2;
+            float *gate_ptr = q_head + FA_HEAD_DIM;
+            float *out_head = g_attn_out + qh * FA_HEAD_DIM;
+
+            float global_max = -INFINITY;
+            for (int s = 0; s < num_splits; s++) {
+                float bm = g_fa_partials[(s * FA_NUM_Q_HEADS + qh) * PARTIAL_STRIDE + FA_HEAD_DIM];
+                if (bm > global_max) global_max = bm;
+            }
+            float total_sum = 0;
+            float total_out[EPL];
+            for (int e = 0; e < EPL; e++) total_out[e] = 0;
+            for (int s = 0; s < num_splits; s++) {
+                float *p = g_fa_partials + (s * FA_NUM_Q_HEADS + qh) * PARTIAL_STRIDE;
+                float bm = p[FA_HEAD_DIM];
+                if (bm > -INFINITY) {
+                    float scale = fast_exp(bm - global_max);
+                    total_sum += p[FA_HEAD_DIM+1] * scale;
+                    for (int e = 0; e < EPL; e++) total_out[e] += p[lane_id*EPL+e] * scale;
                 }
             }
-            __syncthreads();
+            float rcp = 1.0f / total_sum;
+            for (int e = 0; e < EPL; e++) {
+                int idx = lane_id*EPL+e;
+                out_head[idx] = total_out[e] * rcp * fast_sigmoid(gate_ptr[idx]);
+            }
         }
     }
     grid.sync();
@@ -838,6 +909,7 @@ decode_kernel(
     float *__restrict__ g_beta_scratch,
     float *__restrict__ g_alpha_scratch,
     float *__restrict__ g_normalized,
+    float *__restrict__ g_fa_partials,
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_generation,
     int input_token_id, int position, int max_seq_len)
@@ -878,7 +950,7 @@ decode_kernel(
                 fa_k_cache + fa_layer_idx * fa_kv_stride,
                 fa_v_cache + fa_layer_idx * fa_kv_stride,
                 g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
-                g_attn_out, g_mlp_inter, hidden_buffer,
+                g_attn_out, g_mlp_inter, g_fa_partials, hidden_buffer,
                 position, max_seq_len, shmem_bf16);
             fa_layer_idx++;
         }
@@ -960,6 +1032,19 @@ extern "C" void launch_decode(
         }
     }
 
+    // Lazy-allocate the FA-decode split-K partials buffer. Sized to
+    // accommodate up to cached_decode_blocks splits, each holding
+    // FA_NUM_Q_HEADS * (FA_HEAD_DIM + 2) floats. ~1.2 MB on B200.
+    static float *g_fa_partials = nullptr;
+    static int g_fa_partials_blocks = 0;
+    if (g_fa_partials_blocks < cached_decode_blocks) {
+        if (g_fa_partials) cudaFree(g_fa_partials);
+        size_t bytes = (size_t)cached_decode_blocks * FA_NUM_Q_HEADS *
+                       (FA_HEAD_DIM + 2) * sizeof(float);
+        cudaMalloc(&g_fa_partials, bytes);
+        g_fa_partials_blocks = cached_decode_blocks;
+    }
+
     const void *embed_w_arg = embed_weight;
     const void *final_norm_w_arg = final_norm_weight;
     const void *lm_head_w_arg = lm_head_weight;
@@ -979,6 +1064,7 @@ extern "C" void launch_decode(
     void *g_beta_scratch_arg = g_beta_scratch;
     void *g_alpha_scratch_arg = g_alpha_scratch;
     void *g_normalized_arg = g_normalized;
+    float *g_fa_partials_arg = g_fa_partials;
     unsigned int *barrier_counter_arg = barrier_counter;
     unsigned int *barrier_generation_arg = barrier_generation;
     int input_token_id_arg = input_token_id;
@@ -998,6 +1084,7 @@ extern "C" void launch_decode(
         (void *)&g_attn_out_arg, (void *)&g_mlp_inter_arg,
         (void *)&g_z_scratch_arg, (void *)&g_beta_scratch_arg,
         (void *)&g_alpha_scratch_arg, (void *)&g_normalized_arg,
+        (void *)&g_fa_partials_arg,
         (void *)&barrier_counter_arg, (void *)&barrier_generation_arg,
         (void *)&input_token_id_arg, (void *)&position_arg, (void *)&max_seq_len_arg,
     };

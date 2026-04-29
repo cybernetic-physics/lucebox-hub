@@ -23,7 +23,7 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, "/root/lucebox-hub-b200-train/models/qwen35_0p8b")
+sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b")
 
 import torch  # noqa: E402
 

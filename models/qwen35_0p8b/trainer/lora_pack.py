@@ -34,7 +34,7 @@ import torch
 # DN_CONV_CH and would fail this from-import.
 _spec = importlib.util.spec_from_file_location(
     "qwen_outer_model_for_pack",
-    "/root/lucebox-hub-b200-train/models/qwen35_0p8b/model.py")
+    "/home/freiza/lucebox-hub/models/qwen35_0p8b/model.py")
 _outer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_outer)
 LAYER_TYPE     = _outer.LAYER_TYPE
