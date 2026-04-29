@@ -68,3 +68,4 @@ checkpoints/
 .env.local
 *.pem
 *.key
+.venv-3090/
