@@ -485,6 +485,15 @@ class LoraMegakernelTrainer:
             grad_h_pre_norm = out["grad_h_pre_norm"]
             saves = out["saves"]
             scratch = out["scratch"]
+            # FIXME(unstable): without an explicit sync here, downstream
+            # bwd kernels read garbage from the activation save buffers
+            # ~33% of the time on RTX 3090, producing wildly large or NaN
+            # gradients. Loss is always deterministic (forward is fine);
+            # only the bwd reads are racy. Inserting a synchronize here
+            # is a workaround — root-cause is likely a stream mismatch
+            # between cuDNN FA-2's lse/o save writes and the subsequent
+            # bwd kernel reads. See experiments/grad_harness.py.
+            torch.cuda.synchronize()
 
             # Scale grad_h_pre_norm by 1/N so the accumulated gradient
             # corresponds to mean-loss across items (matches HF+PEFT

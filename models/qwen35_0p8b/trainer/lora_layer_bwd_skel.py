@@ -942,6 +942,20 @@ def run_layer_walking_bwd(
     # at every per-layer boundary (see end of loop).
     dh = grad_h_pre_norm.to(torch.float32).contiguous()
 
+    import os as _os
+    _trace = _os.environ.get("MEGAKERNEL_TRACE_BWD") == "1"
+    if _trace:
+        print(f"  [bwd] entry  dh.norm={float(dh.norm()):.4e}  "
+              f"max|dh|={float(dh.abs().max()):.4e}")
+    # Diagnostic guard: if the input gradient already contains NaN/Inf, bail
+    # with a clear error rather than propagating garbage through 24 layers.
+    if not torch.isfinite(dh).all():
+        raise RuntimeError(
+            f"run_layer_walking_bwd: grad_h_pre_norm has non-finite values "
+            f"(NaN={int(torch.isnan(dh).sum())}, "
+            f"Inf={int(torch.isinf(dh).sum())}, total={dh.numel()})"
+        )
+
     fa_idx = N_FA_TOTAL - 1
     dn_idx = N_DN_TOTAL - 1
     # Iterate from last layer to first.
@@ -1069,6 +1083,19 @@ def run_layer_walking_bwd(
         # generated grads on bf16 leaf tensors are bf16; cast back at the
         # layer boundary so the next layer's MLP-down LoRA bwd is happy.
         dh = out["dh_in"].to(torch.float32).contiguous()
+
+        if _trace:
+            # Pick the LoRA-B grad with the largest norm for THIS layer to
+            # spotlight which projection is most active.
+            lora_grad_summary = []
+            for k, v in out.items():
+                if k.startswith("grad_") and k.endswith("_B"):
+                    lora_grad_summary.append((float(v.norm()), k))
+            lora_grad_summary.sort(reverse=True)
+            top = lora_grad_summary[0] if lora_grad_summary else (0.0, "-")
+            print(f"  [bwd] L={L:2d} type={layer_type}  "
+                  f"dh.norm={float(dh.norm()):.4e}  max|dh|={float(dh.abs().max()):.4e}  "
+                  f"max LoRA-B grad: {top[1]}={top[0]:.4e}")
 
     return flat_grads
 
