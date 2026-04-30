@@ -189,8 +189,33 @@ def load_weights(
         model_name, dtype=torch.bfloat16, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    state = model.state_dict()
+    weights, _ = _unify_weights_from_hf(model)
+    if verbose:
+        layer_data = weights["layer_data"]
+        total = sum(sum(t.numel() for t in ld["ptrs"]) for ld in layer_data) + weights["lm_head_weight"].numel()
+        print(f"BF16 weights: {total/1e6:.1f}M params ({total*2/1e6:.0f} MB)")
+    # Hold the HF model alive on the weights dict — the layer tensors are
+    # VIEWS into model.state_dict(), so model GC would invalidate them.
+    weights["_hf_model_keepalive"] = model
+    if resolved_backend == "nvfp4":
+        _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
+    return weights, tokenizer
 
+
+def _unify_weights_from_hf(model):
+    """Build the kernel's flat weight pack (layer_data + embed/final/lm_head)
+    from an already-loaded HF model. The returned tensors are *views into
+    the HF model's parameters* — no new allocation, no extra memory cost.
+
+    Used by :func:`load_weights` for the trainer-owned base model, AND by
+    LoraMegakernelTrainer.unified_decoder_from_session(...) so the sample
+    path's Decoder shares weights with the trainer's HF base instead of
+    re-loading 1.5 GB.
+
+    Returns (weights_dict, state_dict_ref) — the second element is kept
+    so callers can hold a reference if they need to keep state alive.
+    """
+    state = model.state_dict()
     layer_data = []
     for i in range(NUM_LAYERS):
         p = f"model.layers.{i}."
@@ -246,18 +271,7 @@ def load_weights(
         "lm_head_weight": lm_head,
         "layer_data": layer_data,
     }
-
-    del model
-    torch.cuda.empty_cache()
-
-    if verbose:
-        total = sum(sum(t.numel() for t in ld["ptrs"]) for ld in layer_data) + lm_head.numel()
-        print(f"BF16 weights: {total/1e6:.1f}M params ({total*2/1e6:.0f} MB)")
-
-    if resolved_backend == "nvfp4":
-        _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
-
-    return weights, tokenizer
+    return weights, state
 
 
 def _pack_layer_weights(layer_data):

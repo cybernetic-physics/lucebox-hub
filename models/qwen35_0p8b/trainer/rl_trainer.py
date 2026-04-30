@@ -92,6 +92,7 @@ _outer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_outer)
 load_weights = _outer.load_weights
 Decoder = _outer.Decoder
+_unify_weights_from_hf = _outer._unify_weights_from_hf
 
 
 # --------- Adapter ↔ flat-buffer mapping ---------
@@ -656,11 +657,27 @@ class LoraMegakernelTrainer:
 
     def _ensure_decoder(self) -> None:
         if self._decoder is None:
-            self._decoder = Decoder(
-                model_name=self.BASE_MODEL,
-                backend="bf16",
-                verbose=self._verbose_loader,
-            )
+            # Unified weights: if the trainer already loaded the HF base
+            # for PEFT, share its parameters with the Decoder instead of
+            # re-downloading and re-loading 1.5 GB. The kernel reads
+            # tensors via raw .data_ptr() so the HF nn.Parameter graph is
+            # transparent — same memory, two views.
+            if self._hf_base_cache is not None:
+                weights, _ = _unify_weights_from_hf(self._hf_base_cache)
+                # Keep HF model alive — weights are views into its params.
+                weights["_hf_model_keepalive"] = self._hf_base_cache
+                self._decoder = Decoder(
+                    weights=weights,
+                    tokenizer=self._tokenizer,
+                    backend="bf16",
+                    verbose=self._verbose_loader,
+                )
+            else:
+                self._decoder = Decoder(
+                    model_name=self.BASE_MODEL,
+                    backend="bf16",
+                    verbose=self._verbose_loader,
+                )
             if self._tokenizer is None:
                 self._tokenizer = self._decoder.tokenizer
 
