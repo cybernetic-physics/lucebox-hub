@@ -25,6 +25,7 @@ Rollout = prefill + 32 generated tokens, ms wall, best of 3 runs:
 | 15 | Unified LoRA + frozen base weights (~3 GB freed/instance) | `b16c46e`, `83cccf7` |
 | 16 | Training-loop test harness (`grad_harness.py`) | `868081c`, `4d872e3`, `34b82c2` |
 |    | Forward graph cache bug + cuDNN FA bwd determinism | `346f4a3`, `690d8c1` |
+|3-5 | Arch-aware build + runtime guards on sm_100-only kernels | `354be69` |
 
 ## Open
 
@@ -57,19 +58,23 @@ layer 15 across trials, but bit-different exiting it.
   reports 100% good (cos ≥ 0.9 vs HF, 0.2 ≤ ratio ≤ 5.0). Loss
   decreases monotonically across 5 training steps with `MEGAKERNEL_USE_KERNEL_BWD=1`.
 
-### #3 / #4 / #5 — sm_86 retarget polish
+### #3 / #4 / #5 — sm_86 retarget polish ✅ shipped (`354be69`)
 
-| #    | What |
-|-----:|---|
-|   3 | `cutlass_train/` is sm_100 only — port to sm_86 or remove |
-|   4 | Re-tile any remaining shared-mem-heavy kernel that won't fit 99 KB |
-|   5 | Launch-param tuning sweep (`PM_NUM_BLOCKS` etc. — we hardcode 148, clamp at runtime) |
+  - `cutlass_train/setup.py` now skips cleanly on SM<100 instead of
+    emitting an invalid sm_86a binary.
+  - `prefill_bf16_mega`, `dn_bwd`, `dn_chunked_fwd` all query the
+    device's per-block opt-in shared-mem cap and refuse to launch
+    when the kernel's smem need exceeds it. Surfaces a clear error
+    instead of cudaErrorInvalidValue from the hidden FuncSetAttribute.
+  - `trainer/setup.py` picks `PM_NUM_BLOCKS` per device cc:
+    `(10,0)→148, (12,0)/(9,0)→132, (8,6)→82, (8,9)→76, (8,0)→108`.
+    Override via `TRAIN_MEGA_NUM_BLOCKS`.
+  - `prefill.cu` cuBLAS workspace scaled to compute capability:
+    32 MB on Hopper+, 4 MB on Ampere/Ada.
 
-  **Why low-priority**: cuBLAS on Ampere already dispatches to
-  CUTLASS sm_80 kernels (we see them in nsys: `cutlass_80_tensorop_bf16_s1681*`).
-  So "pure CUTLASS" doesn't require building CUTLASS ourselves on
-  this hardware. The `cutlass_train/` directory is dead code on 3090
-  and could be deleted.
+  Production hot path on RTX 3090 unchanged — uses `prefill_bf16` +
+  `dn_chunked_3090` + cuBLAS. The guards are belt-and-braces for
+  misconfigured calls.
 
 ### #9 — SGLang baseline harness
 
