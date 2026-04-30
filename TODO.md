@@ -29,34 +29,28 @@ Rollout = prefill + 32 generated tokens, ms wall, best of 3 runs:
 
 ## Open
 
-### #17 — gradient corruption in `per_layer_bwd_fa`
+### #17 — gradient corruption in `per_layer_bwd_fa` ✅ shipped (`ebb57dd`)
 
-Stability harness:
-~30% good runs, ~45% wrong-magnitude, ~25% NaN. All leaf ops
-(`bwd_lora_linear`, `bwd_swiglu`, `bwd_rmsnorm`, math FA bwd, fla DN
-bwd, forward saves) verified bit-deterministic in isolation. The bug
-is at the **composition** level — `dh` is bit-identical entering
-layer 15 across trials, but bit-different exiting it.
+Root cause: missing `__syncthreads()` between two block-wide reductions
+in `bwd_rmsnorm_kernel`. The first reduction wrote `s_red[0] = mean_sq`,
+then every thread read it; the second reduction wrote `s_red[warp_id]
+= dot` *without a fence first*. A fast warp 0 could overwrite `s_red[0]`
+before slow warps finished their mean_sq read → slow warps divided by
+H using a stale dot partial → garbage gradient.
 
-  **Why**: training has a stable HF+PEFT path today; the kernel-bwd
-  path is opt-in (`MEGAKERNEL_USE_KERNEL_BWD=1`) and was meant to
-  replace HF+PEFT eventually. While broken, training falls back
-  silently to HF+PEFT — but #15 (unified weights) is partially
-  bottlenecked on this since the kernel path is the route to drop
-  HF+PEFT entirely.
+The race only triggered at the QKnorm bwd shape (S=240, H=256 for
+30 tokens × 8 q-heads × head_dim=256); the K-norm and DN-norm shapes
+happened to keep warps in lockstep so the bug stayed hidden across
+all the original unit tests.
 
-  **How to apply**: two options.
-  1. Audit every torch op in `lora_layer_bwd_skel.py:layer_attn_bwd_fa_handrolled`
-     and look for in-place mutations / view aliasing. The non-determinism
-     is allocator-state-dependent (`empty_cache()` between iters makes
-     it strictly worse → confirms aliasing-on-recycled-buffer pattern).
-  2. Rewrite `per_layer_bwd_fa` as one fused CUDA kernel — owns its
-     own scratch, no Python tensor-lifetime games. This is the
-     "pure CUTLASS megakernel" endgame; ~1500 lines, multi-day work.
+Compute-sanitizer racecheck found it in seconds once we ran it on the
+actual trainer shape. Fix is a one-line `__syncthreads()`.
 
-  **Acceptance**: `experiments/grad_harness.py stability --iters 20`
-  reports 100% good (cos ≥ 0.9 vs HF, 0.2 ≤ ratio ≤ 5.0). Loss
-  decreases monotonically across 5 training steps with `MEGAKERNEL_USE_KERNEL_BWD=1`.
+Verification:
+  - racecheck: 0 hazards across the entire kernel-bwd training path
+  - stability harness: 20/20 good runs (was 1/20)
+  - multi-step training: step-3 rel error 88.6% → 0.29% vs HF+PEFT
+  - rollout perf unchanged (S=32K prefill 1197 ms, gen 101 ms)
 
 ### #3 / #4 / #5 — sm_86 retarget polish ✅ shipped (`354be69`)
 
