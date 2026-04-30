@@ -1500,6 +1500,25 @@ extern "C" void launch_prefill_bf16(
     }
 
     bool disable_graph = std::getenv("MEGAKERNEL_PREFILL_NOGRAPH") != nullptr;
+    // Training-step calls (any save slab non-null) allocate scratch + saves
+    // fresh on every call. PyTorch's caching allocator reuses freed
+    // addresses, so the graph cache key matches across calls *with the
+    // same numerical addresses* but DIFFERENT live tensors. Replaying the
+    // captured graph then reads stale buffer contents (whatever the
+    // allocator wrote there for the next user) — produces non-deterministic
+    // forward output across calls. Detect via "saving any activation
+    // slab" and bypass the graph cache. Inference Decoder keeps long-lived
+    // scratch buffers and is unaffected.
+    bool is_training_call = (saved.hidden_in != nullptr ||
+                              saved.normalized_in != nullptr ||
+                              saved.normalized_post_attn != nullptr ||
+                              saved.mlp_inter != nullptr ||
+                              saved.attn_out_pre_o != nullptr ||
+                              saved.h_post_attn != nullptr ||
+                              saved.fa_q_save != nullptr ||
+                              saved.fa_o_save != nullptr ||
+                              saved.fa_lse_save != nullptr);
+    if (is_training_call) disable_graph = true;
 
     PrefillGraphKey key{};
     key.seq_len = seq_len;

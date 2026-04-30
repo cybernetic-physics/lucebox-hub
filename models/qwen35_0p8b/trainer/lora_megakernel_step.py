@@ -150,27 +150,32 @@ def alloc_scratch(S: int, lora_rank: int) -> dict:
     i32 = dict(dtype=torch.int32, device="cuda")
     max_proj = max(FA_QPROJ_SIZE, DN_CONV_CH, INTER)
     max_attn = max(FA_Q_SIZE, DN_V_SIZE, FA_KV_SIZE)
+    # Zero-initialize all scratch — the kernel writes to specific
+    # positions per layer/token, and the caching allocator reuses
+    # buffers across calls. Stale values from previous calls would
+    # bleed into the current call's compute through any region the
+    # kernel doesn't fully overwrite.
     return dict(
         fa_k_cache=torch.zeros(N_FA, FA_KV_HEADS, 32768, FA_HEAD_DIM, **bf16),
         fa_v_cache=torch.zeros(N_FA, FA_KV_HEADS, 32768, FA_HEAD_DIM, **bf16),
         dn_states=torch.zeros(N_DN, DN_HEADS, DN_KEY, DN_VAL, **f32),
         conv_bufs=torch.zeros(N_DN, DN_CONV_CH, DN_CONV_K, **f32),
-        hidden=torch.empty(S * HIDDEN, **bf16),
-        residual=torch.empty(S * HIDDEN, **bf16),
-        normalized=torch.empty(S * HIDDEN, **bf16),
-        proj_buf=torch.empty(S * max_proj, **bf16),
-        proj_buf2=torch.empty(S * max_proj, **bf16),
-        attn_buf=torch.empty(S * max_attn, **bf16),
-        mlp_buf=torch.empty(S * INTER, **bf16),
-        dn_out_buf=torch.empty(S * max_attn, **bf16),
-        beta_buf=torch.empty(S * DN_HEADS, **f32),
-        alpha_buf=torch.empty(S * DN_HEADS, **f32),
-        final_normed=torch.empty(HIDDEN, **bf16),
-        hidden_bf16_out=torch.empty(HIDDEN, **bf16),
-        out_token=torch.empty(1, **i32),
-        lm_bmv=torch.empty(1024, **f32),
-        lm_bmi=torch.empty(1024, **i32),
-        lora_h_ws=torch.empty(S, lora_rank, **bf16),
+        hidden=torch.zeros(S * HIDDEN, **bf16),
+        residual=torch.zeros(S * HIDDEN, **bf16),
+        normalized=torch.zeros(S * HIDDEN, **bf16),
+        proj_buf=torch.zeros(S * max_proj, **bf16),
+        proj_buf2=torch.zeros(S * max_proj, **bf16),
+        attn_buf=torch.zeros(S * max_attn, **bf16),
+        mlp_buf=torch.zeros(S * INTER, **bf16),
+        dn_out_buf=torch.zeros(S * max_attn, **bf16),
+        beta_buf=torch.zeros(S * DN_HEADS, **f32),
+        alpha_buf=torch.zeros(S * DN_HEADS, **f32),
+        final_normed=torch.zeros(HIDDEN, **bf16),
+        hidden_bf16_out=torch.zeros(HIDDEN, **bf16),
+        out_token=torch.zeros(1, **i32),
+        lm_bmv=torch.zeros(1024, **f32),
+        lm_bmi=torch.zeros(1024, **i32),
+        lora_h_ws=torch.zeros(S, lora_rank, **bf16),
     )
 
 
@@ -190,19 +195,24 @@ def alloc_activation_saves(S: int, *, with_b2_saves: bool = True,
     FA_Q_HEADS  = 8
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
     f32  = dict(dtype=torch.float32,  device="cuda")
+    # Use torch.zeros instead of torch.empty: the kernel's per-layer write
+    # path may skip positions that aren't covered by the current sequence
+    # length, and the allocator reuses cached buffers — uninitialized
+    # values from a previous call leak in and corrupt downstream bwd.
+    # See grad_harness.py stability test (commit 868081c).
     out = dict(
-        hidden_in=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
-        normalized_in=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
-        normalized_post_attn=torch.empty(NUM_LAYERS, S, HIDDEN, **bf16),
-        mlp_inter=torch.empty(NUM_LAYERS, S, INTER, **bf16),
+        hidden_in=torch.zeros(NUM_LAYERS, S, HIDDEN, **bf16),
+        normalized_in=torch.zeros(NUM_LAYERS, S, HIDDEN, **bf16),
+        normalized_post_attn=torch.zeros(NUM_LAYERS, S, HIDDEN, **bf16),
+        mlp_inter=torch.zeros(NUM_LAYERS, S, INTER, **bf16),
     )
     if with_b2_saves:
-        out["attn_out_pre_o"] = torch.empty(NUM_LAYERS, S, DN_V_SIZE, **bf16)
-        out["h_post_attn"] = torch.empty(NUM_LAYERS, S, HIDDEN, **bf16)
+        out["attn_out_pre_o"] = torch.zeros(NUM_LAYERS, S, DN_V_SIZE, **bf16)
+        out["h_post_attn"] = torch.zeros(NUM_LAYERS, S, HIDDEN, **bf16)
     if with_fa_bwd_saves:
-        out["fa_q_save"]   = torch.empty(N_FA, S, FA_Q_HEADS, FA_HEAD_DIM, **bf16)
-        out["fa_o_save"]   = torch.empty(N_FA, S, FA_Q_HEADS, FA_HEAD_DIM, **bf16)
-        out["fa_lse_save"] = torch.empty(N_FA, FA_Q_HEADS, S, **f32)
+        out["fa_q_save"]   = torch.zeros(N_FA, S, FA_Q_HEADS, FA_HEAD_DIM, **bf16)
+        out["fa_o_save"]   = torch.zeros(N_FA, S, FA_Q_HEADS, FA_HEAD_DIM, **bf16)
+        out["fa_lse_save"] = torch.zeros(N_FA, FA_Q_HEADS, S, **f32)
     return out
 
 
@@ -551,11 +561,22 @@ def kernel_loss_autograd(
     sc, saves = _train_step_forward(
         handle, full, lora_flat, lora_rank, lora_scaling,
     )
+    torch.cuda.synchronize()  # wait for the forward kernel to commit
+    # Sanity-check the kernel's hidden output before we feed it to autograd.
+    h_kernel = sc["hidden"].view(S, HIDDEN)
+    if not torch.isfinite(h_kernel).all():
+        raise RuntimeError(
+            f"kernel_loss_autograd: prefill_bf16_train_step produced "
+            f"non-finite hidden state "
+            f"(NaN={int(torch.isnan(h_kernel).sum())}, "
+            f"Inf={int(torch.isinf(h_kernel).sum())}, "
+            f"total={h_kernel.numel()})"
+        )
 
     # Detach and clone sc["hidden"] into a leaf tensor with requires_grad.
     # The kernel's own buffer is opaque to autograd; we want grad routing
     # to STOP here so we can read it explicitly.
-    h_pre_norm = sc["hidden"].view(S, HIDDEN).detach().clone()
+    h_pre_norm = h_kernel.detach().clone()
     h_pre_norm.requires_grad_(True)
 
     # Autograd-tracked python from h_pre_norm to loss.
@@ -574,8 +595,19 @@ def kernel_loss_autograd(
     # Pre-compute DN attention saves at forward time (eliminates the
     # bwd-side dn_attn_forward recompute). Per-layer Python forward
     # using fla directly. Saves are keyed by absolute layer index.
-    if hf_model is not None:
+    # MEGAKERNEL_DEBUG_SKIP_DN_PRECOMPUTE=1 disables this for bisection;
+    # bwd path will fall back to in-bwd dn_attn_forward.
+    import os as _os
+    if hf_model is not None and _os.environ.get(
+            "MEGAKERNEL_DEBUG_SKIP_DN_PRECOMPUTE") != "1":
         saves["dn_attn_saves"] = precompute_dn_saves(hf_model, saves)
+    # Force every previously-launched kernel (prefill train_step's per-
+    # layer activation save kernels, the autograd loss graph's matmuls,
+    # the DN-saves recompute via fla/Triton) to commit before we hand
+    # the saves and grad_h_pre_norm off to the layer-walking backward.
+    # Without this, the bwd is racy on RTX 3090 — see grad_harness
+    # stability test.
+    torch.cuda.synchronize()
     return {
         "loss": loss.detach(),
         "grad_h_pre_norm": grad_h_pre_norm,    # [S, HIDDEN] fp32
