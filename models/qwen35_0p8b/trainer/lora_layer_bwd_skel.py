@@ -86,12 +86,16 @@ def lora_linear_bwd(
         ws_lora_h, ws_grad_lora_h,
         S, K_in, K_out, R, scaling,
     )
-    # Add base-path grad_x: d(y) @ base_W   →  [S, K_in] fp32.
-    # Keep grad_y in fp32 here — casting to bf16 loses signal on small
-    # gradients (std ~1e-2) which the gate/up paths typically have. The
-    # extra precision is essentially free since cuBLAS does fp32 GEMM
-    # natively; only the weight tensor is cast to fp32.
-    grad_x_base = grad_y @ base_W.float()
+    # Add base-path grad_x: d(y) @ base_W -> [S, K_in].
+    # Use bf16 inputs so cuBLAS picks the tensor-core GEMM kernel
+    # (cutlass_80_tensorop_bf16_*) instead of the fp32 SIMT path
+    # (cutlass_80_simt_sgemm_*). The latter is ~10× slower at our
+    # sizes. fp32 accumulator inside the GEMM keeps precision
+    # comparable; we cast back to fp32 to add to grad_x.
+    # Skip the cast if grad_y is already bf16 (bench harnesses sometimes
+    # pass fp32; the trainer always passes fp32).
+    grad_y_bf = grad_y.to(torch.bfloat16) if grad_y.dtype != torch.bfloat16 else grad_y
+    grad_x_base = (grad_y_bf @ base_W).float()
     grad_x = grad_x + grad_x_base
     return grad_x, grad_A, grad_B
 

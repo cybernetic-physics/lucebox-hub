@@ -90,39 +90,53 @@ def fa_backward_flash(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
-    # Deterministic math path: bf16 inputs cast to fp32, attention rebuilt
-    # via Q @ K.T then softmax-reweighted by exp(scores - LSE).
-    Qf = Q.float()
-    Kf = K.float()
-    Vf = V.float()
-    Of = O.float()
-    dOf = dO.float()
-    # scores[b,h,i,j] = (Qf @ Kf.transpose) * scale, shape [B, Hq, S, S]
-    scores = torch.einsum("bhid,bhjd->bhij", Qf, Kf) * scale
+    # Deterministic math path. To stay deterministic AND fast we use
+    # cuBLAS bf16 matmul (tensor cores, fp32 accumulator) for the four
+    # large GEMMs and only do the elementwise softmax / row-sum work in
+    # fp32. cuBLAS bf16 GEMM is bit-deterministic for fixed inputs and
+    # fixed handle.
+    #
+    # Shapes: Q,K,V,O,dO are [B, Hq, S, D] bf16; LSE is [B, Hq, S] fp32.
+    Qb = Q.contiguous()      # [B, Hq, S, D] bf16
+    Kb = K.contiguous()
+    Vb = V.contiguous()
+    dOb = dO.contiguous()
+
+    # scores[b,h,i,j] = (Q @ K.T)[b,h,i,j] * scale. Use torch.matmul which
+    # picks cuBLAS bf16 tensor-op GEMM.
+    Kbt = Kb.transpose(-2, -1).contiguous()                           # [B, Hq, D, S] bf16
+    scores_bf16 = torch.matmul(Qb, Kbt)                               # [B, Hq, S, S] bf16
+    scores = scores_bf16.float() * scale                              # promote for the elementwise reweighting
     if is_causal:
-        # Mask future positions to -inf so softmax weights them as zero.
         causal_mask = torch.triu(
             torch.full((S, S), float("-inf"), device=Q.device, dtype=torch.float32),
             diagonal=1,
         )
         scores = scores + causal_mask
-    # P = softmax(scores) reconstructed via LSE: P[b,h,i,j] = exp(scores - LSE[b,h,i]).
-    P = torch.exp(scores - LSE.unsqueeze(-1))     # [B, Hq, S, S] fp32
-    # dV = P^T @ dO, sum over query dim
-    dV = torch.einsum("bhij,bhid->bhjd", P, dOf)
-    # dP = dO @ V^T  -> [B, Hq, S(query), S(key)]
-    dP = torch.einsum("bhid,bhjd->bhij", dOf, Vf)
-    # row_sum = sum_j (P * dP) -> [B, Hq, S(query)]
-    row_sum = (P * dP).sum(dim=-1, keepdim=True)
-    dS = P * (dP - row_sum) * scale
-    # dQ = dS @ K
-    dQ = torch.einsum("bhij,bhjd->bhid", dS, Kf)
-    # dK = dS^T @ Q
-    dK = torch.einsum("bhij,bhid->bhjd", dS, Qf)
+    # P = exp(scores - LSE) — softmax reconstructed via the saved LSE.
+    P = torch.exp(scores - LSE.unsqueeze(-1))                         # [B, Hq, S, S] fp32
 
-    dQ = dQ.to(Q.dtype)
-    dK = dK.to(K.dtype)
-    dV = dV.to(V.dtype)
+    # Cast P / dO to bf16 for the GEMMs.
+    Pb = P.to(torch.bfloat16)                                         # [B, Hq, S, S] bf16
+
+    # dV = P^T @ dO  (axes: i -> reduced; output [B, Hq, S_key, D])
+    dV_bf16 = torch.matmul(Pb.transpose(-2, -1), dOb)                 # [B, Hq, S, D] bf16
+    # dP = dO @ V^T  (axes: D reduced; output [B, Hq, S_q, S_k])
+    Vbt = Vb.transpose(-2, -1).contiguous()
+    dP_bf16 = torch.matmul(dOb, Vbt)                                  # [B, Hq, S, S] bf16
+    dP = dP_bf16.float()
+    # row_sum = sum_j (P * dP)  (Σ over S_k)
+    row_sum = (P * dP).sum(dim=-1, keepdim=True)
+    dS = P * (dP - row_sum) * scale                                   # fp32 [B, Hq, S, S]
+    dSb = dS.to(torch.bfloat16)
+    # dQ = dS @ K
+    dQ_bf16 = torch.matmul(dSb, Kb)                                   # [B, Hq, S, D] bf16
+    # dK = dS^T @ Q
+    dK_bf16 = torch.matmul(dSb.transpose(-2, -1), Qb)                 # [B, Hq, S, D] bf16
+
+    dQ = dQ_bf16.to(Q.dtype)
+    dK = dK_bf16.to(K.dtype)
+    dV = dV_bf16.to(V.dtype)
 
     if num_kv_heads is not None and num_kv_heads != Hq:
         H_R = Hq // num_kv_heads
