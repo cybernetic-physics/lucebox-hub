@@ -1525,6 +1525,11 @@ extern "C" __global__ void bwd_rmsnorm_kernel(
             dot += s_x[i] * s_a[i] * s_dy[i];
         }
         for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+        // FIX: race between this write and the previous read of s_red[0]
+        // (1519). Without this fence a fast warp 0 can overwrite s_red[0]
+        // with its dot partial before slow warps finish reading mean_sq.
+        // See compute-sanitizer racecheck on bwd_rmsnorm at S=240 H=256.
+        __syncthreads();
         if (lane == 0) s_red[warp_id] = dot;
         __syncthreads();
         if (warp_id == 0) {

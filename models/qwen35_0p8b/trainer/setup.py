@@ -33,6 +33,7 @@ setup(
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", f"-arch={arch}", "--use_fast_math", "-std=c++17",
+                     "-lineinfo",
                      f"-DPM_BLOCK_SIZE={block_size}",
                      f"-DPM_NUM_BLOCKS={num_blocks}"],
         },

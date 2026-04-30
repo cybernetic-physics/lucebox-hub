@@ -89,10 +89,9 @@ def test_bwd_swiglu():
         print("  PASS — all 8 iters bit-identical")
 
 
-def test_bwd_rmsnorm():
-    print("=== bwd_rmsnorm ===")
+def _check_bwd_rmsnorm(S, H, label=""):
+    print(f"=== bwd_rmsnorm {label} S={S} H={H} ===")
     torch.manual_seed(0)
-    S, H = 30, 1024
     x = (torch.randn(S, H, device='cuda') * 0.1).to(torch.bfloat16).contiguous()
     w = (torch.randn(H, device='cuda') * 0.1).to(torch.bfloat16).contiguous()
     dy = (torch.randn(S, H, device='cuda') * 0.1).to(torch.float32).contiguous()
@@ -107,9 +106,18 @@ def test_bwd_rmsnorm():
         mx = float((base - r).abs().max())
         if mx > 0:
             print(f"  iter {i}: dx differs by max|Δ|={mx:.4e}")
-            break
-    else:
-        print("  PASS — all 8 iters bit-identical")
+            return
+    print("  PASS — all 8 iters bit-identical")
+
+
+def test_bwd_rmsnorm():
+    # All shapes the trainer actually calls bwd_rmsnorm with.
+    _check_bwd_rmsnorm(30, 1024, label="(input/post-attn rmsnorm, S, HIDDEN)")
+    _check_bwd_rmsnorm(30 * 8,  256, label="(Q-norm: S*Hq, D)")
+    _check_bwd_rmsnorm(30 * 2,  256, label="(K-norm: S*Hk, D)")
+    _check_bwd_rmsnorm(30 * 16, 128, label="(DN-norm: S*Hdn, D_dn)")
+    _check_bwd_rmsnorm(30, 256, label="(small short axis)")
+    _check_bwd_rmsnorm(30, 128, label="(very short axis)")
 
 
 def main():
