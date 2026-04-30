@@ -212,10 +212,23 @@ def _unify_weights_from_hf(model):
     path's Decoder shares weights with the trainer's HF base instead of
     re-loading 1.5 GB.
 
+    Handles PEFT-wrapped models: when a Linear has been replaced by a
+    LoraLinear, the original frozen weight lives at base_layer.weight
+    instead of weight. We map both forms to the same underlying tensor.
+
     Returns (weights_dict, state_dict_ref) — the second element is kept
     so callers can hold a reference if they need to keep state alive.
     """
     state = model.state_dict()
+    # PEFT renames each LoRA-wrapped Linear's underlying weight from
+    # `…proj.weight` -> `…proj.base_layer.weight`. Build an alias dict so
+    # the lookups below work whether the model is PEFT-wrapped or not.
+    aliased = dict(state)
+    for k, v in list(state.items()):
+        if k.endswith(".base_layer.weight"):
+            short = k[: -len(".base_layer.weight")] + ".weight"
+            aliased[short] = v
+    state = aliased
     layer_data = []
     for i in range(NUM_LAYERS):
         p = f"model.layers.{i}."

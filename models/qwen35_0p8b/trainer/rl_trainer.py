@@ -147,6 +147,11 @@ class LoraMegakernelTrainer:
         self._decoder: Decoder | None = None
         self._tokenizer = None
         self._hf_base_cache: Any = None  # the shared frozen base for PEFT wrap
+        # PEFT multi-adapter container — wrapped around _hf_base_cache
+        # exactly once on the first session.register, then add_adapter()
+        # for each subsequent session. set_adapter(model_id) before each
+        # forward / backward picks the live LoRA.
+        self._shared_peft_model: Any = None
 
     # ---------- Runtime metadata ----------
 
@@ -251,17 +256,13 @@ class LoraMegakernelTrainer:
             if self._tokenizer is None:
                 self._tokenizer = AutoTokenizer.from_pretrained(self.BASE_MODEL)
 
-        # Build a PEFT LoRA wrap on a fresh copy of the base. We use
-        # peft.LoraConfig with explicit target_modules so the wrap is
-        # deterministic (and matches what HF+SGLang load later).
+        # Build a PEFT LoRA wrap. The base model nn.Parameters are SHARED
+        # across all sessions via PEFT's multi-adapter support: we wrap
+        # the shared base ONCE on first session.register, and each
+        # subsequent session adds a NEW named adapter to the same model.
+        # set_adapter(model_id) selects the active LoRA before each
+        # forward / backward / sample. Saves ~1.5 GB per extra session.
         from peft import LoraConfig, get_peft_model
-        # Clone the weights into a new model container so each session
-        # can be trained independently without corrupting siblings.
-        # For memory, we actually share the underlying nn.Parameters
-        # via `copy.deepcopy` on the *module graph* — PEFT attaches
-        # adapters on top of the per-session container.
-        import copy
-        session_base = copy.deepcopy(self._hf_base_cache)
         target = []
         if train_attn:
             target += ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -275,8 +276,18 @@ class LoraMegakernelTrainer:
             bias="none",
             task_type="CAUSAL_LM",
         )
-        hf_model = get_peft_model(session_base, cfg).to("cuda", dtype=torch.bfloat16)
-        hf_model.train()
+        if not hasattr(self, "_shared_peft_model") or self._shared_peft_model is None:
+            # First session: wrap the shared HF base once. Use model_id
+            # as the adapter name so set_adapter(model_id) picks it.
+            self._shared_peft_model = get_peft_model(
+                self._hf_base_cache, cfg, adapter_name=model_id,
+            ).to("cuda", dtype=torch.bfloat16)
+            self._shared_peft_model.train()
+        else:
+            # Subsequent session: add adapter on the existing wrap.
+            self._shared_peft_model.add_adapter(model_id, cfg)
+        hf_model = self._shared_peft_model
+        hf_model.set_adapter(model_id)
 
         # Swap HF's fp32 torch_chunk_gated_delta_rule for our CUDA DN
         # recurrence kernel (bit-exact to the recurrent variant, ~2-6x
@@ -580,7 +591,20 @@ class LoraMegakernelTrainer:
             out_dir.mkdir(parents=True, exist_ok=True)
             # PEFT's built-in save writes adapter_model.safetensors +
             # adapter_config.json, directly loadable by SGLang / HF PEFT.
-            s.hf_model.save_pretrained(str(out_dir))
+            # Multi-adapter mode saves to <out_dir>/<adapter_name>/...;
+            # for the SGLang-compatible single-adapter layout, save just
+            # this session's adapter and then flatten its dir up.
+            s.hf_model.set_adapter(model_id)
+            s.hf_model.save_pretrained(str(out_dir),
+                                        selected_adapters=[model_id])
+            adapter_dir = out_dir / model_id
+            if adapter_dir.is_dir():
+                for f in adapter_dir.iterdir():
+                    target_path = out_dir / f.name
+                    if target_path.exists():
+                        target_path.unlink()
+                    f.rename(target_path)
+                adapter_dir.rmdir()
             has_optim = False
             if include_optimizer and s.step > 0:
                 torch.save(s.hf_optimizer.state_dict(), out_dir / "optimizer.pt")
@@ -619,7 +643,8 @@ class LoraMegakernelTrainer:
             # Use peft's set_peft_model_state_dict to handle the mapping.
             from peft import set_peft_model_state_dict
             state = load_file(str(d / "adapter_model.safetensors"))
-            set_peft_model_state_dict(s.hf_model, state)
+            set_peft_model_state_dict(s.hf_model, state,
+                                       adapter_name=model_id)
             if with_optimizer:
                 opt_path = d / "optimizer.pt"
                 if not opt_path.exists():
