@@ -72,29 +72,58 @@ def fa_backward_flash(
     philox_offset: torch.Tensor | None = None,
     num_kv_heads: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """cuDNN FA-2 backward. Inputs are in [B, Hq, S, D] with Q/K/V/O/dO
-    all shaped as Hq heads (GQA has already been expanded by the forward).
-    Returns (dQ, dK, dV) — if `num_kv_heads` is given, dK/dV are reduced
-    back to Hk heads by summing across the H_R = Hq/num_kv_heads copies.
+    """cuDNN FA-2 backward (or deterministic math fallback).
+
+    cuDNN FA-2 bwd defaults to a non-deterministic algorithm — the same
+    inputs produce different gradients from call to call, with NaN every
+    few percent of the time on RTX 3090. Until our own deterministic FA
+    bwd kernel is wired in, we run the math reference path: rebuild the
+    attention scores from Q/K, recompute the softmax (using the saved LSE
+    for numerical stability), and apply the standard attention bwd math
+    in fp32. Slower than cuDNN but bit-deterministic.
+
+    Inputs in [B, Hq, S, D] with Q/K/V/O/dO already shaped as Hq heads
+    (GQA has been expanded by the forward). Returns (dQ, dK, dV) —
+    if num_kv_heads is given, dK/dV are summed back to Hk heads.
     """
     B, Hq, S, D = Q.shape
     if scale is None:
         scale = 1.0 / math.sqrt(D)
-    if philox_seed is None:
-        philox_seed = torch.zeros(2, dtype=torch.uint64, device=Q.device)
-    if philox_offset is None:
-        philox_offset = torch.zeros((), dtype=torch.uint64, device=Q.device)
 
-    r = torch.ops.aten._scaled_dot_product_flash_attention_backward(
-        dO, Q, K, V, O, LSE,
-        None, None,   # cumulative_seq_q / cumulative_seq_k (varlen; unused)
-        S, S,          # max_q, max_k
-        0.0,           # dropout
-        is_causal,
-        philox_seed, philox_offset,
-        scale=scale,
-    )
-    dQ, dK, dV = r[0], r[1], r[2]
+    # Deterministic math path: bf16 inputs cast to fp32, attention rebuilt
+    # via Q @ K.T then softmax-reweighted by exp(scores - LSE).
+    Qf = Q.float()
+    Kf = K.float()
+    Vf = V.float()
+    Of = O.float()
+    dOf = dO.float()
+    # scores[b,h,i,j] = (Qf @ Kf.transpose) * scale, shape [B, Hq, S, S]
+    scores = torch.einsum("bhid,bhjd->bhij", Qf, Kf) * scale
+    if is_causal:
+        # Mask future positions to -inf so softmax weights them as zero.
+        causal_mask = torch.triu(
+            torch.full((S, S), float("-inf"), device=Q.device, dtype=torch.float32),
+            diagonal=1,
+        )
+        scores = scores + causal_mask
+    # P = softmax(scores) reconstructed via LSE: P[b,h,i,j] = exp(scores - LSE[b,h,i]).
+    P = torch.exp(scores - LSE.unsqueeze(-1))     # [B, Hq, S, S] fp32
+    # dV = P^T @ dO, sum over query dim
+    dV = torch.einsum("bhij,bhid->bhjd", P, dOf)
+    # dP = dO @ V^T  -> [B, Hq, S(query), S(key)]
+    dP = torch.einsum("bhid,bhjd->bhij", dOf, Vf)
+    # row_sum = sum_j (P * dP) -> [B, Hq, S(query)]
+    row_sum = (P * dP).sum(dim=-1, keepdim=True)
+    dS = P * (dP - row_sum) * scale
+    # dQ = dS @ K
+    dQ = torch.einsum("bhij,bhjd->bhid", dS, Kf)
+    # dK = dS^T @ Q
+    dK = torch.einsum("bhij,bhid->bhjd", dS, Qf)
+
+    dQ = dQ.to(Q.dtype)
+    dK = dK.to(K.dtype)
+    dV = dV.to(V.dtype)
+
     if num_kv_heads is not None and num_kv_heads != Hq:
         H_R = Hq // num_kv_heads
         dK = dK.view(B, num_kv_heads, H_R, S, D).sum(dim=2)
