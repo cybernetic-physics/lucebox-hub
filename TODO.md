@@ -1,6 +1,6 @@
 # Open work — Qwen3.5-0.8B trainer/inference on RTX 3090
 
-State as of `83cccf7` on branch `3090-train`. See
+State as of `9848cb7` on branch `3090-train`. See
 `docs/results/qwen35_0p8b_3090.md` for the perf write-up.
 
 ## Final RTX 3090 numbers vs HF generate
@@ -70,28 +70,25 @@ Verification:
   `dn_chunked_3090` + cuBLAS. The guards are belt-and-braces for
   misconfigured calls.
 
-### #9 — SGLang baseline harness
+### #9 — SGLang baseline harness ✅ shipped (`4796320`)
 
-Stand up the latest SGLang serving Qwen3.5-0.8B on GPU 1, measure
-prefill + decode + RL-rollout throughput at S in {128, 512, 2K, 8K, 32K}.
-Adds the third reference column to `docs/results/qwen35_0p8b_3090.md`
-(today we only compare against HF generate).
+`experiments/bench_3090_sglang.py` runs the canonical shape sweep
+against `sglang.Engine(Qwen/Qwen3.5-0.8B, tp_size=1,
+mem_fraction_static=0.7, disable_cuda_graph=True,
+disable_radix_cache=True)`. Results landed in
+`docs/results/qwen35_0p8b_3090.md` as the SGLang column. We're faster
+than SGLang up to S=16K (1.14×) and SGLang wins by ~30% at S=32K —
+its `fla.chunk_gated_delta_rule` prefill beats our V-split recurrence
+at the longest shapes.
 
-  **Acceptance**: a `experiments/bench_3090_sglang.py` that produces
-  a table the same shape as `bench_3090_rollout.py`, plus a corresponding
-  row in the results doc.
+### #10 — tuned HF + PyTorch baseline ✅ shipped (`9848cb7`)
 
-### #10 — tuned HF + PyTorch training baseline
-
-Today the kernel-bwd path uses HF+PEFT autograd as its correctness
-reference, but there is no fully-tuned baseline harness for marketing
-comparisons. Stand up: HF transformers + PEFT LoRA + flash-linear-attention
-+ cuDNN SDPA + `torch.compile` + fused AdamW. Measure RL step (sample +
-train) at the same shapes.
-
-  **Acceptance**: a `experiments/bench_3090_hf_train.py` reporting
-  ms/step at the canonical shape sweep, with a `--with-compile` flag
-  for the torch.compile variant.
+`experiments/bench_3090_hf_tuned.py` adds the "HF tuned" rollout column
+and a training-step harness. Tuning knobs: bf16, TF32 matmul on, cuDNN
+benchmark on, fused AdamW, PEFT LoRA, torchao import-check stub.
+`torch.compile(mode="reduce-overhead")` fails Dynamo on the hybrid
+Qwen3.5 generate path with `InternalTorchDynamoError: accessing tensor
+output` — documented as a known PyTorch limitation, no fix needed.
 
 ## Known infrastructure gotchas
 
