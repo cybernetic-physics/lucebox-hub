@@ -864,6 +864,18 @@ extern "C" cudaError_t launch_dn_chunked_fwd(
     size_t smem_fp32 = ((size_t)Dk * Dv + 2 * (size_t)C * C + 16 * 256 + 3 * C) * sizeof(float);
     size_t smem_bf16 = ((size_t)Dk * (Dv/2) + 4 * (size_t)C * Dk + (size_t)C * Dv + (size_t)C * C) * sizeof(__nv_bfloat16);
     size_t smem = smem_fp32 + smem_bf16;
+    // ~217 KB. Use models/qwen35_0p8b/dn_chunked_3090.cu instead on
+    // SM<90 — that kernel re-tiles to V_SPLITS=4 + C=32 to fit the
+    // 99 KB SM86 cap. Refuse to launch this B200-shaped variant on
+    // hardware that can't host the smem.
+    static int sm_max_smem_optin = 0;
+    if (sm_max_smem_optin == 0) {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm_max_smem_optin,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (sm_max_smem_optin <= 0) sm_max_smem_optin = 49152;
+    }
+    if ((int)smem > sm_max_smem_optin) return cudaErrorInvalidValue;
     int threads = 512;
     cudaFuncSetAttribute(dn_chunked_fwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -900,6 +912,18 @@ extern "C" cudaError_t launch_dn_chunk_parallel_fwd(
     size_t smem_fp32 = ((size_t)Dk * Dv + 2 * (size_t)C * C + 16 * 256 + 3 * C) * sizeof(float);
     size_t smem_bf16 = ((size_t)Dk * (Dv/2) + 4 * (size_t)C * Dk + (size_t)C * Dv + (size_t)C * C) * sizeof(__nv_bfloat16);
     size_t smem = smem_fp32 + smem_bf16;
+    // ~217 KB. Use models/qwen35_0p8b/dn_chunked_3090.cu instead on
+    // SM<90 — that kernel re-tiles to V_SPLITS=4 + C=32 to fit the
+    // 99 KB SM86 cap. Refuse to launch this B200-shaped variant on
+    // hardware that can't host the smem.
+    static int sm_max_smem_optin = 0;
+    if (sm_max_smem_optin == 0) {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm_max_smem_optin,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (sm_max_smem_optin <= 0) sm_max_smem_optin = 49152;
+    }
+    if ((int)smem > sm_max_smem_optin) return cudaErrorInvalidValue;
     int threads = 512;
     cudaFuncSetAttribute(dn_chunk_parallel_fwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,

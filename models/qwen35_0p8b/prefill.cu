@@ -1471,7 +1471,15 @@ extern "C" void launch_prefill_bf16(
     static cublasHandle_t cublas = nullptr;
     static void *cublas_workspace = nullptr;
     static cudaStream_t capture_stream = nullptr;
-    static constexpr size_t CUBLAS_WORKSPACE_BYTES = 32ull * 1024 * 1024;  // 32 MB, fits sm_100 recommended
+    // cuBLAS workspace size — per NVIDIA's recommended-sizes table:
+    //   Hopper / Blackwell  -> 32 MB (more split-K options at large GEMMs)
+    //   Ampere and earlier  ->  4 MB (smaller heuristic table; bigger
+    //                          workspace is wasted on a 24 GB consumer card)
+    int dev_for_ws = 0; cudaGetDevice(&dev_for_ws);
+    int cc_major = 0;
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev_for_ws);
+    const size_t CUBLAS_WORKSPACE_BYTES =
+        (cc_major >= 9 ? 32ull : 4ull) * 1024 * 1024;
     if (!cublas) {
         cublasCreate(&cublas);
         cublasSetMathMode(cublas, CUBLAS_DEFAULT_MATH);

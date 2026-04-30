@@ -482,6 +482,18 @@ extern "C" cudaError_t launch_dn_bwd(
     // 4 Dv-sized (s_v,s_dy,s_delta,s_d_delta) + 256-thread reduction.
     size_t smem = (3 * Dk * Dv + 2 * Dk + 4 * Dv + 256) * sizeof(float);
     int threads = 256;
+    // ~196 KB shared. SM86 (RTX 3090) caps per-block dynamic shared at
+    // ~99 KB even with the opt-in carveout — this kernel can only run on
+    // SM_90+. Surface a clean error rather than a confusing
+    // cudaErrorInvalidValue from the hidden cudaFuncSetAttribute.
+    static int sm_max_smem_optin = 0;
+    if (sm_max_smem_optin == 0) {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm_max_smem_optin,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (sm_max_smem_optin <= 0) sm_max_smem_optin = 49152;
+    }
+    if ((int)smem > sm_max_smem_optin) return cudaErrorInvalidValue;
     cudaFuncSetAttribute(dn_bwd_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem);

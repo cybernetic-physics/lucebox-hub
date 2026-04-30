@@ -9,13 +9,26 @@ Usage:
     python3 test_gemm.py
 """
 import os
+import sys
 import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 CUTLASS_DIR = os.environ.get("CUTLASS_DIR", "/root/cutlass")
 # CUTLASS Blackwell kernels need the 'a' arch variant (tcgen05, TMA).
+# These intrinsics don't exist on Ampere/Hopper/Ada — refuse the build
+# rather than emit a misleading sm_86a / sm_90a binary that crashes at
+# the first kernel launch. The trainer's hot path doesn't use anything
+# from cutlass_train_C on RTX 3090; cuBLAS already routes to the
+# CUTLASS sm_80 tensor-op kernels under the hood.
 cc = torch.cuda.get_device_capability()
+if cc[0] < 10:
+    sys.stderr.write(
+        f"cutlass_train: skipping build on SM{cc[0]}{cc[1]} "
+        f"(requires sm_100+ tcgen05/TMA). The trainer falls back to "
+        f"the cuBLAS+graph forward / math FA bwd path on Ampere.\n"
+    )
+    sys.exit(0)
 arch = f"sm_{cc[0]}{cc[1]}a"
 
 setup(

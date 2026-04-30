@@ -1036,6 +1036,30 @@ extern "C" void launch_prefill_bf16_mega(
     float *lm_bmv, int *lm_bmi,
     cudaStream_t stream)
 {
+    // The cooperative megakernel allocates 104 KB dynamic shared per
+    // block. SM86 (RTX 3090) caps per-block dynamic shared at ~99 KB
+    // even with the opt-in carveout, so cudaFuncSetAttribute would
+    // succeed on B200 (228 KB cap) but fail at launch on Ampere with
+    // an opaque "invalid argument" error. Detect and fall back so the
+    // caller sees a clear error instead.
+    static int sm_max_smem_optin = 0;
+    if (sm_max_smem_optin == 0) {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm_max_smem_optin,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (sm_max_smem_optin <= 0) sm_max_smem_optin = 49152;  // pre-Volta default
+    }
+    if ((int)MEGA_SHMEM_BYTES > sm_max_smem_optin) {
+        fprintf(stderr,
+            "[prefill_bf16_mega] this kernel needs %d KB dynamic shared "
+            "but the device caps at %d KB (SM%d capability). Use "
+            "prefill_bf16 instead — it's the cuBLAS+graph path that "
+            "runs on every Ampere+ GPU.\n",
+            (int)MEGA_SHMEM_BYTES / 1024,
+            sm_max_smem_optin / 1024,
+            (int)(sm_max_smem_optin >= 99000 ? 86 : 70));
+        return;
+    }
     static int cached_blocks = 0;
     if (cached_blocks == 0) cached_blocks = mega_launch_blocks();
 
