@@ -15,11 +15,9 @@ sys.path.insert(0, "/home/freiza/lucebox-hub/models/qwen35_0p8b/trainer")
 import train_megakernel_C  # noqa: F401
 
 
-def test_bwd_lora_linear():
-    print("=== bwd_lora_linear (5 inner kernels, ws_lora_h + ws_grad_lora_h) ===")
+def _check_bwd_lora_linear(S, K_in, K_out, R, scaling=2.0, label=""):
+    print(f"=== bwd_lora_linear {label} S={S} K_in={K_in} K_out={K_out} R={R} ===")
     torch.manual_seed(0)
-    S, K_in, K_out, R = 30, 1024, 1024, 8
-    scaling = 2.0
     x = (torch.randn(S, K_in, device='cuda') * 0.1).to(torch.bfloat16).contiguous()
     A = (torch.randn(K_in, R, device='cuda') * 0.1).to(torch.bfloat16).contiguous()
     B = (torch.randn(R, K_out, device='cuda') * 0.1).to(torch.bfloat16).contiguous()
@@ -52,6 +50,15 @@ def test_bwd_lora_linear():
         break
     else:
         print("  PASS — all 8 iters bit-identical")
+
+
+def test_bwd_lora_linear():
+    # Cover all the shapes the trainer actually uses on Qwen3.5-0.8B.
+    _check_bwd_lora_linear(30, 1024, 1024, 8, label="(self_attn.q identity)")
+    _check_bwd_lora_linear(30, 1024, 3584, 8, label="(mlp.gate / mlp.up)")
+    _check_bwd_lora_linear(30, 3584, 1024, 8, label="(mlp.down)")
+    _check_bwd_lora_linear(30, 1024, 2048, 8, label="(self_attn.q_proj)")
+    _check_bwd_lora_linear(30, 1024, 512,  8, label="(self_attn.k/v_proj)")
 
 
 def test_bwd_swiglu():
