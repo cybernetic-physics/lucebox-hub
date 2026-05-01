@@ -982,14 +982,16 @@ def run_layer_walking_bwd(
     if _trace:
         print(f"  [bwd] entry  dh.norm={float(dh.norm()):.4e}  "
               f"max|dh|={float(dh.abs().max()):.4e}")
-    # Diagnostic guard: if the input gradient already contains NaN/Inf, bail
-    # with a clear error rather than propagating garbage through 24 layers.
-    if not torch.isfinite(dh).all():
-        raise RuntimeError(
-            f"run_layer_walking_bwd: grad_h_pre_norm has non-finite values "
-            f"(NaN={int(torch.isnan(dh).sum())}, "
-            f"Inf={int(torch.isinf(dh).sum())}, total={dh.numel()})"
-        )
+    # Diagnostic guard — gated behind MEGAKERNEL_BWD_DEBUG_CHECKS because
+    # `.all()` triggers a CPU sync that breaks CUDA-graph capture. The
+    # bwd path is stable post-690d8c1 / ebb57dd; this is dev-only.
+    if _os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
+        if not torch.isfinite(dh).all():
+            raise RuntimeError(
+                f"run_layer_walking_bwd: grad_h_pre_norm has non-finite values "
+                f"(NaN={int(torch.isnan(dh).sum())}, "
+                f"Inf={int(torch.isinf(dh).sum())}, total={dh.numel()})"
+            )
 
     fa_idx = N_FA_TOTAL - 1
     dn_idx = N_DN_TOTAL - 1

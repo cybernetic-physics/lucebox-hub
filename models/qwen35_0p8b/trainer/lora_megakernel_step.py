@@ -56,6 +56,7 @@ Total: ~7-8 engineer-days for the full Slice B.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -561,17 +562,20 @@ def kernel_loss_autograd(
     sc, saves = _train_step_forward(
         handle, full, lora_flat, lora_rank, lora_scaling,
     )
-    torch.cuda.synchronize()  # wait for the forward kernel to commit
-    # Sanity-check the kernel's hidden output before we feed it to autograd.
     h_kernel = sc["hidden"].view(S, HIDDEN)
-    if not torch.isfinite(h_kernel).all():
-        raise RuntimeError(
-            f"kernel_loss_autograd: prefill_bf16_train_step produced "
-            f"non-finite hidden state "
-            f"(NaN={int(torch.isnan(h_kernel).sum())}, "
-            f"Inf={int(torch.isinf(h_kernel).sum())}, "
-            f"total={h_kernel.numel()})"
-        )
+    # Optional debug guard — `cuda.synchronize()` and `.all().item()` both
+    # break CUDA-graph capture, so the check is gated. When the kernel-bwd
+    # path is stable (it is, post-690d8c1), nothing should be non-finite.
+    if os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
+        torch.cuda.synchronize()
+        if not torch.isfinite(h_kernel).all():
+            raise RuntimeError(
+                f"kernel_loss_autograd: prefill_bf16_train_step produced "
+                f"non-finite hidden state "
+                f"(NaN={int(torch.isnan(h_kernel).sum())}, "
+                f"Inf={int(torch.isinf(h_kernel).sum())}, "
+                f"total={h_kernel.numel()})"
+            )
 
     # Detach and clone sc["hidden"] into a leaf tensor with requires_grad.
     # The kernel's own buffer is opaque to autograd; we want grad routing
@@ -597,17 +601,16 @@ def kernel_loss_autograd(
     # using fla directly. Saves are keyed by absolute layer index.
     # MEGAKERNEL_DEBUG_SKIP_DN_PRECOMPUTE=1 disables this for bisection;
     # bwd path will fall back to in-bwd dn_attn_forward.
-    import os as _os
-    if hf_model is not None and _os.environ.get(
+    if hf_model is not None and os.environ.get(
             "MEGAKERNEL_DEBUG_SKIP_DN_PRECOMPUTE") != "1":
         saves["dn_attn_saves"] = precompute_dn_saves(hf_model, saves)
-    # Force every previously-launched kernel (prefill train_step's per-
-    # layer activation save kernels, the autograd loss graph's matmuls,
-    # the DN-saves recompute via fla/Triton) to commit before we hand
-    # the saves and grad_h_pre_norm off to the layer-walking backward.
-    # Without this, the bwd is racy on RTX 3090 — see grad_harness
-    # stability test.
-    torch.cuda.synchronize()
+    # Historic note: this used to be an unconditional cuda.synchronize()
+    # to work around a race where the bwd read garbage from the FA saves
+    # ~33% of the time. Replaced cuDNN FA-2 with the deterministic math
+    # fallback in 690d8c1 — the race is gone. Sync now gated behind
+    # MEGAKERNEL_BWD_DEBUG_CHECKS so it doesn't break CUDA-graph capture.
+    if os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
+        torch.cuda.synchronize()
     return {
         "loss": loss.detach(),
         "grad_h_pre_norm": grad_h_pre_norm,    # [S, HIDDEN] fp32

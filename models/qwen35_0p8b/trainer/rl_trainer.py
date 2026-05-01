@@ -304,9 +304,15 @@ class LoraMegakernelTrainer:
                 print(f"[LoraMegakernelTrainer] patched {_n} GatedDeltaNet "
                       f"layers with CUDA kernel")
 
+        # capturable=True lets the optimizer's step() be traced inside a
+        # CUDA graph (required for end-to-end forward_backward+optim_step
+        # graph capture in #20). fused AdamW is the fast path; capturable
+        # has minimal overhead in eager mode.
         optimizer = torch.optim.AdamW(
             [p for p in hf_model.parameters() if p.requires_grad],
             lr=1e-4,
+            capturable=True,
+            fused=True,
         )
 
         session = _Session(
@@ -497,15 +503,14 @@ class LoraMegakernelTrainer:
             grad_h_pre_norm = out["grad_h_pre_norm"]
             saves = out["saves"]
             scratch = out["scratch"]
-            # FIXME(unstable): without an explicit sync here, downstream
-            # bwd kernels read garbage from the activation save buffers
-            # ~33% of the time on RTX 3090, producing wildly large or NaN
-            # gradients. Loss is always deterministic (forward is fine);
-            # only the bwd reads are racy. Inserting a synchronize here
-            # is a workaround — root-cause is likely a stream mismatch
-            # between cuDNN FA-2's lse/o save writes and the subsequent
-            # bwd kernel reads. See experiments/grad_harness.py.
-            torch.cuda.synchronize()
+            # Note: this used to need an explicit cuda.synchronize() to
+            # work around a race where downstream bwd kernels read garbage
+            # from FA-2 lse/o saves ~33% of the time. Replaced cuDNN FA-2
+            # with the deterministic math fallback in 690d8c1, so the sync
+            # is no longer required. Gated behind MEGAKERNEL_BWD_DEBUG_CHECKS
+            # for paranoid debugging.
+            if os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
+                torch.cuda.synchronize()
 
             # Scale grad_h_pre_norm by 1/N so the accumulated gradient
             # corresponds to mean-loss across items (matches HF+PEFT
