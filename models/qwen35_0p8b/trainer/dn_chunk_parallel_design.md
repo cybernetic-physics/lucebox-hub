@@ -244,3 +244,86 @@ deferred until B200 work resumes.
   TF32, with sub-chunk decomposition for K@K^T:
   3-4 engineer-days (kernel rewrite, validation against fla, tuning).
 - Phase B (deferred): 1-2 days on top.
+
+## Bench: actual gap to fla at long S (2026-04-30)
+
+Updated bench (`experiments/bench_dn_chunked_3090.py` at H=16, Dk=Dv=128):
+
+|     S |   fla ms |  ours ms | fla/ours |
+|------:|---------:|---------:|---------:|
+|   128 |     0.54 |     0.14 |    3.88x |
+|   256 |     0.48 |     0.28 |    1.68x |
+|   512 |     0.49 |     0.56 |    0.88x |
+|  1024 |     0.47 |     1.10 |    0.43x |
+|  2048 |     0.48 |     2.18 |    0.22x |
+|  4096 |     0.53 |     4.35 |    0.12x |
+|  8192 |     0.94 |     8.67 |    0.11x |
+| 16384 |     1.77 |    17.30 |    0.10x |
+| 32768 |     3.44 |    34.56 |    0.10x |
+
+Note: fla's time is essentially CONSTANT for S ≤ 4K (~0.5 ms — launch-
+bound) and only starts scaling at S ≥ 8K. Our kernel scales linearly
+throughout (per-chunk overhead dominates).
+
+At S=32K we're **10x slower per call** (34.6 vs 3.4 ms). Per layer
+that's a 31 ms gap; across 18 DN layers that's 558 ms — slightly
+larger than the 486 ms total prefill gap to SGLang at S=32K
+(1740 ms vs 1254 ms). Closing this entirely would put us ahead of
+SGLang at every shape.
+
+## fla architecture audit (deeper than the chunk_fwd.py audit)
+
+Reading `chunk_delta_h.py:chunk_gated_delta_rule_fwd_kernel_h_blockdim64`
+revealed fla splits the work across **three kernels**, not one:
+
+1. **`chunk_gated_delta_rule_fwd_intra`** (`chunk_fwd.py`) — per-chunk
+   WY representation: produces `w`, `u`, `A` from `k`, `v`, `beta`, `g`.
+   PARALLELIZED across chunks AND heads (no inter-chunk dependency).
+   This is where the 10-block sub-chunked K@K^T + solve_tril runs.
+2. **`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`** (`chunk_delta_h.py`)
+   — the sequential recurrence over chunks. Reads pre-computed `w`,
+   `u`; produces `h` (per-chunk states) and `v_new`. Per block holds
+   state in registers as `b_h1..b_h4 = tl.zeros([BV, 64], fp32)`,
+   one slab per BK split (K=128 → 2 slabs).
+3. **`chunk_fwd_o`** (`chunk_o.py`) — output projection per chunk:
+   `o_chunk = q @ k.T * mask @ v_new + (q * exp_g_cs) @ h_chunk`.
+   PARALLELIZED across chunks.
+
+Our `dn_chunked_3090` does ALL three phases in one big sequential
+loop. That means our per-chunk inner loop carries:
+
+  - the per-chunk K@K^T + solve_tril (~30% of per-chunk time)
+  - the recurrence step (~30%)
+  - the output projection step (~40%)
+
+…all serialized inside the chunk dependence chain. fla pulls phases
+1 and 3 OUT of the dependence chain — they only need to be done once
+per chunk and don't depend on the inter-chunk state. With ~16K total
+chunks at S=32K (n_chunks × H), Phase 1 and Phase 3 run as massively
+parallel kernels saturating all 82 SMs, while only Phase 2 runs at
+the 16-block-per-head bottleneck.
+
+Memory: fla pays for the intermediates. At S=32K, H=16, K=V=128:
+`A`: 128 MB, `w`: 128 MB, `u`: 128 MB, `h`: 540 MB. Total ~924 MB.
+For inference this is large but fits in 24 GB. For training it adds
+to the activation budget but is offset by avoiding the bwd recompute.
+
+## Revised effort estimate (after deeper audit)
+
+The Phase A "single-kernel rewrite" approach is INSUFFICIENT to
+match fla's perf because the dependency chain is wrong. The right
+target is fla's 3-kernel split:
+
+- 3-kernel rewrite: 5-7 engineer-days
+  - Phase 1 kernel (per-chunk WY): 2 days
+  - Phase 2 kernel (sequential recurrence with register state): 2 days
+  - Phase 3 kernel (per-chunk output projection): 1-2 days
+  - Wiring + validation + tuning: 1 day
+- Memory budget audit on the 24GB constraint: 0.5 day
+
+Pragmatic alternative: **route DN inference at S ≥ 1024 to
+fla.chunk_gated_delta_rule** via a Python-side hook in the prefill
+flow. This requires breaking the C++ prefill into "before DN" /
+"DN" / "after DN" phases at the Python boundary, but reuses fla's
+already-tuned kernels and avoids the 5-7 day rewrite. Estimate
+1-2 days for the Python integration + graph capture rework.
