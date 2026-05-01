@@ -327,3 +327,104 @@ flow. This requires breaking the C++ prefill into "before DN" /
 "DN" / "after DN" phases at the Python boundary, but reuses fla's
 already-tuned kernels and avoids the 5-7 day rewrite. Estimate
 1-2 days for the Python integration + graph capture rework.
+
+## Build-spec for the 3-kernel rewrite (next session)
+
+When picking this up, the work is structured as follows:
+
+### Files to create
+
+1. `models/qwen35_0p8b/dn_chunked_3090_v2.cu` — new file with three
+   `__global__` kernels and one `launch_dn_chunked_3090_v2` entry
+   that orchestrates them. Keep the original `dn_chunked_3090.cu`
+   intact; gate v2 behind `MEGAKERNEL_DN_USE_PARALLEL_SCAN=1`.
+2. `experiments/test_dn_chunked_3090_v2.py` — bit-correctness test
+   vs `dn_chunked_3090` (original) AND vs fla.chunk_gated_delta_rule
+   at S in {128, 1024, 8192, 32768}, H=16, Dk=Dv=128.
+3. `experiments/bench_dn_chunked_3090_v2.py` — perf harness
+   (existing `bench_dn_chunked_3090.py` extended to compare v1 / v2 /
+   fla side-by-side).
+
+### Kernel 1: `dn3090v2_intra_kernel` (per-chunk WY rep)
+
+Computes `w[chunk, head, t, k]`, `u[chunk, head, t, v]` from
+`k`, `v`, `beta`, `g`. PARALLEL across (head, chunk). Grid:
+`(n_chunks, H)`. Per block: BT=64 chunk, processes 1 head's
+[BT, Dk] K and [BT, Dv] V slices.
+
+Internal layout: 4 sub-chunks of BC=16 each. Computes 10
+lower-triangular [BC, BC] tiles of `K @ K.T`, applies beta and
+gate scaling, runs sequential forward substitution PER tile (just
+16 iterations, fits in registers), then block-merges the 4 diagonal
+tiles into the full [BT, BT] (I+A)^-1.
+
+Output: `A[n_chunks, H, BT, BT]` fp32 (kept for bwd) and `w`, `u`
+bf16 for the recurrence.
+
+### Kernel 2: `dn3090v2_recurrence_kernel` (sequential per head)
+
+Sequential walk of the recurrence. Grid: `(K/BK, H)` where BK=64
+splits the K axis. Per block: 1 head, 1 K-slice. Holds state in
+REGISTERS as `b_h1, b_h2 = float[BV=32, 64]` slabs (one per BK
+split).
+
+Per chunk in the (sequential) chunk loop:
+  - Load `w[chunk, h, :, k_slice]` from kernel 1's output
+  - `b_v = b_w @ b_h` (one BV column at a time)
+  - Apply gate: `b_v = u - b_v` (residual), then scale by exp(g_last - g_t) per row
+  - Scale `b_h *= exp(g_last)`
+  - Load k.T from chunk's K range
+  - `b_h += b_k @ b_v.T`
+
+Output: `h[n_chunks, H, K, V]` fp32 (per-chunk states for kernel 3
+and for bwd) and final state.
+
+### Kernel 3: `dn3090v2_o_kernel` (per-chunk output projection)
+
+Computes `y[chunk, t, h, v] = q[t] @ k.T * mask @ v_new[chunk] +
+(q[t] * exp_g_cs[t]) @ h[chunk]`. PARALLEL across (chunk, head).
+
+Grid: `(n_chunks, H, V/BV)` where BV=32. Per block: 1 chunk, 1 head,
+1 V-slice.
+
+Output: `y[S, H, V]` bf16 — the final per-token output.
+
+### Memory budget (S=32K, H=16, Dk=Dv=128, BT=64)
+
+  - `A`: [n_chunks=512, H=16, BT=64, BT=64] fp32 = 128 MB
+  - `w`: [S=32K, H=16, K=128] bf16 = 128 MB
+  - `u`: [S=32K, H=16, V=128] bf16 = 128 MB
+  - `h`: [n_chunks=512, H=16, K=128, V=128] fp32 = 540 MB
+
+Total: 924 MB temporary. Fits in 24 GB but is significant. For
+inference we can free `A` after kernel 2 (only needed for bwd).
+For the prefill graph, allocate these as scratch buffers and
+reuse across layers.
+
+### Validation gates
+
+  1. `dn3090v2_intra_kernel` output `A` matches fla's `chunk_fwd_o`
+     intermediate (compare via `chunk_gated_delta_rule_fwd_intra`'s
+     return value `A`) — bf16 tolerance.
+  2. `dn3090v2_recurrence_kernel` output `h[chunk]` matches fla's
+     `chunk_gated_delta_rule_fwd_h` per-chunk state — fp32 1e-5
+     tolerance.
+  3. End-to-end y[S, H, V] matches fla's chunk_gated_delta_rule
+     output — bf16 tolerance.
+  4. Bench ≥ 0.8× of fla at S=32K (within 25%). Stretch goal:
+     ≥ 1.0× via better autotuning.
+
+### Effort
+
+  - Kernel 1 (intra): 1.5 days
+  - Kernel 2 (recurrence with register state): 2 days  ← hardest
+  - Kernel 3 (output projection): 1 day
+  - Validation suite: 0.5 day
+  - Bench + tuning: 1 day
+  - Wiring into prefill.cu: 0.5 day
+  - Total: 6.5 engineer-days
+
+This is genuine kernel-engineering work, not a chat-bot session
+deliverable. The design doc above (and the fla source under
+`/home/freiza/lucebox-hub/.venv-3090/lib/python3.10/site-packages/fla/ops/`)
+is the spec.
