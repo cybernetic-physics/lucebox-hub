@@ -204,13 +204,16 @@ def layer_mlp_bwd(
     # mlp_inter = silu(gate) * up. We didn't save gate/up — recompute them.
     # gate = normalized_post_attn @ gate_W.T + scaling * (npa @ gate_A) @ gate_B
     # Same pattern for up.
+    #
+    # Use bf16 GEMMs (npa, gate_W, gate_A, gate_B are all bf16) so cuBLAS
+    # picks the tensor-core path (cutlass_80_tensorop_bf16_*) instead of
+    # the fp32 SIMT path (ampere_sgemm_*). The fp32 path was ~3x slower
+    # at our shapes and contributed 18 ms / 8% of step time at P=1024
+    # (profile in experiments/profile_kernel_bwd.py). bf16 also matches
+    # the forward path's GEMM precision for cleaner numerics.
     npa = normalized_post_attn
-    gate = npa.float() @ gate_W.float().t()
-    gate = gate + lora_scaling * ((npa.float() @ gate_A.float()) @ gate_B.float())
-    up = npa.float() @ up_W.float().t()
-    up = up + lora_scaling * ((npa.float() @ up_A.float()) @ up_B.float())
-    gate_bf = gate.to(torch.bfloat16).contiguous()
-    up_bf = up.to(torch.bfloat16).contiguous()
+    gate_bf = (npa @ gate_W.t() + lora_scaling * ((npa @ gate_A) @ gate_B)).contiguous()
+    up_bf   = (npa @ up_W.t()   + lora_scaling * ((npa @ up_A)   @ up_B)).contiguous()
 
     dgate, dup = swiglu_bwd(gate_bf, up_bf, dmlp_inter)
 
