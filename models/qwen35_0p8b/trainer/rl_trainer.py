@@ -456,6 +456,112 @@ class LoraMegakernelTrainer:
             }
 
     # ---------- Slice B.3b kernel-driven backward path ----------
+    def _capture_kernel_step(self, *, s: "_Session", handle, P: int, T: int):
+        """Capture one (P, T) shape into a CUDA graph.
+
+        Returns a `_GraphedStep` carrying static input/output buffers and
+        the captured graph. Replay copies new prompt/targets into the
+        static buffers, replays, then reads loss out.
+
+        Captures forward+bwd+grad-scatter; optim_step stays eager (it's
+        called once per training-step batch, not per item, so it's
+        a poor fit for per-item graphs).
+
+        Grad correctness across replays: the captured graph writes
+        gradients into PEFT params' `.grad` tensors. Each `param.grad`
+        must keep pointing at the SAME underlying storage across
+        replays. We pin `param.grad = static_grad_buf[i]` before
+        capture and re-pin before every replay. Callers that do
+        `zero_grad(set_to_none=True)` between calls will null out
+        `param.grad`; the re-pin restores it to the static buffer.
+        """
+        from lora_pack import pack_peft_to_flat, scatter_flat_grads_to_peft
+        from lora_megakernel_step import kernel_loss_autograd
+        from lora_layer_bwd_skel import run_layer_walking_bwd
+
+        static_prompt  = torch.zeros(P, dtype=torch.int32, device="cuda")
+        static_targets = torch.zeros(T, dtype=torch.int32, device="cuda")
+        static_loss    = torch.zeros((),  dtype=torch.float32, device="cuda")
+
+        # Pin per-LoRA-param static grad buffers. scatter_flat_grads_to_peft
+        # uses `accumulate=True` → param.grad.add_(flat); the recorded
+        # graph thus holds pointers into these static buffers. Set
+        # param.grad to each buffer BEFORE warmup so the address is
+        # stable for capture.
+        # scatter_flat_grads_to_peft casts to PEFT param dtype (bf16) and
+        # writes via `param.grad += ...`. Match dtype so the assignment
+        # `param.grad = static_buf` doesn't fail.
+        lora_params = [p for p in s.hf_model.parameters() if p.requires_grad]
+        static_grads = [torch.zeros_like(p) for p in lora_params]
+        for p, gbuf in zip(lora_params, static_grads):
+            p.grad = gbuf
+
+        def _step():
+            lora_flat = pack_peft_to_flat(s.hf_model, s.lora_rank)
+            out = kernel_loss_autograd(
+                handle=handle, prompt_tokens=static_prompt,
+                target_tokens=static_targets,
+                lora_flat=lora_flat, lora_rank=s.lora_rank,
+                lora_scaling=s.lora_scaling, hf_model=s.hf_model,
+            )
+            flat_grads = run_layer_walking_bwd(
+                grad_h_pre_norm=out["grad_h_pre_norm"],
+                saves=out["saves"], lora_flat=lora_flat,
+                final_norm_weight=handle.final_norm_weight,
+                hf_model=s.hf_model, lora_rank=s.lora_rank,
+                lora_scaling=s.lora_scaling,
+                fa_k_cache=out["scratch"]["fa_k_cache"],
+                fa_v_cache=out["scratch"]["fa_v_cache"],
+            )
+            scatter_flat_grads_to_peft(s.hf_model, flat_grads, accumulate=True)
+            static_loss.copy_(out["loss"])
+
+        # Side-stream warmup, then capture. Mirrors cuda_graph_train.py.
+        cap_s = torch.cuda.Stream()
+        cap_s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap_s):
+            for _ in range(2):
+                _step()
+        torch.cuda.current_stream().wait_stream(cap_s)
+        torch.cuda.synchronize()
+
+        # Zero static grads after warmup so the captured replay starts
+        # from a clean accumulator (warmup polluted them).
+        for gbuf in static_grads:
+            gbuf.zero_()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            _step()
+
+        class _GraphedStep:
+            def __init__(self_):
+                self_.P = P
+                self_.T = T
+                self_.graph = g
+                self_.static_prompt = static_prompt
+                self_.static_targets = static_targets
+                self_.static_loss = static_loss
+                self_.static_grads = static_grads
+                self_.lora_params = lora_params
+
+            def run(self_, prompt, targets):
+                # Re-pin .grad — caller may have done set_to_none=True
+                # between calls, which would invalidate the graph's
+                # writes. Re-pinning restores the static buffer and
+                # zeroes it (since accumulate=True inside the graph
+                # would otherwise compound across replays).
+                for p, gbuf in zip(self_.lora_params, self_.static_grads):
+                    if p.grad is not gbuf:
+                        p.grad = gbuf
+                    gbuf.zero_()
+                self_.static_prompt.copy_(prompt)
+                self_.static_targets.copy_(targets)
+                self_.graph.replay()
+                return self_.static_loss
+
+        return _GraphedStep()
+
     def _forward_backward_kernel_path(
         self, *, s: "_Session", items: list, total_data_len: int,
     ) -> dict[str, Any]:
@@ -469,6 +575,11 @@ class LoraMegakernelTrainer:
 
         After the loop, optim_step() (the HF+PEFT one) consumes the
         scattered grads. No code change to optim_step.
+
+        With MEGAKERNEL_USE_GRAPH=1 this routes per-item work through a
+        per-(P,T)-shape CUDA graph cache. First call at a shape captures;
+        subsequent calls replay (~20% step-time win at P=256 from
+        amortizing the ~7600 kernel launches).
         """
         # Lazy imports to avoid pulling in fla / extensions when the kernel
         # path is disabled. The trainer is normally imported at startup
@@ -485,54 +596,71 @@ class LoraMegakernelTrainer:
                                                        verbose=False)
         handle = self._kernel_base_handle
 
+        use_graph = os.environ.get("MEGAKERNEL_USE_GRAPH") == "1"
+        if not hasattr(self, "_kernel_graph_cache"):
+            self._kernel_graph_cache: dict[tuple[int, int], object] = {}
+
         lora_flat = pack_peft_to_flat(s.hf_model, s.lora_rank)
 
         per_losses: list[float] = []
         outputs: list[dict] = []
         for prompt, targets in items:
-            out = kernel_loss_autograd(
-                handle=handle,
-                prompt_tokens=prompt,
-                target_tokens=targets,
-                lora_flat=lora_flat,
-                lora_rank=s.lora_rank,
-                lora_scaling=s.lora_scaling,
-                hf_model=s.hf_model,
-            )
-            loss = out["loss"]
-            grad_h_pre_norm = out["grad_h_pre_norm"]
-            saves = out["saves"]
-            scratch = out["scratch"]
-            # Note: this used to need an explicit cuda.synchronize() to
-            # work around a race where downstream bwd kernels read garbage
-            # from FA-2 lse/o saves ~33% of the time. Replaced cuDNN FA-2
-            # with the deterministic math fallback in 690d8c1, so the sync
-            # is no longer required. Gated behind MEGAKERNEL_BWD_DEBUG_CHECKS
-            # for paranoid debugging.
-            if os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
-                torch.cuda.synchronize()
+            P_item = int(prompt.numel())
+            T_item = int(targets.numel())
+            shape_key = (P_item, T_item)
 
-            # Scale grad_h_pre_norm by 1/N so the accumulated gradient
-            # corresponds to mean-loss across items (matches HF+PEFT
-            # path's `(total_loss/N).backward()` convention).
-            scale = 1.0 / max(len(items), 1)
-            grad_h_pre_norm = grad_h_pre_norm * scale
+            if use_graph:
+                graphed = self._kernel_graph_cache.get(shape_key)
+                if graphed is None:
+                    graphed = self._capture_kernel_step(
+                        s=s, handle=handle, P=P_item, T=T_item,
+                    )
+                    self._kernel_graph_cache[shape_key] = graphed
+                loss = graphed.run(prompt, targets)
+            else:
+                out = kernel_loss_autograd(
+                    handle=handle,
+                    prompt_tokens=prompt,
+                    target_tokens=targets,
+                    lora_flat=lora_flat,
+                    lora_rank=s.lora_rank,
+                    lora_scaling=s.lora_scaling,
+                    hf_model=s.hf_model,
+                )
+                loss = out["loss"]
+                grad_h_pre_norm = out["grad_h_pre_norm"]
+                saves = out["saves"]
+                scratch = out["scratch"]
+                # Note: this used to need an explicit cuda.synchronize() to
+                # work around a race where downstream bwd kernels read garbage
+                # from FA-2 lse/o saves ~33% of the time. Replaced cuDNN FA-2
+                # with the deterministic math fallback in 690d8c1, so the sync
+                # is no longer required. Gated behind MEGAKERNEL_BWD_DEBUG_CHECKS
+                # for paranoid debugging.
+                if os.environ.get("MEGAKERNEL_BWD_DEBUG_CHECKS") == "1":
+                    torch.cuda.synchronize()
 
-            flat_grads = run_layer_walking_bwd(
-                grad_h_pre_norm=grad_h_pre_norm,
-                saves=saves,
-                lora_flat=lora_flat,
-                final_norm_weight=handle.final_norm_weight,
-                hf_model=s.hf_model,
-                lora_rank=s.lora_rank,
-                lora_scaling=s.lora_scaling,
-                fa_k_cache=scratch["fa_k_cache"],
-                fa_v_cache=scratch["fa_v_cache"],
-            )
+                # Scale grad_h_pre_norm by 1/N so the accumulated gradient
+                # corresponds to mean-loss across items (matches HF+PEFT
+                # path's `(total_loss/N).backward()` convention).
+                scale = 1.0 / max(len(items), 1)
+                grad_h_pre_norm = grad_h_pre_norm * scale
 
-            # Scatter into PEFT params' .grad. Accumulate across items.
-            scatter_flat_grads_to_peft(s.hf_model, flat_grads,
-                                        accumulate=True)
+                flat_grads = run_layer_walking_bwd(
+                    grad_h_pre_norm=grad_h_pre_norm,
+                    saves=saves,
+                    lora_flat=lora_flat,
+                    final_norm_weight=handle.final_norm_weight,
+                    hf_model=s.hf_model,
+                    lora_rank=s.lora_rank,
+                    lora_scaling=s.lora_scaling,
+                    fa_k_cache=scratch["fa_k_cache"],
+                    fa_v_cache=scratch["fa_v_cache"],
+                )
+
+                # Scatter into PEFT params' .grad. Accumulate across items.
+                scatter_flat_grads_to_peft(s.hf_model, flat_grads,
+                                            accumulate=True)
 
             lv = float(loss.item())
             per_losses.append(lv)
