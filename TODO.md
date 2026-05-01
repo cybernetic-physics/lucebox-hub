@@ -90,6 +90,35 @@ benchmark on, fused AdamW, PEFT LoRA, torchao import-check stub.
 Qwen3.5 generate path with `InternalTorchDynamoError: accessing tensor
 output` — documented as a known PyTorch limitation, no fix needed.
 
+### #20 — fused mega-bwd, in progress (`f84d034`, `029f1e0`)
+
+Two phases shipped this round:
+
+  - bf16 GEMMs in `layer_mlp_bwd` gate/up recompute (`f84d034`).
+    Eliminates the 18 ms / 8% ampere_sgemm_128x64_tn fp32 path at
+    P=1024.
+  - cuBLAS bf16 GEMMs in `lora_linear_bwd` at S≥512 (`029f1e0`).
+    Replaces the 5 SIMT kernels (~33 blocks each on 82 SMs) with
+    cutlass_80_tensorop_bf16 calls. Shape-routed: SIMT for S<512
+    (1 binding launch wins on overhead), cuBLAS for S≥512.
+
+Bench progress (vs HF+PEFT at P × T=32):
+
+   P=64    1.02× → 1.04×  (parity, both paths small-S SIMT)
+   P=256   1.00× → 1.01×  (parity, both paths SIMT)
+   P=1024  0.58× → 0.72×  (244 ms → 194 ms = 24% step-time win)
+
+Remaining gap to flip ≥1.0× at P=1024 needs another ~30%. The big
+lever is **CUDA graph capture** of `forward_backward` to amortize
+the ~7 600 kernel launches per step into a single graph replay.
+Estimated 15-20% additional win — would put us at 0.85-0.90×, still
+short of flipping. A full flip likely requires reducing the long
+tail of small per-op launches (291× / 420× / 505× / 858× elementwise
++ direct_copy at 8-17 µs/launch) by composing them into per-layer
+mega-kernels.
+
+Tracked in task #20.
+
 ## Known infrastructure gotchas
 
   - The kernel forward's CUDA graph cache (`prefill.cu`) keys on
