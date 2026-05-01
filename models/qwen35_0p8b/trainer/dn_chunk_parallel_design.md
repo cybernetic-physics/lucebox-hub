@@ -179,3 +179,68 @@ After this lands, the chunk-parallel BACKWARD (Tier 1.6) can follow
 the same pattern using `dn_chunked_bwd_proto.py` as the algorithm
 spec — which is itself the next thing the trainer's full Tier 0.2
 custom backward depends on for the DN bwd path.
+
+## Algorithmic findings from fla source (2026-04-30)
+
+To inform a 3090-targeted rewrite, audited fla's
+`chunk_gated_delta_rule_fwd` decomposition. The 30% perf advantage at
+S=32K vs our `dn_chunked_3090` traces to three structural choices we
+should adopt:
+
+1. **`BT=64` chunk size with `BC=BT/4=16` sub-chunks.** fla never
+   materializes a 64×64 K@K^T matrix — it computes the lower
+   triangle of `BT×BT` as 10 separate `BC×BC = 16×16` tile products
+   (`chunk_fwd.py:117-120`: "all 10 lower-triangular [BC, BC] blocks
+   of K @ K^T"). That avoids the smem blowup we hit when trying
+   C=64 directly: 4 of our `C×Dk` bf16 buffers go from 8 KB → 16 KB
+   each (+32 KB) and our `C×C` fp32 buffers go from 4 KB → 16 KB
+   each (+24 KB), pushing the kernel from ~76 KB to ~140 KB at
+   V_SPLITS=4 — well over 99 KB. fla's sub-chunk decomposition
+   keeps the per-tile smem footprint at BC=16 sizes.
+2. **Register-resident state.** fla holds the recurrence state
+   in registers as `b_h1..b_h4 = tl.zeros([BV, 64], fp32)`
+   (`chunk_delta_h.py:81-95`), accumulating across BK splits.
+   `BV=32` and `BK=64` mean each register slab is 2048 fp32 = 8 KB
+   in registers; at K=128 (our Dk) there are 2 BK splits, so 16 KB
+   register state per block. Our kernel keeps state in shared mem
+   (16 KB at V_SPLITS=4) and pays a `state_fp32 → state_bf16` cast
+   every chunk to feed the wmma matmul. Going register-resident
+   eliminates the cast traffic and the bf16 mirror of the state
+   buffer (8 KB smem savings).
+3. **TF32 matmul instead of bf16 cast-and-wmma.** fla uses
+   `SOLVE_TRIL_DOT_PRECISION = tf32` on Ampere
+   (`chunk_fwd.py:17-20`). TF32 is 1.5× slower per-op than bf16
+   tensor cores on sm_86, but it eliminates the per-chunk fp32→bf16
+   cast and works directly on register-resident state. For inputs
+   that arrive as bf16 (q, k, v) we still cast on load, but the
+   STATE accumulation stays fp32 throughout. Compared to our path
+   (fp32 state in smem → bf16 cast in smem → wmma fp32 accumulator
+   → write back fp32 in smem), fla saves 2 round-trip casts per
+   chunk.
+
+### Implications for the 3090 rewrite
+
+The "parallel-scan" framing in the original design (sequential chunk
+ordering with global-state spin-wait sync) is orthogonal to the
+30% gap — fla's design is also sequential-per-head with the same
+recurrence structure. The win is the per-chunk inner loop, not the
+chunk parallelism. So:
+
+- **Phase A (high impact):** rewrite `dn_chunked_3090.cu`'s per-chunk
+  body using fla's sub-chunk + register-state + TF32 design. Keep
+  the existing `(H × V_SPLITS=4)` grid layout (fits 82 SMs in one
+  wave). Target: parity with fla on S=32K.
+- **Phase B (lower impact):** ALSO add chunk-parallel grid scheme.
+  Useful only on hardware where (H × V_SPLITS) doesn't already
+  saturate the SM count — i.e. NOT a 3090 win, but plausibly a
+  B200 win where 64 blocks leaves 84 SMs idle.
+
+Phase A is the right thing for 3090 specifically. Phase B is
+deferred until B200 work resumes.
+
+### Effort estimate (revised)
+
+- Phase A: refactor per-chunk body to register-resident state +
+  TF32, with sub-chunk decomposition for K@K^T:
+  3-4 engineer-days (kernel rewrite, validation against fla, tuning).
+- Phase B (deferred): 1-2 days on top.
