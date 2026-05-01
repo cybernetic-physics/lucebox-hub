@@ -56,6 +56,16 @@ LAYER_TYPE = _outer.LAYER_TYPE
 # Per-projection LoRA bwd helper
 # ---------------------------------------------------------------------------
 
+# Shape threshold for the cuBLAS path. Below this S, the SIMT C++ kernel
+# bundles 5 internal kernel launches into one binding call, which is
+# launch-overhead-cheaper than 5 separate cuBLAS calls — even though
+# cuBLAS individually is faster on tensor cores. Above this S, the
+# per-call cuBLAS compute speedup overwhelms the extra launch overhead.
+# Tuned empirically on RTX 3090: P=256 (S=288) regresses 14% on cuBLAS,
+# P=1024 (S=1056) wins 13%. Threshold 512 splits cleanly.
+_LORA_BWD_CUBLAS_MIN_S = 512
+
+
 def lora_linear_bwd(
     x: torch.Tensor,        # [S, K_in]   bf16  — input to forward
     A: torch.Tensor,        # [K_in, R]   bf16
@@ -66,14 +76,41 @@ def lora_linear_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (grad_x, grad_A, grad_B) for `y = x @ base_W.T + scaling * (x @ A) @ B`.
 
-    Combines our `bwd_lora_linear` kernel (LoRA contribution to grad_x +
-    grad_A + grad_B) with one cuBLAS GEMM for the base path's grad_x.
+    Math:
+       lora_h       = x @ A                                       [S, R]
+       grad_lora_h  = grad_y @ B.T                                [S, R]
+       grad_A       = scaling * x.T @ grad_lora_h                 [K_in, R]
+       grad_B       = scaling * lora_h.T @ grad_y                 [R, K_out]
+       grad_x       = scaling * grad_lora_h @ A.T  +  grad_y @ base_W   [S, K_in]
+
+    Two paths, shape-routed:
+      - S < 512: SIMT `bwd_lora_linear` kernel — bundles 5 internal
+        launches into one binding call. Launch-overhead-cheap.
+      - S >= 512: 5 cuBLAS bf16 GEMMs — tensor-core compute, saturates
+        the SMs. The SIMT kernel only launches ~33 blocks at S=1024
+        (vs 82 SMs); cuBLAS picks cutlass_80_tensorop_bf16_*.
+
+    Profile (experiments/profile_kernel_bwd.py at P=1024): the 5 SIMT
+    kernels contributed ~40 ms / 19% of step time across 96 calls;
+    cuBLAS path drops this to ~22 ms.
     """
     S, K_in = x.shape
     R = A.shape[1]
     K_out = B.shape[1]
-    # zero-init: the kernel accumulates into grad_A / grad_B (matches the
-    # test_bwd_mlp.py call convention, where torch.zeros is used).
+    grad_y_bf = grad_y.to(torch.bfloat16) if grad_y.dtype != torch.bfloat16 else grad_y
+
+    if S >= _LORA_BWD_CUBLAS_MIN_S:
+        # cuBLAS bf16 GEMM path (long S).
+        lora_h_bf = x @ A                                          # bf16 [S, R]
+        grad_lora_h_bf = grad_y_bf @ B.t()                         # bf16 [S, R]
+        grad_A = scaling * (x.t() @ grad_lora_h_bf).float()        # [K_in, R] fp32
+        grad_B = scaling * (lora_h_bf.t() @ grad_y_bf).float()     # [R, K_out] fp32
+        grad_x_lora = scaling * (grad_lora_h_bf @ A.t()).float()   # [S, K_in] fp32
+        grad_x_base = (grad_y_bf @ base_W).float()                 # [S, K_in] fp32
+        grad_x = grad_x_lora + grad_x_base
+        return grad_x, grad_A, grad_B
+
+    # SIMT C++ path (short S).
     grad_x = torch.zeros(S, K_in, dtype=torch.float32, device="cuda")
     grad_A = torch.zeros(K_in, R, dtype=torch.float32, device="cuda")
     grad_B = torch.zeros(R, K_out, dtype=torch.float32, device="cuda")
@@ -86,15 +123,6 @@ def lora_linear_bwd(
         ws_lora_h, ws_grad_lora_h,
         S, K_in, K_out, R, scaling,
     )
-    # Add base-path grad_x: d(y) @ base_W -> [S, K_in].
-    # Use bf16 inputs so cuBLAS picks the tensor-core GEMM kernel
-    # (cutlass_80_tensorop_bf16_*) instead of the fp32 SIMT path
-    # (cutlass_80_simt_sgemm_*). The latter is ~10× slower at our
-    # sizes. fp32 accumulator inside the GEMM keeps precision
-    # comparable; we cast back to fp32 to add to grad_x.
-    # Skip the cast if grad_y is already bf16 (bench harnesses sometimes
-    # pass fp32; the trainer always passes fp32).
-    grad_y_bf = grad_y.to(torch.bfloat16) if grad_y.dtype != torch.bfloat16 else grad_y
     grad_x_base = (grad_y_bf @ base_W).float()
     grad_x = grad_x + grad_x_base
     return grad_x, grad_A, grad_B
