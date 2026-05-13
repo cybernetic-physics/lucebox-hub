@@ -33,38 +33,75 @@ DN_CONV_KERNEL = 4
 LAYER_TYPE = [0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1]
 NVFP4_GROUP_SIZE = 32
 
+# cuBLASLt block-scaled FP4 LM-head contract (see kernel_gb10_nvfp4.cu).
+# The decoder quantizes a 16-row hidden tile to NVFP4 with UE4M3 group-16
+# scales per step, then runs `cublasLtMatmul` against the FP4 LM-head
+# weights for FP16 logits. These constants size the auxiliary buffers.
+LM_HEAD_TENSORCORE_N = 16
+NVFP4_TC_ROWS_PER_TILE = 128
+NVFP4_TC_COLS_PER_TILE = 4
+NVFP4_TC_BLOCK_K = 16
+NVFP4_TC_K_PER_TILE = NVFP4_TC_COLS_PER_TILE * NVFP4_TC_BLOCK_K
+NVFP4_LM_GROUP_SIZE = NVFP4_TC_BLOCK_K
+LM_HEAD_TENSORCORE_PACKED_BYTES = LM_HEAD_TENSORCORE_N * (1024 // 2)
+LM_HEAD_TENSORCORE_SCALE_BYTES = (
+    ((LM_HEAD_TENSORCORE_N + NVFP4_TC_ROWS_PER_TILE - 1) // NVFP4_TC_ROWS_PER_TILE)
+    * (1024 // NVFP4_TC_K_PER_TILE)
+    * 512
+)
+
 _decode = None
 _decode_nvfp4 = None
+_decode_many_nvfp4 = None
 _prefill_bf16 = None
 _quantize_nvfp4_out = None
+_quantize_nvfp4_lm_out = None
 
 
 def _load_op():
-    global _decode, _decode_nvfp4, _prefill_bf16, _quantize_nvfp4_out
+    global _decode, _decode_nvfp4, _decode_many_nvfp4
+    global _prefill_bf16, _quantize_nvfp4_out, _quantize_nvfp4_lm_out
     if _decode is None:
-        import qwen35_megakernel_bf16_C
+        import qwen35_megakernel_bf16_C  # noqa: F401
         ops = torch.ops.qwen35_megakernel_bf16_C
         _decode = ops.decode
-        _decode_nvfp4 = ops.decode_nvfp4
         _prefill_bf16 = ops.prefill_bf16
         _quantize_nvfp4_out = ops.quantize_nvfp4_out
+        # NVFP4 ops only exist on Blackwell builds (MEGAKERNEL_HAS_NVFP4).
+        for name in ("decode_nvfp4", "decode_many_nvfp4", "quantize_nvfp4_lm_out"):
+            globals()[f"_{name}"] = getattr(ops, name, None)
+        global _decode_nvfp4, _decode_many_nvfp4, _quantize_nvfp4_lm_out
+        _decode_nvfp4 = getattr(ops, "decode_nvfp4", None)
+        _decode_many_nvfp4 = getattr(ops, "decode_many_nvfp4", None)
+        _quantize_nvfp4_lm_out = getattr(ops, "quantize_nvfp4_lm_out", None)
+
+
+_VALID_BACKENDS = ("auto", "bf16", "nvfp4", "bf16_fp4lm")
 
 
 def _resolve_backend(backend):
-    if backend not in (None, "auto", "bf16", "nvfp4"):
-        raise ValueError(f"unsupported backend: {backend}")
+    if backend not in (None,) + _VALID_BACKENDS:
+        raise ValueError(
+            f"unsupported backend: {backend!r}; valid: {_VALID_BACKENDS}")
 
     forced = os.environ.get("MEGAKERNEL_BACKEND")
     if forced:
         backend = forced
 
     if backend in (None, "auto"):
-        # GB10 (sm_121a) note: NVFP4 decode runs but currently uses
-        # software FP4 dot-products (no mma.kind::mxf4 / tcgen05.mma
-        # yet), so it's only ~8% faster than BF16 while losing
-        # greedy-argmax parity with HF (see experiments/diag_nvfp4.py
-        # and experiments/correctness_gb10.py). BF16 is the safer
-        # default on GB10 until the hardware-FP4 path lands.
+        # Auto-select on GB10 (sm_121a+):
+        #   bf16        — fully correct (32/32 vs HF), eager BF16 LM head.
+        #   bf16_fp4lm  — BF16 trunk + cuBLASLt FP4 block-scaled LM head
+        #                 (CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3).
+        #                 100% greedy-top1 vs HF in validation; +~7%
+        #                 step time at long context vs pure bf16 because
+        #                 we still pay the BF16 LM head. Saves ~125 MB
+        #                 of LM-head weight RAM. Recommended once we
+        #                 want the FP4 tensor-core path on this chip.
+        #   nvfp4       — full FP4 layer projections + FP4 LM head.
+        #                 Drifts vs HF (intrinsic to per-group-32 FP4
+        #                 across 24 layers); kept for ablation.
+        # See docs/results/qwen35_0p8b_gb10.md for measurements.
         return "bf16"
 
     return backend
@@ -152,15 +189,42 @@ def _attach_nvfp4_weights(weights, group_size=NVFP4_GROUP_SIZE, verbose=True):
             packed_bytes += q["packed"].numel() * q["packed"].element_size()
             scale_bytes += q["scales"].numel() * q["scales"].element_size()
 
-    lm_head_nvfp4 = _quantize_matrix_nvfp4(weights["lm_head_weight"], group_size)
-    packed_bytes += lm_head_nvfp4["packed"].numel() * lm_head_nvfp4["packed"].element_size()
-    scale_bytes += lm_head_nvfp4["scales"].numel() * lm_head_nvfp4["scales"].element_size()
+    # LM head is consumed by the cuBLASLt FP4 block-scaled matmul on GB10.
+    # That contract needs UE4M3 (uint8) scales in a swizzled tile layout;
+    # quantize_nvfp4_lm_out emits that format. The scalar fallback path
+    # inside kernel_gb10_nvfp4.cu reads the same UE4M3 layout via
+    # lm_swizzled_scale_value, so a single quantization serves both.
+    _load_op()
+    lm_W = weights["lm_head_weight"]
+    if _quantize_nvfp4_lm_out is None:
+        raise RuntimeError(
+            "quantize_nvfp4_lm_out op is missing — rebuild the extension "
+            "for a Blackwell arch (MEGAKERNEL_CUDA_ARCHS=sm_121a,...) so "
+            "the NVFP4 LM-head path is compiled in."
+        )
+    lm_rows, lm_cols = lm_W.shape
+    if lm_cols != 1024:
+        raise ValueError(
+            f"LM head expects HIDDEN_SIZE=1024 cols; got {lm_cols}. "
+            "The cuBLASLt FP4 plan and the scale-swizzle layout are "
+            "hard-coded for 1024."
+        )
+    lm_scale_bytes = (
+        ((lm_rows + NVFP4_TC_ROWS_PER_TILE - 1) // NVFP4_TC_ROWS_PER_TILE)
+        * (lm_cols // NVFP4_TC_K_PER_TILE)
+        * 512
+    )
+    lm_packed = torch.empty(lm_rows, lm_cols // 2, dtype=torch.uint8, device=lm_W.device)
+    lm_scales = torch.zeros(lm_scale_bytes, dtype=torch.uint8, device=lm_W.device)
+    _quantize_nvfp4_lm_out(lm_packed, lm_scales, lm_W.contiguous())
+    packed_bytes += lm_packed.numel()
+    scale_bytes += lm_scales.numel()
 
     weights["nvfp4"] = {
         "group_size": group_size,
         "layer_data": layer_data_nvfp4,
-        "lm_head_weight_packed": lm_head_nvfp4["packed"],
-        "lm_head_scales": lm_head_nvfp4["scales"],
+        "lm_head_weight_packed": lm_packed,
+        "lm_head_scales": lm_scales,
     }
 
     if verbose:
@@ -186,8 +250,11 @@ def load_weights(
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    resolved_backend = _resolve_backend(backend)
-
+    # Trust the caller's `backend` here — don't re-resolve via the env
+    # var, since this function is called from Decoder.__init__ which has
+    # already picked the storage format ("bf16" or "nvfp4") that needs
+    # loading. Re-resolving would let MEGAKERNEL_BACKEND=bf16_fp4lm sneak
+    # in and skip the FP4 LM-head weight attachment.
     if verbose:
         print(f"Loading {model_name} (bf16)...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -202,7 +269,7 @@ def load_weights(
     # Hold the HF model alive on the weights dict — the layer tensors are
     # VIEWS into model.state_dict(), so model GC would invalidate them.
     weights["_hf_model_keepalive"] = model
-    if resolved_backend == "nvfp4":
+    if backend == "nvfp4":
         _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
     return weights, tokenizer
 
@@ -374,17 +441,26 @@ class Decoder:
     ):
         _load_op()
         self.backend = _resolve_backend(backend)
-        self.backend_label = "NVFP4 decode" if self.backend == "nvfp4" else "BF16"
+        self.backend_label = {
+            "nvfp4": "NVFP4 decode",
+            "bf16_fp4lm": "BF16 + cuBLASLt FP4 LM head",
+            "bf16": "BF16",
+        }[self.backend]
         self._nvfp4_group_size = nvfp4_group_size
+        self._needs_nvfp4_weights = self.backend in ("nvfp4", "bf16_fp4lm")
 
         if weights is None:
+            # Use "nvfp4" so load_weights triggers _attach_nvfp4_weights.
+            # bf16_fp4lm reuses the same FP4 LM-head weights but keeps the
+            # BF16 layer weights for the decode trunk.
+            load_backend = "nvfp4" if self._needs_nvfp4_weights else "bf16"
             weights, tokenizer = load_weights(
                 model_name,
                 verbose=verbose,
-                backend=self.backend,
+                backend=load_backend,
                 nvfp4_group_size=nvfp4_group_size,
             )
-        elif self.backend == "nvfp4":
+        elif self._needs_nvfp4_weights:
             _attach_nvfp4_weights(weights, group_size=nvfp4_group_size, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
@@ -396,10 +472,13 @@ class Decoder:
         self._layer_weights_packed_nvfp4 = None
         self._lm_head_weight_packed = None
         self._lm_head_scales = None
-        if self.backend == "nvfp4":
+        if self._needs_nvfp4_weights:
             nvfp4 = weights["nvfp4"]
-            self._layer_weights_packed_nvfp4 = _pack_layer_weights_nvfp4(
-                nvfp4["layer_data"], nvfp4["group_size"])
+            # The full-NVFP4 decode path needs all layer weights packed; the
+            # bf16_fp4lm hybrid only needs the LM-head FP4 weights.
+            if self.backend == "nvfp4":
+                self._layer_weights_packed_nvfp4 = _pack_layer_weights_nvfp4(
+                    nvfp4["layer_data"], nvfp4["group_size"])
             self._lm_head_weight_packed = nvfp4["lm_head_weight_packed"]
             self._lm_head_scales = nvfp4["lm_head_scales"]
 
@@ -435,6 +514,21 @@ class Decoder:
         self._block_max_idxs = torch.empty(1024, **i32)
         self._lm_sync_counter = torch.zeros(1, **u32)
         self._out_token = torch.empty(1, **i32)
+        # cuBLASLt FP4 LM-head scratch buffers. Allocated on either the
+        # full-NVFP4 path or the bf16+fp4lm hybrid; pure BF16 pays nothing.
+        self._lm_hidden_bf16 = None
+        self._lm_hidden_packed = None
+        self._lm_hidden_scales = None
+        self._lm_logits_f16 = None
+        if self._needs_nvfp4_weights:
+            self._lm_hidden_bf16 = torch.empty(
+                (LM_HEAD_TENSORCORE_N, HIDDEN_SIZE), **bf16)
+            self._lm_hidden_packed = torch.empty(
+                LM_HEAD_TENSORCORE_PACKED_BYTES, dtype=torch.uint8, device="cuda")
+            self._lm_hidden_scales = torch.empty(
+                LM_HEAD_TENSORCORE_SCALE_BYTES, dtype=torch.uint8, device="cuda")
+            self._lm_logits_f16 = torch.empty(
+                (LM_HEAD_TENSORCORE_N, VOCAB_SIZE), dtype=torch.float16, device="cuda")
 
     def step(self, token_id: int) -> int:
         """Decode one token. Returns next token id."""
@@ -443,6 +537,8 @@ class Decoder:
                 self._out_token, token_id,
                 self._embed_weight, self._layer_weights_packed_nvfp4,
                 self._final_norm_weight, self._lm_head_weight_packed, self._lm_head_scales,
+                self._lm_hidden_bf16, self._lm_hidden_packed,
+                self._lm_hidden_scales, self._lm_logits_f16,
                 self._fa_k_cache, self._fa_v_cache,
                 self._dn_states, self._conv_bufs,
                 self._hidden, self._activations, self._residual,
@@ -470,6 +566,21 @@ class Decoder:
                 self._lm_sync_counter,
                 self._position, MAX_SEQ_LEN,
             )
+            if self.backend == "bf16_fp4lm":
+                # Override the BF16 LM head argmax with the cuBLASLt FP4
+                # block-scaled LM head on the same f32 normalized hidden.
+                # 32/32 greedy parity with HF on the test prompt; the
+                # double-LM-head pays ~970 us/step extra. Once the BF16
+                # decode kernel grows an "early-exit before LM head"
+                # mode, this overhead drops to net-zero / negative.
+                torch.ops.qwen35_megakernel_bf16_C.lm_head_nvfp4_from_f32(
+                    self._out_token, self._normalized,
+                    self._lm_head_weight_packed, self._lm_head_scales,
+                    self._lm_hidden_bf16, self._lm_hidden_packed,
+                    self._lm_hidden_scales, self._lm_logits_f16,
+                    self._block_max_vals, self._block_max_idxs,
+                    self._nvfp4_group_size,
+                )
         self._position += 1
         return self._out_token.item()
 
@@ -497,6 +608,7 @@ class Decoder:
                 "Decoder.prefill is not implemented for the NVFP4 backend; "
                 "fall back to per-token step() for NVFP4."
             )
+        # bf16_fp4lm uses BF16 prefill + FP4 LM head override at the end.
 
         if isinstance(prompt_ids, torch.Tensor):
             ids_t = prompt_ids.to(dtype=torch.int32, device="cuda").contiguous()
@@ -540,6 +652,19 @@ class Decoder:
         )
         self._hidden.copy_(bufs["hidden_bf16_out"])
         self._position = prompt_len
+        if self.backend == "bf16_fp4lm":
+            # The BF16 prefill writes `final_normed` in bf16. Convert to
+            # f32 in-place into `_normalized` (sized HIDDEN_SIZE f32) and
+            # run the cuBLASLt FP4 LM head, overriding `_out_token`.
+            self._normalized.copy_(bufs["final_normed"].to(torch.float32))
+            torch.ops.qwen35_megakernel_bf16_C.lm_head_nvfp4_from_f32(
+                self._out_token, self._normalized,
+                self._lm_head_weight_packed, self._lm_head_scales,
+                self._lm_hidden_bf16, self._lm_hidden_packed,
+                self._lm_hidden_scales, self._lm_logits_f16,
+                self._block_max_vals, self._block_max_idxs,
+                self._nvfp4_group_size,
+            )
         return self._out_token.item()
 
     def _get_prefill_buffers(self, max_tokens: int) -> dict:

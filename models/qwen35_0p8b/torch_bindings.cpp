@@ -28,12 +28,14 @@ struct LayerWeights {
     void *ptrs[14];  // max(11 FA, 14 DN) pointers — all bf16, no scales
 };
 
+#ifdef MEGAKERNEL_HAS_NVFP4
 struct LayerWeightsNVFP4 {
     int layer_type;
     int group_size;
     int _pad[2];
     void *ptrs[24];  // hot decode weights become packed fp4 + per-group scales
 };
+#endif
 
 extern "C" void launch_decode(
     int input_token_id, int *output_token_id,
@@ -50,11 +52,16 @@ extern "C" void launch_decode(
     unsigned int *lm_sync_counter,
     int position, int max_seq_len, cudaStream_t stream);
 
+#ifdef MEGAKERNEL_HAS_NVFP4
+// New signature: lm_hidden_* + lm_logits_f16 buffers added between
+// lm_head_scales and fa_k_cache. input_token is read from a device int
+// (`output_token_id` is reused as input on the device side).
 extern "C" void launch_decode_nvfp4(
-    int input_token_id, int *output_token_id,
+    const int *input_token_ptr, int *output_token_id,
     const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
     const void *final_norm_weight,
     const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
     void *fa_k_cache, void *fa_v_cache,
     void *dn_states, void *conv_bufs,
     void *hidden_buffer, void *g_activations, void *g_residual,
@@ -65,6 +72,49 @@ extern "C" void launch_decode_nvfp4(
     float *block_max_vals, int *block_max_idxs,
     unsigned int *lm_sync_counter,
     int position, int max_seq_len, int group_size, cudaStream_t stream);
+
+extern "C" void launch_decode_many_nvfp4(
+    int *token_buffer, int *output_tokens, int steps,
+    const void *embed_weight, const LayerWeightsNVFP4 *layer_weights,
+    const void *final_norm_weight,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_activations, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
+    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_alpha_scratch, void *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_generation,
+    float *block_max_vals, int *block_max_idxs,
+    unsigned int *lm_sync_counter,
+    int position, int max_seq_len, int group_size, cudaStream_t stream);
+
+extern "C" void launch_quantize_nvfp4_lm_out(
+    const void *weight, int rows, int cols,
+    void *packed_out, void *scales_out, cudaStream_t stream);
+
+extern "C" void launch_lm_head_nvfp4_from_f32(
+    const float *normalized,
+    int *output_token_id,
+    const void *lm_head_weight_packed, const void *lm_head_scales,
+    void *lm_hidden_bf16, void *lm_hidden_packed, void *lm_hidden_scales, void *lm_logits_f16,
+    float *block_max_vals, int *block_max_idxs,
+    int group_size,
+    cudaStream_t stream);
+
+static void seed_token_buffer(torch::Tensor token_buffer, int token_id) {
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    cudaError_t err = cudaMemcpyAsync(
+        token_buffer.data_ptr(),
+        &token_id,
+        sizeof(token_id),
+        cudaMemcpyHostToDevice,
+        stream);
+    TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync(token_buffer) failed: ",
+                cudaGetErrorString(err));
+}
+#endif  // MEGAKERNEL_HAS_NVFP4
 
 extern "C" void launch_quantize_nvfp4_out(
     const void *weight, int rows, int cols, int group_size,
@@ -102,11 +152,14 @@ void decode(
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
+#ifdef MEGAKERNEL_HAS_NVFP4
 void decode_nvfp4(
     torch::Tensor output_token, int64_t input_token_id,
     torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
     torch::Tensor final_norm_weight,
     torch::Tensor lm_head_weight_packed, torch::Tensor lm_head_scales,
+    torch::Tensor lm_hidden_bf16, torch::Tensor lm_hidden_packed,
+    torch::Tensor lm_hidden_scales, torch::Tensor lm_logits_f16,
     torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
     torch::Tensor dn_states, torch::Tensor conv_bufs,
     torch::Tensor hidden_buffer, torch::Tensor activations, torch::Tensor residual,
@@ -118,12 +171,16 @@ void decode_nvfp4(
     torch::Tensor lm_sync_counter, int64_t position, int64_t max_seq_len,
     int64_t group_size)
 {
+    seed_token_buffer(output_token, (int)input_token_id);
     launch_decode_nvfp4(
-        (int)input_token_id, (int*)output_token.data_ptr(),
+        (const int*)output_token.data_ptr(),
+        (int*)output_token.data_ptr(),
         embed_weight.data_ptr(),
         reinterpret_cast<const LayerWeightsNVFP4*>(layer_weights_packed.data_ptr()),
         final_norm_weight.data_ptr(),
         lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(),
+        lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
         fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
         dn_states.data_ptr(), conv_bufs.data_ptr(),
         hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
@@ -136,6 +193,108 @@ void decode_nvfp4(
         (int)position, (int)max_seq_len, (int)group_size,
         c10::cuda::getCurrentCUDAStream().stream());
 }
+
+void decode_many_nvfp4(
+    torch::Tensor output_tokens,
+    torch::Tensor token_buffer,
+    int64_t input_token_id,
+    torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
+    torch::Tensor final_norm_weight,
+    torch::Tensor lm_head_weight_packed, torch::Tensor lm_head_scales,
+    torch::Tensor lm_hidden_bf16, torch::Tensor lm_hidden_packed,
+    torch::Tensor lm_hidden_scales, torch::Tensor lm_logits_f16,
+    torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
+    torch::Tensor dn_states, torch::Tensor conv_bufs,
+    torch::Tensor hidden_buffer, torch::Tensor activations, torch::Tensor residual,
+    torch::Tensor qkv_scratch, torch::Tensor kv_scratch, torch::Tensor attn_out,
+    torch::Tensor mlp_inter, torch::Tensor z_scratch, torch::Tensor beta_scratch,
+    torch::Tensor alpha_scratch, torch::Tensor normalized,
+    torch::Tensor barrier_counter, torch::Tensor barrier_generation,
+    torch::Tensor block_max_vals, torch::Tensor block_max_idxs,
+    torch::Tensor lm_sync_counter, int64_t position, int64_t max_seq_len,
+    int64_t group_size)
+{
+    TORCH_CHECK(output_tokens.is_cuda(), "output_tokens must be CUDA");
+    TORCH_CHECK(output_tokens.is_contiguous(), "output_tokens must be contiguous");
+    TORCH_CHECK(output_tokens.scalar_type() == torch::kInt32, "output_tokens must be int32");
+    TORCH_CHECK(output_tokens.dim() == 1, "output_tokens must be 1D");
+    TORCH_CHECK(token_buffer.is_cuda(), "token_buffer must be CUDA");
+    TORCH_CHECK(token_buffer.is_contiguous(), "token_buffer must be contiguous");
+    TORCH_CHECK(token_buffer.scalar_type() == torch::kInt32, "token_buffer must be int32");
+    TORCH_CHECK(token_buffer.numel() == 1, "token_buffer must contain exactly one int32 token");
+
+    seed_token_buffer(token_buffer, (int)input_token_id);
+    launch_decode_many_nvfp4(
+        (int*)token_buffer.data_ptr(),
+        (int*)output_tokens.data_ptr(),
+        (int)output_tokens.numel(),
+        embed_weight.data_ptr(),
+        reinterpret_cast<const LayerWeightsNVFP4*>(layer_weights_packed.data_ptr()),
+        final_norm_weight.data_ptr(),
+        lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(),
+        lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
+        fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
+        dn_states.data_ptr(), conv_bufs.data_ptr(),
+        hidden_buffer.data_ptr(), activations.data_ptr(), residual.data_ptr(),
+        qkv_scratch.data_ptr(), kv_scratch.data_ptr(), attn_out.data_ptr(),
+        mlp_inter.data_ptr(), z_scratch.data_ptr(), beta_scratch.data_ptr(),
+        alpha_scratch.data_ptr(), normalized.data_ptr(),
+        (unsigned int*)barrier_counter.data_ptr(), (unsigned int*)barrier_generation.data_ptr(),
+        (float*)block_max_vals.data_ptr(), (int*)block_max_idxs.data_ptr(),
+        (unsigned int*)lm_sync_counter.data_ptr(),
+        (int)position, (int)max_seq_len, (int)group_size,
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void lm_head_nvfp4_from_f32(
+    torch::Tensor output_token,
+    torch::Tensor normalized,
+    torch::Tensor lm_head_weight_packed,
+    torch::Tensor lm_head_scales,
+    torch::Tensor lm_hidden_bf16,
+    torch::Tensor lm_hidden_packed,
+    torch::Tensor lm_hidden_scales,
+    torch::Tensor lm_logits_f16,
+    torch::Tensor block_max_vals,
+    torch::Tensor block_max_idxs,
+    int64_t group_size)
+{
+    TORCH_CHECK(normalized.is_cuda() && normalized.is_contiguous(),
+                "normalized must be contiguous CUDA");
+    TORCH_CHECK(normalized.scalar_type() == torch::kFloat32,
+                "normalized must be f32");
+    launch_lm_head_nvfp4_from_f32(
+        (const float*)normalized.data_ptr(),
+        (int*)output_token.data_ptr(),
+        lm_head_weight_packed.data_ptr(), lm_head_scales.data_ptr(),
+        lm_hidden_bf16.data_ptr(), lm_hidden_packed.data_ptr(),
+        lm_hidden_scales.data_ptr(), lm_logits_f16.data_ptr(),
+        (float*)block_max_vals.data_ptr(), (int*)block_max_idxs.data_ptr(),
+        (int)group_size,
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void quantize_nvfp4_lm_out(
+    torch::Tensor packed_out,
+    torch::Tensor scales_out,
+    torch::Tensor weight)
+{
+    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous(), "weight must be contiguous CUDA");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+    TORCH_CHECK(weight.scalar_type() == torch::kBFloat16, "weight must be bfloat16");
+    TORCH_CHECK(packed_out.is_cuda() && packed_out.is_contiguous(), "packed_out must be contiguous CUDA");
+    TORCH_CHECK(scales_out.is_cuda() && scales_out.is_contiguous(), "scales_out must be contiguous CUDA");
+    TORCH_CHECK(packed_out.scalar_type() == torch::kUInt8, "packed_out must be uint8");
+    TORCH_CHECK(scales_out.scalar_type() == torch::kUInt8, "scales_out must be uint8 (UE4M3)");
+    auto rows = static_cast<int>(weight.size(0));
+    auto cols = static_cast<int>(weight.size(1));
+    launch_quantize_nvfp4_lm_out(
+        weight.data_ptr(), rows, cols,
+        packed_out.data_ptr(), scales_out.data_ptr(),
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+#endif  // MEGAKERNEL_HAS_NVFP4
 
 void quantize_nvfp4_out(
     torch::Tensor packed_out,
@@ -536,9 +695,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "int position, int max_seq_len) -> ()");
     ops.impl("decode", torch::kCUDA, &decode);
 
+#ifdef MEGAKERNEL_HAS_NVFP4
     ops.def("decode_nvfp4(Tensor output_token, int input_token_id, "
             "Tensor embed_weight, Tensor layer_weights_packed, "
             "Tensor final_norm_weight, Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, Tensor lm_hidden_scales, Tensor lm_logits_f16, "
             "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
             "Tensor hidden_buffer, Tensor activations, Tensor residual, "
             "Tensor qkv_scratch, Tensor kv_scratch, Tensor attn_out, "
@@ -548,6 +709,32 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor block_max_vals, Tensor block_max_idxs, Tensor lm_sync_counter, "
             "int position, int max_seq_len, int group_size) -> ()");
     ops.impl("decode_nvfp4", torch::kCUDA, &decode_nvfp4);
+
+    ops.def("decode_many_nvfp4(Tensor output_tokens, Tensor token_buffer, int input_token_id, "
+            "Tensor embed_weight, Tensor layer_weights_packed, "
+            "Tensor final_norm_weight, Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, Tensor lm_hidden_scales, Tensor lm_logits_f16, "
+            "Tensor fa_k_cache, Tensor fa_v_cache, Tensor dn_states, Tensor conv_bufs, "
+            "Tensor hidden_buffer, Tensor activations, Tensor residual, "
+            "Tensor qkv_scratch, Tensor kv_scratch, Tensor attn_out, "
+            "Tensor mlp_inter, Tensor z_scratch, Tensor beta_scratch, "
+            "Tensor alpha_scratch, Tensor normalized, "
+            "Tensor barrier_counter, Tensor barrier_generation, "
+            "Tensor block_max_vals, Tensor block_max_idxs, Tensor lm_sync_counter, "
+            "int position, int max_seq_len, int group_size) -> ()");
+    ops.impl("decode_many_nvfp4", torch::kCUDA, &decode_many_nvfp4);
+
+    ops.def("quantize_nvfp4_lm_out(Tensor packed_out, Tensor scales_out, Tensor weight) -> ()");
+    ops.impl("quantize_nvfp4_lm_out", torch::kCUDA, &quantize_nvfp4_lm_out);
+
+    ops.def("lm_head_nvfp4_from_f32(Tensor output_token, Tensor normalized, "
+            "Tensor lm_head_weight_packed, Tensor lm_head_scales, "
+            "Tensor lm_hidden_bf16, Tensor lm_hidden_packed, "
+            "Tensor lm_hidden_scales, Tensor lm_logits_f16, "
+            "Tensor block_max_vals, Tensor block_max_idxs, "
+            "int group_size) -> ()");
+    ops.impl("lm_head_nvfp4_from_f32", torch::kCUDA, &lm_head_nvfp4_from_f32);
+#endif  // MEGAKERNEL_HAS_NVFP4
 
     ops.def("prefill_bf16(Tensor output_token, Tensor token_ids, "
             "Tensor embed_weight, Tensor layer_weights_packed, "

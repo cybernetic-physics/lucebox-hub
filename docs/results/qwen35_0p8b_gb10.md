@@ -48,6 +48,28 @@ Runtime env (read by the launcher in `kernel.cu` / `kernel_gb10_nvfp4.cu`):
 | `MEGAKERNEL_LM_BLOCKS` | Override LM-head grid size. Non-cooperative kernel; safe to oversubscribe. |
 | `MEGAKERNEL_BACKEND` | Force `bf16` or `nvfp4`. Overrides Decoder(`backend="auto"`). |
 
+## Backend modes
+
+Three backends are now available; `Decoder(backend="auto")` returns
+`bf16`. Override with `--backend` or `MEGAKERNEL_BACKEND=`.
+
+| Backend | What runs | Greedy top-1 vs HF | pp520 / tg128 (tok/s) | When to use |
+|---------|-----------|:------------------:|----------------------:|-------------|
+| `bf16` | BF16 megakernel decode + BF16 LM head. | **100 %** (32/32) | 7,185 / 69 | Correctness-critical (RLHF rollouts, evals). |
+| **`bf16_fp4lm`** | BF16 megakernel decode + cuBLASLt FP4 block-scaled LM head (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`). | **100 %** (32/32) | 7,384 / 65 | Same quality as bf16, ~125 MB lower LM-head footprint. Step-time is +970 us because BF16 LM head still runs first; will be net-positive once a `decode_bf16_no_lm` variant exists. |
+| `nvfp4` | Full FP4 layer projections + cuBLASLt FP4 LM head. | 3/32 (intrinsic FP4 drift across 24 layers) | 9,187 / 88 | Ablations and microbenches only — output is coherent but diverges from HF. |
+
+`bf16_fp4lm` is the "NVFP4 with no quality loss" path: the cuBLASLt FP4
+LM head is the only FP4 component, and the LM-head quantization alone
+preserves HF's argmax (verified in `experiments/diag_nvfp4.py` —
+FP4-roundtripped LM head reports rank 0 for HF's top token).
+
+Background — the previous default `nvfp4` mode loses parity because the
+24 layer projections each compound ~19 % per-group-32 FP4 rel err.
+That's intrinsic to per-group-32 scalar FP4, not a kernel bug. The
+fix path is `mma.kind::mxf4` / `tcgen05.mma` tensor-core layer
+projections (open work below).
+
 ## Backend default
 
 `Decoder(backend="auto")` returns **`bf16` on GB10**, not NVFP4. Why:
