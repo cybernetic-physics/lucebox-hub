@@ -60,7 +60,7 @@ def compare(prompt, gen_tokens, model_name, backends):
         decoder = Decoder(model_name=model_name, backend=backend, verbose=False)
         print(f"  Backend label: {decoder.backend_label}", flush=True)
 
-        if backend in ("bf16", "bf16_fp4lm"):
+        if backend in ("bf16", "bf16_fp4lm", "nvfp4"):
             decoder.reset()
             mk_first = decoder.prefill(prompt_ids)
         else:

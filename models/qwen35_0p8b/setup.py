@@ -64,9 +64,14 @@ def _int_env(name, default):
 
 
 archs = _detect_caps()
-gencode_flags: list[str] = []
-for a in archs:
-    gencode_flags += ["-gencode", _arch_to_gencode(a)]
+# Prefer `-arch=` for single-arch builds (matches the standalone
+# megakernel build); fall back to multiple `-gencode` for multi-arch.
+if len(archs) == 1:
+    gencode_flags: list[str] = [f"-arch={archs[0]}"]
+else:
+    gencode_flags = []
+    for a in archs:
+        gencode_flags += ["-gencode", _arch_to_gencode(a)]
 
 # Enable the NVFP4 (cuBLASLt FP4 LM head + sm_120 decode kernel) bindings
 # when any target arch is sm_120+. Cleanly drops out for sm_86-only builds,
@@ -102,6 +107,10 @@ sources = [
     "dn_chunked_3090.cu",  # 3090-tuned chunked DN forward (V_SPLITS=4, C=32)
     "fa_attn_aten.cpp",  # cuDNN FA-2 wrapper used by prefill.cu
 ]
+# BF16 prefill body + cuBLASLt FP4 LM head — Blackwell only (uses
+# cublasLt block-scaled FP4 path). Drop from sm_86-only builds.
+if has_nvfp4:
+    sources.append("prefill_bw.cu")
 libraries = ["cublas"]
 if has_nvfp4:
     libraries.append("cublasLt")

@@ -603,12 +603,44 @@ class Decoder:
         BF16 backend only — NVFP4 prefill is not yet implemented in the
         kernel extension.
         """
-        if self.backend == "nvfp4":
-            raise NotImplementedError(
-                "Decoder.prefill is not implemented for the NVFP4 backend; "
-                "fall back to per-token step() for NVFP4."
+        if isinstance(prompt_ids, torch.Tensor):
+            ids_t_full = prompt_ids.to(dtype=torch.int32, device="cuda").contiguous()
+        else:
+            ids_t_full = torch.tensor(list(prompt_ids), dtype=torch.int32, device="cuda")
+        prompt_len_full = ids_t_full.numel()
+        if prompt_len_full == 0:
+            raise ValueError("Decoder.prefill: prompt_ids must be non-empty")
+        if prompt_len_full > MAX_SEQ_LEN:
+            raise ValueError(
+                f"Decoder.prefill: prompt_len={prompt_len_full} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}"
             )
-        # bf16_fp4lm uses BF16 prefill + FP4 LM head override at the end.
+
+        if self.backend == "nvfp4":
+            # Full NVFP4 prefill: persistent megakernel processes the
+            # entire prompt with FP4 layer projections, then runs the
+            # cuBLASLt FP4 block-scaled LM head on the final hidden.
+            self.reset()
+            torch.ops.qwen35_megakernel_bf16_C.prefill_megakernel_nvfp4(
+                self._out_token, ids_t_full,
+                self._embed_weight, self._layer_weights_packed_nvfp4,
+                self._final_norm_weight,
+                self._lm_head_weight_packed, self._lm_head_scales,
+                self._lm_hidden_bf16, self._lm_hidden_packed,
+                self._lm_hidden_scales, self._lm_logits_f16,
+                self._fa_k_cache, self._fa_v_cache,
+                self._dn_states, self._conv_bufs,
+                self._hidden, self._activations, self._residual,
+                self._qkv_scratch, self._kv_scratch, self._attn_out,
+                self._mlp_inter, self._z_scratch, self._beta_scratch,
+                self._alpha_scratch, self._normalized,
+                self._barrier_counter, self._barrier_generation,
+                self._block_max_vals, self._block_max_idxs,
+                self._lm_sync_counter,
+                MAX_SEQ_LEN, self._nvfp4_group_size,
+            )
+            self._position = prompt_len_full
+            return self._out_token.item()
+        # bf16 / bf16_fp4lm path uses the eager BF16 prefill below.
 
         if isinstance(prompt_ids, torch.Tensor):
             ids_t = prompt_ids.to(dtype=torch.int32, device="cuda").contiguous()

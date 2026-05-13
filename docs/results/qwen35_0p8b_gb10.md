@@ -57,7 +57,7 @@ Three backends are now available; `Decoder(backend="auto")` returns
 |---------|-----------|:------------------:|----------------------:|-------------|
 | `bf16` | BF16 megakernel decode + BF16 LM head. | **100 %** (32/32) | 7,185 / 69 | Correctness-critical (RLHF rollouts, evals). |
 | **`bf16_fp4lm`** | BF16 megakernel decode + cuBLASLt FP4 block-scaled LM head (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`). | **100 %** (32/32) | 7,384 / 65 | Same quality as bf16, ~125 MB lower LM-head footprint. Step-time is +970 us because BF16 LM head still runs first; will be net-positive once a `decode_bf16_no_lm` variant exists. |
-| `nvfp4` | Full FP4 layer projections + cuBLASLt FP4 LM head. | 3/32 (intrinsic FP4 drift across 24 layers) | 9,187 / 88 | Ablations and microbenches only — output is coherent but diverges from HF. |
+| `nvfp4` | Full FP4 layer projections (`prefill_megakernel_nvfp4`) + cuBLASLt FP4 LM head. | 3/32 (intrinsic FP4 drift across 24 layers — **confirmed in two independent implementations**) | 9,187 / 88 | Ablations and microbenches only — output is coherent but diverges from HF. |
 
 `bf16_fp4lm` is the "NVFP4 with no quality loss" path: the cuBLASLt FP4
 LM head is the only FP4 component, and the LM-head quantization alone
@@ -66,9 +66,16 @@ FP4-roundtripped LM head reports rank 0 for HF's top token).
 
 Background — the previous default `nvfp4` mode loses parity because the
 24 layer projections each compound ~19 % per-group-32 FP4 rel err.
-That's intrinsic to per-group-32 scalar FP4, not a kernel bug. The
-fix path is `mma.kind::mxf4` / `tcgen05.mma` tensor-core layer
-projections (open work below).
+That's intrinsic to per-group-32 scalar FP4, not a kernel bug. Verified
+by running BOTH this branch's `prefill_megakernel_nvfp4` AND the
+standalone `/home/sparkz/lucebox-hub/megakernel` build with
+`MEGAKERNEL_PREFILL_MODE=raw` — both produce token 303 (' in') instead
+of HF's 11751 (' Paris') on "The capital of France is". The standalone's
+documented `MEGAKERNEL_PREFILL_MODE=hybrid` default produces ' Paris' by
+running BF16 prefill + cuBLASLt FP4 LM head — that is, semantically the
+same as `bf16_fp4lm` here. The "NVFP4 with no quality loss" path is the
+hybrid path. Closing the gap for pure FP4 needs `mma.kind::mxf4` /
+`tcgen05.mma` tensor-core layer projections (open work below).
 
 ## Backend default
 
