@@ -59,8 +59,13 @@ def _resolve_backend(backend):
         backend = forced
 
     if backend in (None, "auto"):
-        major, _minor = torch.cuda.get_device_capability()
-        return "nvfp4" if major >= 12 else "bf16"
+        # GB10 (sm_121a) note: NVFP4 decode runs but currently uses
+        # software FP4 dot-products (no mma.kind::mxf4 / tcgen05.mma
+        # yet), so it's only ~8% faster than BF16 while losing
+        # greedy-argmax parity with HF (see experiments/diag_nvfp4.py
+        # and experiments/correctness_gb10.py). BF16 is the safer
+        # default on GB10 until the hardware-FP4 path lands.
+        return "bf16"
 
     return backend
 
