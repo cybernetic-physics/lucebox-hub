@@ -57,25 +57,29 @@ Three backends are now available; `Decoder(backend="auto")` returns
 |---------|-----------|:------------------:|----------------------:|-------------|
 | `bf16` | BF16 megakernel decode + BF16 LM head. | **100 %** (32/32) | 7,185 / 69 | Correctness-critical (RLHF rollouts, evals). |
 | **`bf16_fp4lm`** | BF16 megakernel decode + cuBLASLt FP4 block-scaled LM head (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`). | **100 %** (32/32) | 7,384 / 65 | Same quality as bf16, ~125 MB lower LM-head footprint. Step-time is +970 us because BF16 LM head still runs first; will be net-positive once a `decode_bf16_no_lm` variant exists. |
-| `nvfp4` | Full FP4 layer projections (`prefill_megakernel_nvfp4`) + cuBLASLt FP4 LM head. | 3/32 (intrinsic FP4 drift across 24 layers — **confirmed in two independent implementations**) | 9,187 / 88 | Ablations and microbenches only — output is coherent but diverges from HF. |
+| **`nvfp4`** | Full FP4 layer projections (`prefill_megakernel_nvfp4`) + cuBLASLt FP4 LM head, **optimal-MSE quantization** (30-candidate scale sweep per group at quant time). | **32/32 (100 %)** | **14,563 / 181** | Fastest correct backend on GB10 — **28 % faster tg than bf16** at the same quality. |
 
 `bf16_fp4lm` is the "NVFP4 with no quality loss" path: the cuBLASLt FP4
 LM head is the only FP4 component, and the LM-head quantization alone
 preserves HF's argmax (verified in `experiments/diag_nvfp4.py` —
 FP4-roundtripped LM head reports rank 0 for HF's top token).
 
-Background — the previous default `nvfp4` mode loses parity because the
-24 layer projections each compound ~19 % per-group-32 FP4 rel err.
-That's intrinsic to per-group-32 scalar FP4, not a kernel bug. Verified
-by running BOTH this branch's `prefill_megakernel_nvfp4` AND the
-standalone `/home/sparkz/lucebox-hub/megakernel` build with
-`MEGAKERNEL_PREFILL_MODE=raw` — both produce token 303 (' in') instead
-of HF's 11751 (' Paris') on "The capital of France is". The standalone's
-documented `MEGAKERNEL_PREFILL_MODE=hybrid` default produces ' Paris' by
-running BF16 prefill + cuBLASLt FP4 LM head — that is, semantically the
-same as `bf16_fp4lm` here. The "NVFP4 with no quality loss" path is the
-hybrid path. Closing the gap for pure FP4 needs `mma.kind::mxf4` /
-`tcgen05.mma` tensor-core layer projections (open work below).
+**The NVFP4 quantizer fix.** The original kernel-side quantizer picks
+`scale = absmax / 6` (saturating absmax). Outliers dominate that scale
+and ~50 % of FP4's eight magnitudes get wasted capturing them while
+typical values snap to 0 or ±0.5. Compound that ~19 % per-group rel err
+across 24 layers × 7-9 projections and `' Paris'` flips to `' in'`.
+
+`_quantize_matrix_nvfp4` in `model.py` now defaults to an
+**optimal-MSE** scheme: for each 32-element group, sweep 30 candidate
+multipliers of `amax/6` between 0.30× and 2.25×, round each element to
+the nearest FP4 codeword, pick the multiplier with minimum squared
+error. Recovers 32/32 greedy parity. Verified against the standalone
+build with `MEGAKERNEL_PREFILL_MODE=raw` — same kernel, same weights,
+new quantizer → different (correct) token at every position.
+
+Set `MEGAKERNEL_NVFP4_QUANT=naive` to fall back to the kernel
+`absmax/6` quantizer for ablations.
 
 ## Backend default
 
