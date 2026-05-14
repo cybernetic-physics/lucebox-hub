@@ -165,6 +165,86 @@ decode_kernel_impl(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host-side launchers — extern C wrappers around the cooperative-grid
+// dispatch. Each calls the corresponding Cfg specialization.
+// ---------------------------------------------------------------------------
+template<typename Cfg>
+static cudaError_t launch_decode_impl(
+    void *embed_weight, void *final_norm_weight,
+    void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch,
+    void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp,
+    int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
+    int num_blocks,
+    cudaStream_t stream)
+{
+    void *args[] = {
+        &embed_weight, &final_norm_weight, &layer_weights,
+        &fa_k_cache, &fa_v_cache, &dn_states, &conv_bufs,
+        &hidden_buffer, &g_residual,
+        &g_qkv_scratch, &g_kv_scratch, &g_attn_out, &g_mlp_inter,
+        &g_z_scratch, &g_beta_scratch, &g_alpha_scratch,
+        &g_normalized, &g_fa_partials, &g_rope_inv_freq,
+        &yp,
+        &input_token_id, &position, &pos_h, &pos_w, &max_seq_len,
+    };
+    dim3 grid(num_blocks);
+    dim3 block(BLOCK_SIZE);
+    return cudaLaunchCooperativeKernel(
+        (void *)decode_kernel_impl<Cfg>, grid, block, args, 0, stream);
+}
+
+extern "C" cudaError_t launch_decode_0p8b(
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp,
+    int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
+    int num_blocks, cudaStream_t stream)
+{
+    return launch_decode_impl<Cfg_0p8B>(
+        embed_weight, final_norm_weight, layer_weights,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden_buffer, g_residual,
+        g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
+        g_z_scratch, g_beta_scratch, g_alpha_scratch,
+        g_normalized, g_fa_partials, g_rope_inv_freq, yp,
+        input_token_id, position, pos_h, pos_w, max_seq_len,
+        num_blocks, stream);
+}
+
+extern "C" cudaError_t launch_decode_27b(
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp,
+    int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
+    int num_blocks, cudaStream_t stream)
+{
+    return launch_decode_impl<Cfg_27B>(
+        embed_weight, final_norm_weight, layer_weights,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden_buffer, g_residual,
+        g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
+        g_z_scratch, g_beta_scratch, g_alpha_scratch,
+        g_normalized, g_fa_partials, g_rope_inv_freq, yp,
+        input_token_id, position, pos_h, pos_w, max_seq_len,
+        num_blocks, stream);
+}
+
 // Explicit instantiations.
 template __global__ void decode_kernel_impl<Cfg_0p8B>(
     const __nv_bfloat16*, const __nv_bfloat16*,

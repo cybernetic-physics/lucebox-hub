@@ -34,6 +34,11 @@
 
 namespace lucebox::qwen3x {
 
+#ifndef WARP_SIZE_DEFINED
+#define WARP_SIZE_DEFINED
+constexpr int WARP_SIZE_ROPE = 32;
+#endif
+
 // MRoPE sections per the Qwen3.6 config — [t, h, w]. Sum must equal
 // FA_ROTARY_DIM / 2 (32 for both 0.8B and 27B). 0.8B doesn't use MRoPE
 // (text-only model), but giving it the same section layout doesn't
@@ -126,7 +131,7 @@ __device__ void rope_apply(
 
     // For pair index i (0..HALF-1), pick the position dimension based on
     // which MRoPE section it lives in.
-    for (int i = lane_id; i < HALF; i += WARP_SIZE) {
+    for (int i = lane_id; i < HALF; i += WARP_SIZE_ROPE) {
         int p;
         if      (i < sections.t)                          p = pos_t;
         else if (i < sections.t + sections.h)             p = pos_h;

@@ -30,6 +30,30 @@
     return PyModule_Create(&module);                                           \
   }
 
+// Mirror of YarnParams from rope.cuh — host side.
+struct YarnParamsHost {
+    float scale_factor;
+    float beta_fast;
+    float beta_slow;
+    int   original_ctx_len;
+    bool  enabled;
+    int   _pad[3];
+};
+static_assert(sizeof(YarnParamsHost) >= 16, "YarnParams ABI");
+
+extern "C" cudaError_t launch_decode_0p8b(
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, int, int, int, int, cudaStream_t);
+extern "C" cudaError_t launch_decode_27b(
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, int, int, int, int, cudaStream_t);
+
 extern "C" void launch_mlp_smoke_0p8b(
     const void *input, const void *gain,
     const void *w_gate, const void *w_up, const void *w_down,
@@ -104,6 +128,76 @@ void mlp_smoke_27b(
         c10::cuda::getCurrentCUDAStream().stream());
 }
 
+// ---------------------------------------------------------------------------
+// Full decode op: dispatches to Cfg_0p8B or Cfg_27B specialization based on
+// `model_id`. Layer-weight blob is a uint8 device tensor that mirrors the
+// LayerWeights<Cfg> array layout (see weight_packer.py:pack_layer_weights).
+// ---------------------------------------------------------------------------
+
+static int default_num_blocks_for(int cfg_id) {
+    // Heuristic: enough blocks to run Q_HEADS * 8 splits on the FA layer.
+    // 0.8B: 8 * 8 = 64; 27B: 24 * 8 = 192. GB10 has ~64 SMs so we can
+    // afford 64 blocks of cooperative grid (cuLaunchCooperativeKernel
+    // requires the entire grid to fit on the device at once).
+    int dev = 0; cudaGetDevice(&dev);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+    int target = (cfg_id == 0) ? 64 : 96;   // tuned modestly for 0.8B / 27B
+    return std::min(target, std::max(sm_count, 1));
+}
+
+void decode_qwen3x(
+    int64_t model_id,
+    torch::Tensor embed_weight,
+    torch::Tensor final_norm_weight,
+    torch::Tensor layer_weights,
+    torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
+    torch::Tensor dn_states, torch::Tensor conv_bufs,
+    torch::Tensor hidden_buffer, torch::Tensor g_residual,
+    torch::Tensor g_qkv_scratch, torch::Tensor g_kv_scratch,
+    torch::Tensor g_attn_out, torch::Tensor g_mlp_inter,
+    torch::Tensor g_z_scratch, torch::Tensor g_beta_scratch, torch::Tensor g_alpha_scratch,
+    torch::Tensor g_normalized, torch::Tensor g_fa_partials, torch::Tensor g_rope_inv_freq,
+    int64_t input_token_id, int64_t position,
+    int64_t pos_h, int64_t pos_w, int64_t max_seq_len,
+    double yarn_scale, double yarn_beta_fast, double yarn_beta_slow,
+    int64_t yarn_orig_ctx, bool yarn_enabled,
+    int64_t num_blocks)
+{
+    TORCH_CHECK(model_id == 0 || model_id == 1,
+                "model_id must be 0 (Cfg_0p8B) or 1 (Cfg_27B)");
+    TORCH_CHECK(embed_weight.is_cuda() && layer_weights.is_cuda(),
+                "weights must be CUDA");
+
+    YarnParamsHost yp;
+    yp.scale_factor     = (float)yarn_scale;
+    yp.beta_fast        = (float)yarn_beta_fast;
+    yp.beta_slow        = (float)yarn_beta_slow;
+    yp.original_ctx_len = (int)yarn_orig_ctx;
+    yp.enabled          = yarn_enabled;
+    for (int i = 0; i < 3; ++i) yp._pad[i] = 0;
+
+    int nb = (num_blocks > 0) ? (int)num_blocks : default_num_blocks_for((int)model_id);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    auto launcher = (model_id == 0) ? &launch_decode_0p8b : &launch_decode_27b;
+    cudaError_t err = launcher(
+        embed_weight.data_ptr(), final_norm_weight.data_ptr(),
+        layer_weights.data_ptr(),
+        fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
+        dn_states.data_ptr(), conv_bufs.data_ptr(),
+        hidden_buffer.data_ptr(), g_residual.data_ptr(),
+        g_qkv_scratch.data_ptr(), g_kv_scratch.data_ptr(),
+        g_attn_out.data_ptr(), g_mlp_inter.data_ptr(),
+        g_z_scratch.data_ptr(), g_beta_scratch.data_ptr(), g_alpha_scratch.data_ptr(),
+        g_normalized.data_ptr(), g_fa_partials.data_ptr(), g_rope_inv_freq.data_ptr(),
+        yp,
+        (int)input_token_id, (int)position, (int)pos_h, (int)pos_w, (int)max_seq_len,
+        nb, stream);
+    TORCH_CHECK(err == cudaSuccess,
+                "decode_qwen3x launch failed: ", cudaGetErrorString(err));
+}
+
 TORCH_LIBRARY(qwen3x_C, ops) {
     ops.def("mlp_smoke_0p8b(Tensor input, Tensor gain, "
             "Tensor w_gate, Tensor w_up, Tensor w_down, "
@@ -116,6 +210,20 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "Tensor(a!) sh_norm, Tensor(b!) g_gate, Tensor(c!) g_up, "
             "Tensor(d!) sh_inter, Tensor(e!) out) -> ()");
     ops.impl("mlp_smoke_27b", torch::kCUDA, &mlp_smoke_27b);
+
+    ops.def("decode_qwen3x(int model_id, "
+            "Tensor embed_weight, Tensor final_norm_weight, Tensor layer_weights, "
+            "Tensor(a!) fa_k_cache, Tensor(b!) fa_v_cache, "
+            "Tensor(c!) dn_states, Tensor(d!) conv_bufs, "
+            "Tensor(e!) hidden_buffer, Tensor(f!) g_residual, "
+            "Tensor(g!) g_qkv_scratch, Tensor(h!) g_kv_scratch, "
+            "Tensor(i!) g_attn_out, Tensor(j!) g_mlp_inter, "
+            "Tensor(k!) g_z_scratch, Tensor(l!) g_beta_scratch, Tensor(m!) g_alpha_scratch, "
+            "Tensor(n!) g_normalized, Tensor(o!) g_fa_partials, Tensor(p!) g_rope_inv_freq, "
+            "int input_token_id, int position, int pos_h, int pos_w, int max_seq_len, "
+            "float yarn_scale, float yarn_beta_fast, float yarn_beta_slow, "
+            "int yarn_orig_ctx, bool yarn_enabled, int num_blocks) -> ()");
+    ops.impl("decode_qwen3x", torch::kCUDA, &decode_qwen3x);
 }
 
 REGISTER_EXTENSION(qwen3x_C)

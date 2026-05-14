@@ -71,7 +71,7 @@ N_DN = sum(1 for t in LAYER_TYPE if t == 0)   # 48
 # has shape [out_channels, 1, kernel] in HF (we squeeze to [out, kernel]).
 
 def _hf_keys_fa(i: int) -> dict:
-    p = f"model.layers.{i}."
+    p = f"model.language_model.layers.{i}."
     return {
         "input_layernorm":       p + "input_layernorm.weight",
         "q_proj":                p + "self_attn.q_proj.weight",
@@ -88,7 +88,7 @@ def _hf_keys_fa(i: int) -> dict:
 
 
 def _hf_keys_dn(i: int) -> dict:
-    p = f"model.layers.{i}."
+    p = f"model.language_model.layers.{i}."
     return {
         "input_layernorm":       p + "input_layernorm.weight",
         # Qwen3.6 DN uses an in_proj_qkv that concatenates Q, K, V along the
@@ -199,8 +199,15 @@ def load_27b_weights(
             _check_shape(ptrs[13], (HIDDEN_SIZE, INTERMEDIATE_SIZE),            f"L{i} down_proj")
             layer_data.append({"type": 0, "ptrs": ptrs})
 
-    embed = state["model.embed_tokens.weight"].contiguous()
-    fnorm = state["model.norm.weight"].contiguous()
+    # HF Qwen3.6-27B keys: prefixed with model.language_model.
+    embed_key = "model.language_model.embed_tokens.weight"
+    fnorm_key = "model.language_model.norm.weight"
+    if embed_key not in state:
+        embed_key = "model.embed_tokens.weight"  # fallback for variants
+    if fnorm_key not in state:
+        fnorm_key = "model.norm.weight"
+    embed = state[embed_key].contiguous()
+    fnorm = state[fnorm_key].contiguous()
     lm_head = state.get("lm_head.weight", embed).contiguous()
     _check_shape(embed, (VOCAB_SIZE, HIDDEN_SIZE), "embed")
     _check_shape(fnorm, (HIDDEN_SIZE,), "final_norm")

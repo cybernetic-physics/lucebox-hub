@@ -257,6 +257,114 @@ class MTPDecoder:
 
 
 # ---------------------------------------------------------------------------
+# Tree-verify driver (host-side; works against any runtime that exposes
+# target_forward + a tree_attention_mask hook).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TreeNode:
+    """One node in the DDTree-style speculation tree."""
+    token_id: int
+    parent: int                # index in the tree (-1 for root)
+    depth: int
+    score: float = 0.0          # cumulative log-prob from root
+
+    def ancestor_path(self, tree: list["TreeNode"]) -> list[int]:
+        """Return the path of token ids from the root's parent down to
+        this node (inclusive). Used to construct the verify forward's
+        input sequence."""
+        path = [self.token_id]
+        cur = self.parent
+        while cur >= 0:
+            path.append(tree[cur].token_id)
+            cur = tree[cur].parent
+        return list(reversed(path))
+
+
+class TreeBuilder:
+    """Build a DDTree from the MTP draft head's top-k predictions.
+
+    Strategy: from each "best" leaf, expand top_k children and add them
+    to the tree until budget is reached. Score nodes by cumulative
+    log-prob; expand greedily from the best score.
+    """
+    def __init__(self, top_k: int = 4, max_depth: int = 6, budget: int = 22):
+        self.top_k = top_k
+        self.max_depth = max_depth
+        self.budget = budget
+
+    def build(self, draft_fn: Callable[[int, list[int]], list[tuple[int, float]]],
+              root_token: int) -> list[TreeNode]:
+        """Build the tree. `draft_fn(node_idx, path)` returns up to top_k
+        (token_id, log_prob) candidates for the children of `path`."""
+        tree: list[TreeNode] = [TreeNode(root_token, -1, 0, 0.0)]
+        # Frontier: (score, node_idx) heap. Use a list with sorting since
+        # builds are small (budget ~22).
+        frontier = [(0.0, 0)]
+        while frontier and len(tree) < self.budget:
+            frontier.sort(reverse=True)
+            score, node_idx = frontier.pop(0)
+            depth = tree[node_idx].depth
+            if depth >= self.max_depth: continue
+            path = tree[node_idx].ancestor_path(tree)
+            children = draft_fn(node_idx, path)[: self.top_k]
+            for tok, lp in children:
+                if len(tree) >= self.budget: break
+                tree.append(TreeNode(tok, node_idx, depth + 1, score + lp))
+                frontier.append((score + lp, len(tree) - 1))
+        return tree
+
+
+class TreeVerifyDriver:
+    """Host-side tree-verify driver. Uses runtime.target_forward to
+    score every node in one pass (per chain — the parallel tree-mode
+    forward needs the kernel-side `prefill_megakernel_tree<Cfg>` which
+    is the next-session work)."""
+
+    def __init__(self, runtime, cfg: MTPConfig | None = None):
+        self.runtime = runtime
+        self.cfg = cfg or MTPConfig(use_tree_verify=True)
+        self.builder = TreeBuilder(top_k=cfg.max_speculative_tokens if cfg else 4,
+                                    max_depth=6, budget=self.cfg.tree_budget)
+
+    def verify(self, prefix_ids: torch.Tensor, tree: list[TreeNode]
+              ) -> tuple[list[int], int]:
+        """Score every leaf->root path in the tree against the target.
+
+        Returns (accepted_path_tokens, accepted_length). For the host-
+        side reference, we just run one target forward per leaf. The
+        fast path (one forward over the whole tree with tree-attention)
+        needs the kernel-side primitive in `megakernel/tree_verify.cuh`.
+        """
+        leaves = [i for i in range(len(tree))
+                  if all(n.parent != i for n in tree)]
+        best: list[int] = []
+        # Score each leaf's path: count how many of the path's argmaxes
+        # match the target's predictions at each position.
+        for leaf_idx in leaves:
+            path = tree[leaf_idx].ancestor_path(tree)
+            # Path includes the already-committed root_token; we only
+            # speculate from path[1:] onward.
+            spec = path[1:]
+            if not spec: continue
+            ids = torch.cat([prefix_ids,
+                             torch.tensor(spec, device=prefix_ids.device,
+                                          dtype=prefix_ids.dtype)])
+            with torch.no_grad():
+                out = self.runtime.model(input_ids=ids.unsqueeze(0), use_cache=False)
+            logits = out.logits[0, len(prefix_ids)-1 : len(prefix_ids)-1 + len(spec)]
+            argmaxes = logits.argmax(dim=-1).tolist()
+            # Longest matching prefix.
+            accepted: list[int] = []
+            for j, tok in enumerate(spec):
+                if argmaxes[j] == tok: accepted.append(tok)
+                else: break
+            if len(accepted) > len(best):
+                best = accepted
+        return best, len(best)
+
+
+# ---------------------------------------------------------------------------
 # Where the kernel-side speculative tree-verify will plug in
 # ---------------------------------------------------------------------------
 #
