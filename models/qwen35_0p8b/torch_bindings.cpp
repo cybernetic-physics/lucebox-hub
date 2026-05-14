@@ -131,6 +131,194 @@ static void seed_token_buffer(torch::Tensor token_buffer, int token_id) {
     TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync(token_buffer) failed: ",
                 cudaGetErrorString(err));
 }
+
+// ===== NVFP4 KV cache (sm_121a). See nvfp4_kv.cuh for the format spec. =====
+extern "C" void launch_kv_quant(
+    const void *src_bf16, void *data, void *scales,
+    int T, int H, cudaStream_t stream);
+extern "C" void launch_kv_dequant(
+    const void *data, const void *scales, void *dst_bf16,
+    int T, int H, cudaStream_t stream);
+extern "C" void launch_kv_qk_dot(
+    const void *q_bf16, const void *k_data, const void *k_scales, void *scores,
+    int T, int H, int Q_H, cudaStream_t stream);
+extern "C" void launch_kv_attention(
+    const void *q_bf16,
+    const void *k_data, const void *k_scales,
+    const void *v_data, const void *v_scales,
+    void *out_bf16, void *lse_out,
+    int T, int H, int Q_H, float attn_scale, cudaStream_t stream);
+extern "C" void launch_kv_attention_split(
+    const void *q_bf16,
+    const void *k_data, const void *k_scales,
+    const void *v_data, const void *v_scales,
+    void *out_bf16, void *lse_out, void *partials,
+    int T, int H, int Q_H, float attn_scale, int num_splits,
+    cudaStream_t stream);
+
+static constexpr int KV_HEAD_DIM    = 256;
+static constexpr int KV_GROUP_SIZE  = 16;
+static constexpr int KV_DATA_BYTES  = KV_HEAD_DIM / 2;     // 128
+static constexpr int KV_SCALE_BYTES = KV_HEAD_DIM / KV_GROUP_SIZE;  // 16
+
+static inline void check_kv_shapes(
+    const torch::Tensor &bf16, const torch::Tensor &data, const torch::Tensor &scales,
+    const char *bf16_name)
+{
+    TORCH_CHECK(bf16.is_cuda() && bf16.is_contiguous(), bf16_name, " must be contiguous CUDA");
+    TORCH_CHECK(data.is_cuda() && data.is_contiguous(), "data must be contiguous CUDA");
+    TORCH_CHECK(scales.is_cuda() && scales.is_contiguous(), "scales must be contiguous CUDA");
+    TORCH_CHECK(bf16.scalar_type() == torch::kBFloat16, bf16_name, " must be bfloat16");
+    TORCH_CHECK(data.scalar_type() == torch::kUInt8,   "data must be uint8");
+    TORCH_CHECK(scales.scalar_type() == torch::kUInt8, "scales must be uint8 (E4M3 raw bytes)");
+    TORCH_CHECK(bf16.dim() == 3,   bf16_name, " shape must be [T, H, ", KV_HEAD_DIM, "]");
+    TORCH_CHECK(data.dim() == 3,   "data shape must be [T, H, ", KV_DATA_BYTES, "]");
+    TORCH_CHECK(scales.dim() == 3, "scales shape must be [T, H, ", KV_SCALE_BYTES, "]");
+    TORCH_CHECK(bf16.size(2) == KV_HEAD_DIM,     bf16_name, " head_dim must be ", KV_HEAD_DIM);
+    TORCH_CHECK(data.size(2) == KV_DATA_BYTES,   "data last-dim must be ", KV_DATA_BYTES);
+    TORCH_CHECK(scales.size(2) == KV_SCALE_BYTES, "scales last-dim must be ", KV_SCALE_BYTES);
+    TORCH_CHECK(bf16.size(0) == data.size(0) && bf16.size(0) == scales.size(0),
+                "T mismatch across bf16/data/scales");
+    TORCH_CHECK(bf16.size(1) == data.size(1) && bf16.size(1) == scales.size(1),
+                "H mismatch across bf16/data/scales");
+}
+
+void quantize_bf16_to_nvfp4_kv(torch::Tensor src, torch::Tensor data, torch::Tensor scales) {
+    check_kv_shapes(src, data, scales, "src");
+    int T = (int)src.size(0);
+    int H = (int)src.size(1);
+    launch_kv_quant(src.data_ptr(), data.data_ptr(), scales.data_ptr(),
+                    T, H, c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void dequantize_nvfp4_kv_to_bf16(torch::Tensor data, torch::Tensor scales, torch::Tensor dst) {
+    check_kv_shapes(dst, data, scales, "dst");
+    int T = (int)dst.size(0);
+    int H = (int)dst.size(1);
+    launch_kv_dequant(data.data_ptr(), scales.data_ptr(), dst.data_ptr(),
+                      T, H, c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void qk_dot_nvfp4(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_scales,
+                  torch::Tensor scores) {
+    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kBFloat16,
+                "q must be contiguous CUDA bf16");
+    TORCH_CHECK(q.dim() == 2 && q.size(1) == KV_HEAD_DIM,
+                "q shape must be [Q_H, ", KV_HEAD_DIM, "]");
+    TORCH_CHECK(k_data.is_cuda() && k_data.is_contiguous() && k_data.scalar_type() == torch::kUInt8,
+                "k_data must be contiguous CUDA uint8");
+    TORCH_CHECK(k_scales.is_cuda() && k_scales.is_contiguous() && k_scales.scalar_type() == torch::kUInt8,
+                "k_scales must be contiguous CUDA uint8");
+    TORCH_CHECK(k_data.dim() == 3 && k_data.size(2) == KV_DATA_BYTES,
+                "k_data shape must be [T, H, ", KV_DATA_BYTES, "]");
+    TORCH_CHECK(k_scales.dim() == 3 && k_scales.size(2) == KV_SCALE_BYTES,
+                "k_scales shape must be [T, H, ", KV_SCALE_BYTES, "]");
+    TORCH_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.scalar_type() == torch::kFloat,
+                "scores must be contiguous CUDA float32");
+    int T   = (int)k_data.size(0);
+    int H   = (int)k_data.size(1);
+    int Q_H = (int)q.size(0);
+    TORCH_CHECK((Q_H % H) == 0, "Q_H (", Q_H, ") must be a multiple of H (", H, ") for GQA");
+    TORCH_CHECK(scores.dim() == 2 && scores.size(0) == Q_H && scores.size(1) == T,
+                "scores shape must be [Q_H=", Q_H, ", T=", T, "]");
+    launch_kv_qk_dot(q.data_ptr(), k_data.data_ptr(), k_scales.data_ptr(), scores.data_ptr(),
+                     T, H, Q_H, c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void kv_attention_nvfp4(
+    torch::Tensor q,
+    torch::Tensor k_data, torch::Tensor k_scales,
+    torch::Tensor v_data, torch::Tensor v_scales,
+    torch::Tensor out,
+    c10::optional<torch::Tensor> lse_out,
+    double attn_scale)
+{
+    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kBFloat16,
+                "q must be contiguous CUDA bf16");
+    TORCH_CHECK(q.dim() == 2 && q.size(1) == KV_HEAD_DIM,
+                "q shape must be [Q_H, ", KV_HEAD_DIM, "]");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kBFloat16,
+                "out must be contiguous CUDA bf16");
+    TORCH_CHECK(out.sizes() == q.sizes(), "out shape must match q");
+    TORCH_CHECK(k_data.is_cuda() && k_data.is_contiguous() && k_data.scalar_type() == torch::kUInt8,
+                "k_data must be contiguous CUDA uint8");
+    TORCH_CHECK(k_scales.is_cuda() && k_scales.is_contiguous() && k_scales.scalar_type() == torch::kUInt8,
+                "k_scales must be contiguous CUDA uint8");
+    TORCH_CHECK(v_data.is_cuda() && v_data.is_contiguous() && v_data.scalar_type() == torch::kUInt8,
+                "v_data must be contiguous CUDA uint8");
+    TORCH_CHECK(v_scales.is_cuda() && v_scales.is_contiguous() && v_scales.scalar_type() == torch::kUInt8,
+                "v_scales must be contiguous CUDA uint8");
+    TORCH_CHECK(k_data.dim() == 3 && k_data.size(2) == KV_DATA_BYTES,
+                "k_data last-dim must be ", KV_DATA_BYTES);
+    TORCH_CHECK(k_scales.dim() == 3 && k_scales.size(2) == KV_SCALE_BYTES,
+                "k_scales last-dim must be ", KV_SCALE_BYTES);
+    TORCH_CHECK(k_data.sizes() == v_data.sizes(), "K/V data shapes mismatch");
+    TORCH_CHECK(k_scales.sizes() == v_scales.sizes(), "K/V scale shapes mismatch");
+    int T   = (int)k_data.size(0);
+    int H   = (int)k_data.size(1);
+    int Q_H = (int)q.size(0);
+    TORCH_CHECK((Q_H % H) == 0, "Q_H (", Q_H, ") must be a multiple of H (", H, ") for GQA");
+    void *lse_ptr = nullptr;
+    if (lse_out.has_value()) {
+        const auto &t = *lse_out;
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == torch::kFloat
+                    && t.dim() == 1 && t.size(0) == Q_H,
+                    "lse_out must be a contiguous CUDA float32 [Q_H] tensor");
+        lse_ptr = t.data_ptr();
+    }
+    launch_kv_attention(
+        q.data_ptr(), k_data.data_ptr(), k_scales.data_ptr(),
+        v_data.data_ptr(), v_scales.data_ptr(),
+        out.data_ptr(), lse_ptr,
+        T, H, Q_H, (float)attn_scale,
+        c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void kv_attention_split_nvfp4(
+    torch::Tensor q,
+    torch::Tensor k_data, torch::Tensor k_scales,
+    torch::Tensor v_data, torch::Tensor v_scales,
+    torch::Tensor out,
+    torch::Tensor partials,
+    c10::optional<torch::Tensor> lse_out,
+    double attn_scale,
+    int64_t num_splits)
+{
+    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kBFloat16,
+                "q must be contiguous CUDA bf16");
+    TORCH_CHECK(q.dim() == 2 && q.size(1) == KV_HEAD_DIM,
+                "q shape must be [Q_H, ", KV_HEAD_DIM, "]");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kBFloat16,
+                "out must be contiguous CUDA bf16");
+    TORCH_CHECK(out.sizes() == q.sizes(), "out shape must match q");
+    TORCH_CHECK(k_data.dim() == 3 && k_data.size(2) == KV_DATA_BYTES,
+                "k_data last-dim must be ", KV_DATA_BYTES);
+    TORCH_CHECK(k_data.sizes() == v_data.sizes(), "K/V data shapes mismatch");
+    TORCH_CHECK(k_scales.sizes() == v_scales.sizes(), "K/V scale shapes mismatch");
+    TORCH_CHECK(num_splits > 0, "num_splits must be > 0");
+    int T   = (int)k_data.size(0);
+    int H   = (int)k_data.size(1);
+    int Q_H = (int)q.size(0);
+    TORCH_CHECK((Q_H % H) == 0, "Q_H must be a multiple of H");
+    TORCH_CHECK(partials.is_cuda() && partials.is_contiguous()
+                && partials.scalar_type() == torch::kFloat
+                && partials.numel() >= (int64_t)Q_H * num_splits * (KV_HEAD_DIM + 2),
+                "partials must be a contiguous CUDA float tensor of size >= Q_H*num_splits*(head+2)");
+    void *lse_ptr = nullptr;
+    if (lse_out.has_value()) {
+        const auto &t = *lse_out;
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == torch::kFloat
+                    && t.dim() == 1 && t.size(0) == Q_H,
+                    "lse_out must be contiguous CUDA float32 [Q_H]");
+        lse_ptr = t.data_ptr();
+    }
+    launch_kv_attention_split(
+        q.data_ptr(), k_data.data_ptr(), k_scales.data_ptr(),
+        v_data.data_ptr(), v_scales.data_ptr(),
+        out.data_ptr(), lse_ptr, partials.data_ptr(),
+        T, H, Q_H, (float)attn_scale, (int)num_splits,
+        c10::cuda::getCurrentCUDAStream().stream());
+}
 #endif  // MEGAKERNEL_HAS_NVFP4
 
 extern "C" void launch_quantize_nvfp4_out(
@@ -795,6 +983,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor block_max_vals, Tensor block_max_idxs, "
             "int group_size) -> ()");
     ops.impl("lm_head_nvfp4_from_f32", torch::kCUDA, &lm_head_nvfp4_from_f32);
+
+    ops.def("quantize_bf16_to_nvfp4_kv(Tensor src, Tensor(a!) data, Tensor(b!) scales) -> ()");
+    ops.impl("quantize_bf16_to_nvfp4_kv", torch::kCUDA, &quantize_bf16_to_nvfp4_kv);
+
+    ops.def("dequantize_nvfp4_kv_to_bf16(Tensor data, Tensor scales, Tensor(a!) dst) -> ()");
+    ops.impl("dequantize_nvfp4_kv_to_bf16", torch::kCUDA, &dequantize_nvfp4_kv_to_bf16);
+
+    ops.def("qk_dot_nvfp4(Tensor q, Tensor k_data, Tensor k_scales, Tensor(a!) scores) -> ()");
+    ops.impl("qk_dot_nvfp4", torch::kCUDA, &qk_dot_nvfp4);
+
+    ops.def("kv_attention_nvfp4(Tensor q, Tensor k_data, Tensor k_scales, "
+            "Tensor v_data, Tensor v_scales, Tensor(a!) out, Tensor(b!)? lse_out, "
+            "float attn_scale) -> ()");
+    ops.impl("kv_attention_nvfp4", torch::kCUDA, &kv_attention_nvfp4);
+
+    ops.def("kv_attention_split_nvfp4(Tensor q, Tensor k_data, Tensor k_scales, "
+            "Tensor v_data, Tensor v_scales, Tensor(a!) out, Tensor(b!) partials, "
+            "Tensor(c!)? lse_out, float attn_scale, int num_splits) -> ()");
+    ops.impl("kv_attention_split_nvfp4", torch::kCUDA, &kv_attention_split_nvfp4);
 
     ops.def("prefill_megakernel_nvfp4(Tensor output_token, Tensor token_ids, "
             "Tensor embed_weight, Tensor layer_weights_packed, "

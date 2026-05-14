@@ -111,6 +111,7 @@ sources = [
 # cublasLt block-scaled FP4 path). Drop from sm_86-only builds.
 if has_nvfp4:
     sources.append("prefill_bw.cu")
+    sources.append("nvfp4_kv_test.cu")  # NVFP4 KV cache quant/dequant/dot kernels (sm_120+)
 libraries = ["cublas"]
 if has_nvfp4:
     libraries.append("cublasLt")
