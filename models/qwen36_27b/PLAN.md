@@ -68,7 +68,49 @@ cards (RTX 4090, 5090) and free headroom for longer-context training.
       specializations compile + execute on GB10 (`test_mlp_smoke.py`
       passes with cos=1.000).
 
-### Phase 1 — Parameterize 0.8B kernels (1–2 days)
+### Phase 1–7 — Templated kernels + 27B integration [DONE in this session]
+
+- [x] `mlp_forward<Cfg>`, `rmsnorm<Cfg>`, `matvec_bf16<Cfg>` primitives
+      with PyTorch-reference smoke test (cos=1.000 both Cfgs).
+- [x] `full_attention_layer<Cfg>` (port from 0.8B, parameterized).
+- [x] `delta_net_layer<Cfg>` with DN V/QK split — NEW code for 27B.
+- [x] `rope.cuh` with YaRN + MRoPE-interleaved sections {11, 11, 10}.
+- [x] `decode_kernel_impl<Cfg>` persistent layer walker, both Cfgs
+      compile + link cleanly for sm_121a.
+- [x] `prefill_naive<Cfg>` per-token-loop prefill (correctness-first).
+- [x] `tree_verify.cuh` kernel primitives (TreeNode descriptor +
+      walk_ancestors + tree_attention_score).
+- [x] 27B weight packer (`weight_packer.py`) with HF state-dict key
+      mapping validated against the live Qwen3.6-27B safetensors
+      index (1199 keys, 16 FA + 48 DN layers).
+- [x] NVFP4 KV + weight quantization plumbing (`nvfp4_27b.py`) using
+      the existing 0.8B helpers.
+- [x] MTP chain decoder (`mtp_speculative.py`) + tree-verify host
+      driver. Kernel-side tree-mode forward TODO.
+- [x] `qwen3x_C.decode_qwen3x` and `qwen3x_C.prefill_qwen3x_naive`
+      torch ops -- Python-driveable.
+- [x] `Qwen36MegakernelDecoder` Python runtime wrapping the ops with
+      HF-loaded weights.
+- [x] 54 GB Qwen3.6-27B BF16 download complete.
+
+### Phase 8 — End-to-end HF correctness validation (next)
+
+The decoder is wired but the actual `Qwen36MegakernelDecoder.prefill()
+== HF.forward()` parity check needs:
+- HF model load + reference logits capture (in progress)
+- Megakernel forward on the same tokens
+- Compare top-1 / cos-sim / KL
+
+Most likely sources of drift to debug:
+1. **DN V/QK indexing**: per-V-head `a_log` lookup, V-head <-> QK-head
+   GQA mapping. Highest risk because DN V/QK split is the one piece
+   of genuinely new code.
+2. **MRoPE section boundaries**: HF uses 32 freq pairs in 3 groups
+   {11, 11, 10}. My implementation indexes by `i < t/i < t+h/else`.
+3. **DN normalization order**: per-head L2 norm of Q gets a 1/sqrt(128)
+   factor; that may differ in Qwen3.6's "output_gate_type: swish".
+
+### Phase 9 — Optimization (after parity)
 
 Make the existing kernels work for both 0.8B and 27B. Strategy: template
 the per-model constants on a `ModelConfig` struct passed as a `__constant__`
