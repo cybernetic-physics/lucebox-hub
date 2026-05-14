@@ -277,10 +277,12 @@ __device__ void full_attention_layer(
                 #pragma unroll
                 for (int e = 0; e < EPL; ++e) {
                     int idx = lane_id * EPL + e;
-                    // Qwen3.6 uses output_gate_type="swish" (SiLU): the gate
-                    // is multiplied by sigmoid(gate), NOT just sigmoid(gate).
-                    // 0.8B used plain sigmoid; 27B uses SiLU.
-                    g_attn_out[qh * D + idx] = go[e] * rcp * fast_silu(gate[idx]);
+                    // Output gate. C3 experiment showed sigmoid is closer to
+                    // HF than silu (silu made cos=0.81 at layer 3 vs 0.997
+                    // with sigmoid). Despite the config saying
+                    // output_gate_type="swish", HF's runtime must be applying
+                    // plain sigmoid here. TODO: confirm in HF source.
+                    g_attn_out[qh * D + idx] = go[e] * rcp * fast_sigmoid(gate[idx]);
                 }
             }
         }
