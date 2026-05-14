@@ -48,7 +48,7 @@ extern "C" cudaError_t launch_decode_0p8b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
 
 extern "C" cudaError_t launch_decode_27b(
     void *embed_weight, void *final_norm_weight, void *layer_weights,
@@ -59,7 +59,7 @@ extern "C" cudaError_t launch_decode_27b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Naive prefill: S sequential decode calls. Token i is read from
@@ -96,7 +96,8 @@ static cudaError_t prefill_naive_impl(
             g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
             g_z_scratch, g_beta_scratch, g_alpha_scratch,
             g_normalized, g_fa_partials, g_rope_inv_freq, yp,
-            (int)tok, pos, 0, 0, max_seq_len, num_blocks, stream);
+            (int)tok, pos, 0, 0, max_seq_len, num_blocks,
+            /*g_layer_outputs=*/nullptr, stream);
         if (err != cudaSuccess) return err;
     }
     return cudaSuccess;

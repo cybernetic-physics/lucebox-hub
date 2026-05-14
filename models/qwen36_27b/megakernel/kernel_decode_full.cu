@@ -84,7 +84,8 @@ decode_kernel_impl(
     int input_token_id,
     int position,
     int pos_h, int pos_w,  // 0 for text-only
-    int max_seq_len)
+    int max_seq_len,
+    __nv_bfloat16 *__restrict__ g_layer_outputs)  // optional [NUM_LAYERS, HIDDEN]
 {
     AtomicGridSync grid{};
     constexpr int H        = Cfg::HIDDEN;
@@ -146,6 +147,17 @@ decode_kernel_impl(
                 shmem_bf16, hidden_buffer);
             ++fa_layer_idx;
         }
+        // Debug capture: write hidden_buffer to layer-indexed slot if requested.
+        if (g_layer_outputs != nullptr) {
+            grid.sync();
+            if (blockIdx.x == 0) {
+                __nv_bfloat16 *dst = g_layer_outputs + (size_t)layer * H;
+                for (int i = threadIdx.x; i < H; i += BLOCK_SIZE) {
+                    dst[i] = hidden_buffer[i];
+                }
+            }
+            grid.sync();
+        }
     }
 
     // 4. Final RMSNorm (block 0 only; result lives in g_normalized as fp32
@@ -195,6 +207,7 @@ static cudaError_t launch_decode_impl(
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
     int num_blocks,
+    void *g_layer_outputs,
     cudaStream_t stream)
 {
     void *args[] = {
@@ -206,6 +219,7 @@ static cudaError_t launch_decode_impl(
         &g_normalized, &g_fa_partials, &g_rope_inv_freq,
         &yp,
         &input_token_id, &position, &pos_h, &pos_w, &max_seq_len,
+        &g_layer_outputs,
     };
     dim3 grid(num_blocks);
     dim3 block(BLOCK_SIZE);
@@ -222,7 +236,7 @@ extern "C" cudaError_t launch_decode_0p8b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_0p8B>(
         embed_weight, final_norm_weight, layer_weights,
@@ -232,7 +246,7 @@ extern "C" cudaError_t launch_decode_0p8b(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, stream);
+        num_blocks, g_layer_outputs, stream);
 }
 
 extern "C" cudaError_t launch_decode_27b(
@@ -244,7 +258,7 @@ extern "C" cudaError_t launch_decode_27b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_27B>(
         embed_weight, final_norm_weight, layer_weights,
@@ -254,7 +268,7 @@ extern "C" cudaError_t launch_decode_27b(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, stream);
+        num_blocks, g_layer_outputs, stream);
 }
 
 // Explicit instantiations.
@@ -265,7 +279,8 @@ template __global__ void decode_kernel_impl<Cfg_0p8B>(
     __nv_bfloat16*, __nv_bfloat16*,
     float*, float*, float*, float*, float*, float*, float*, float*,
     float*, float*, YarnParams,
-    int, int, int, int, int);
+    int, int, int, int, int,
+    __nv_bfloat16*);
 template __global__ void decode_kernel_impl<Cfg_27B>(
     const __nv_bfloat16*, const __nv_bfloat16*,
     const LayerWeights<Cfg_27B>*,
@@ -273,6 +288,7 @@ template __global__ void decode_kernel_impl<Cfg_27B>(
     __nv_bfloat16*, __nv_bfloat16*,
     float*, float*, float*, float*, float*, float*, float*, float*,
     float*, float*, YarnParams,
-    int, int, int, int, int);
+    int, int, int, int, int,
+    __nv_bfloat16*);
 
 }  // namespace lucebox::qwen3x

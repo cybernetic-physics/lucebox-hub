@@ -46,13 +46,13 @@ extern "C" cudaError_t launch_decode_0p8b(
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, int, void*, cudaStream_t);
 extern "C" cudaError_t launch_decode_27b(
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, int, void*, cudaStream_t);
 
 extern "C" cudaError_t launch_prefill_naive_0p8b(
     const int32_t*, int,
@@ -61,6 +61,7 @@ extern "C" cudaError_t launch_prefill_naive_0p8b(
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
     int, int, cudaStream_t);
+// NOTE: prefill launcher signature unchanged (no debug capture in prefill yet).
 extern "C" cudaError_t launch_prefill_naive_27b(
     const int32_t*, int,
     void*, void*, void*, void*, void*, void*, void*,
@@ -177,7 +178,8 @@ void decode_qwen3x(
     int64_t pos_h, int64_t pos_w, int64_t max_seq_len,
     double yarn_scale, double yarn_beta_fast, double yarn_beta_slow,
     int64_t yarn_orig_ctx, bool yarn_enabled,
-    int64_t num_blocks)
+    int64_t num_blocks,
+    c10::optional<torch::Tensor> g_layer_outputs)
 {
     TORCH_CHECK(model_id == 0 || model_id == 1,
                 "model_id must be 0 (Cfg_0p8B) or 1 (Cfg_27B)");
@@ -196,6 +198,14 @@ void decode_qwen3x(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     auto launcher = (model_id == 0) ? &launch_decode_0p8b : &launch_decode_27b;
+    void *layer_outs_ptr = nullptr;
+    if (g_layer_outputs.has_value()) {
+        const auto &t = *g_layer_outputs;
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous()
+                    && t.scalar_type() == torch::kBFloat16,
+                    "g_layer_outputs must be contiguous CUDA bf16");
+        layer_outs_ptr = t.data_ptr();
+    }
     cudaError_t err = launcher(
         embed_weight.data_ptr(), final_norm_weight.data_ptr(),
         layer_weights.data_ptr(),
@@ -208,7 +218,7 @@ void decode_qwen3x(
         g_normalized.data_ptr(), g_fa_partials.data_ptr(), g_rope_inv_freq.data_ptr(),
         yp,
         (int)input_token_id, (int)position, (int)pos_h, (int)pos_w, (int)max_seq_len,
-        nb, stream);
+        nb, layer_outs_ptr, stream);
     TORCH_CHECK(err == cudaSuccess,
                 "decode_qwen3x launch failed: ", cudaGetErrorString(err));
 }
@@ -302,7 +312,8 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "Tensor(n!) g_normalized, Tensor(o!) g_fa_partials, Tensor(p!) g_rope_inv_freq, "
             "int input_token_id, int position, int pos_h, int pos_w, int max_seq_len, "
             "float yarn_scale, float yarn_beta_fast, float yarn_beta_slow, "
-            "int yarn_orig_ctx, bool yarn_enabled, int num_blocks) -> ()");
+            "int yarn_orig_ctx, bool yarn_enabled, int num_blocks, "
+            "Tensor(q!)? g_layer_outputs) -> ()");
     ops.impl("decode_qwen3x", torch::kCUDA, &decode_qwen3x);
 }
 

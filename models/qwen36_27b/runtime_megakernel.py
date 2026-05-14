@@ -114,9 +114,19 @@ class Qwen36MegakernelDecoder:
         if verbose: print(f"[megakernel] allocating scratch (max_seq={max_seq})...", flush=True)
         self.sc = alloc_scratch(max_seq=max_seq)
 
+        # Optional layer-by-layer hidden-state capture buffer. Allocated on
+        # demand via enable_layer_capture(). When set, decode_qwen3x writes
+        # each layer's `hidden_buffer` into this [NUM_LAYERS, HIDDEN] slab.
+        self.layer_capture: torch.Tensor | None = None
+
         if verbose:
             gpu = torch.cuda.memory_allocated() / (1024 ** 3)
             print(f"[megakernel] ready. GPU alloc: {gpu:.1f} GB")
+
+    def enable_layer_capture(self):
+        """Allocate the [NUM_LAYERS, HIDDEN] capture buffer."""
+        self.layer_capture = torch.zeros(NUM_LAYERS, HIDDEN_SIZE,
+                                          dtype=torch.bfloat16, device="cuda")
 
     def reset(self):
         self.position = 0
@@ -174,6 +184,7 @@ class Qwen36MegakernelDecoder:
             float(self.yarn["beta_slow"]),
             int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),
             int(self.num_blocks),
+            self.layer_capture,
         )
         self.position += 1
         return self._argmax_from_normalized()
