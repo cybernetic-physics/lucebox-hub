@@ -54,6 +54,21 @@ extern "C" cudaError_t launch_decode_27b(
     YarnParamsHost,
     int, int, int, int, int, int, cudaStream_t);
 
+extern "C" cudaError_t launch_prefill_naive_0p8b(
+    const int32_t*, int,
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, cudaStream_t);
+extern "C" cudaError_t launch_prefill_naive_27b(
+    const int32_t*, int,
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, cudaStream_t);
+
 extern "C" void launch_mlp_smoke_0p8b(
     const void *input, const void *gain,
     const void *w_gate, const void *w_up, const void *w_down,
@@ -198,6 +213,58 @@ void decode_qwen3x(
                 "decode_qwen3x launch failed: ", cudaGetErrorString(err));
 }
 
+void prefill_qwen3x_naive(
+    int64_t model_id,
+    torch::Tensor tokens,                                  // [S] int32
+    torch::Tensor embed_weight,
+    torch::Tensor final_norm_weight,
+    torch::Tensor layer_weights,
+    torch::Tensor fa_k_cache, torch::Tensor fa_v_cache,
+    torch::Tensor dn_states, torch::Tensor conv_bufs,
+    torch::Tensor hidden_buffer, torch::Tensor g_residual,
+    torch::Tensor g_qkv_scratch, torch::Tensor g_kv_scratch,
+    torch::Tensor g_attn_out, torch::Tensor g_mlp_inter,
+    torch::Tensor g_z_scratch, torch::Tensor g_beta_scratch, torch::Tensor g_alpha_scratch,
+    torch::Tensor g_normalized, torch::Tensor g_fa_partials, torch::Tensor g_rope_inv_freq,
+    int64_t max_seq_len,
+    double yarn_scale, double yarn_beta_fast, double yarn_beta_slow,
+    int64_t yarn_orig_ctx, bool yarn_enabled,
+    int64_t num_blocks)
+{
+    TORCH_CHECK(model_id == 0 || model_id == 1, "model_id must be 0 or 1");
+    TORCH_CHECK(tokens.is_cuda() && tokens.is_contiguous()
+                && tokens.scalar_type() == torch::kInt32,
+                "tokens must be contiguous CUDA int32 [S]");
+    TORCH_CHECK(tokens.dim() == 1, "tokens must be 1-D");
+    int S = (int)tokens.size(0);
+    YarnParamsHost yp;
+    yp.scale_factor     = (float)yarn_scale;
+    yp.beta_fast        = (float)yarn_beta_fast;
+    yp.beta_slow        = (float)yarn_beta_slow;
+    yp.original_ctx_len = (int)yarn_orig_ctx;
+    yp.enabled          = yarn_enabled;
+    for (int i = 0; i < 3; ++i) yp._pad[i] = 0;
+    int nb = (num_blocks > 0) ? (int)num_blocks : default_num_blocks_for((int)model_id);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    auto launcher = (model_id == 0) ? &launch_prefill_naive_0p8b
+                                    : &launch_prefill_naive_27b;
+    cudaError_t err = launcher(
+        (const int32_t*)tokens.data_ptr(), S,
+        embed_weight.data_ptr(), final_norm_weight.data_ptr(),
+        layer_weights.data_ptr(),
+        fa_k_cache.data_ptr(), fa_v_cache.data_ptr(),
+        dn_states.data_ptr(), conv_bufs.data_ptr(),
+        hidden_buffer.data_ptr(), g_residual.data_ptr(),
+        g_qkv_scratch.data_ptr(), g_kv_scratch.data_ptr(),
+        g_attn_out.data_ptr(), g_mlp_inter.data_ptr(),
+        g_z_scratch.data_ptr(), g_beta_scratch.data_ptr(), g_alpha_scratch.data_ptr(),
+        g_normalized.data_ptr(), g_fa_partials.data_ptr(), g_rope_inv_freq.data_ptr(),
+        yp, (int)max_seq_len, nb, stream);
+    TORCH_CHECK(err == cudaSuccess,
+                "prefill_qwen3x_naive launch failed: ", cudaGetErrorString(err));
+}
+
 TORCH_LIBRARY(qwen3x_C, ops) {
     ops.def("mlp_smoke_0p8b(Tensor input, Tensor gain, "
             "Tensor w_gate, Tensor w_up, Tensor w_down, "
@@ -210,6 +277,19 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "Tensor(a!) sh_norm, Tensor(b!) g_gate, Tensor(c!) g_up, "
             "Tensor(d!) sh_inter, Tensor(e!) out) -> ()");
     ops.impl("mlp_smoke_27b", torch::kCUDA, &mlp_smoke_27b);
+
+    ops.def("prefill_qwen3x_naive(int model_id, Tensor tokens, "
+            "Tensor embed_weight, Tensor final_norm_weight, Tensor layer_weights, "
+            "Tensor(a!) fa_k_cache, Tensor(b!) fa_v_cache, "
+            "Tensor(c!) dn_states, Tensor(d!) conv_bufs, "
+            "Tensor(e!) hidden_buffer, Tensor(f!) g_residual, "
+            "Tensor(g!) g_qkv_scratch, Tensor(h!) g_kv_scratch, "
+            "Tensor(i!) g_attn_out, Tensor(j!) g_mlp_inter, "
+            "Tensor(k!) g_z_scratch, Tensor(l!) g_beta_scratch, Tensor(m!) g_alpha_scratch, "
+            "Tensor(n!) g_normalized, Tensor(o!) g_fa_partials, Tensor(p!) g_rope_inv_freq, "
+            "int max_seq_len, float yarn_scale, float yarn_beta_fast, "
+            "float yarn_beta_slow, int yarn_orig_ctx, bool yarn_enabled, int num_blocks) -> ()");
+    ops.impl("prefill_qwen3x_naive", torch::kCUDA, &prefill_qwen3x_naive);
 
     ops.def("decode_qwen3x(int model_id, "
             "Tensor embed_weight, Tensor final_norm_weight, Tensor layer_weights, "
