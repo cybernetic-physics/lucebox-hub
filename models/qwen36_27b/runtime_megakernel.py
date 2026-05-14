@@ -81,17 +81,32 @@ class Qwen36MegakernelDecoder:
                  max_seq: int = 32768,
                  yarn: dict | None = None,
                  num_blocks: int = 0,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 hf_model=None,        # pre-loaded HF model to share weights
+                 tokenizer=None):
         self.max_seq = max_seq
         self.yarn = yarn or DEFAULT_YARN
         self.num_blocks = num_blocks
         self.position = 0
         self.verbose = verbose
 
-        if verbose: print(f"[megakernel] loading HF weights from {model_name}", flush=True)
-        t0 = time.perf_counter()
-        self.weights, self.tokenizer = load_27b_weights(model_name, verbose=verbose)
-        if verbose: print(f"[megakernel]   ...{time.perf_counter()-t0:.1f}s", flush=True)
+        if hf_model is not None:
+            if verbose: print("[megakernel] using pre-loaded HF model "
+                              "(sharing weight tensors)", flush=True)
+            # Extract the same weights structure load_27b_weights would build,
+            # but from the existing HF model — no extra allocation.
+            from weight_packer import _unify_from_hf_model
+            self.weights = _unify_from_hf_model(hf_model)
+            self.tokenizer = tokenizer
+            if self.tokenizer is None:
+                from transformers import AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, trust_remote_code=True)
+        else:
+            if verbose: print(f"[megakernel] loading HF weights from {model_name}", flush=True)
+            t0 = time.perf_counter()
+            self.weights, self.tokenizer = load_27b_weights(model_name, verbose=verbose)
+            if verbose: print(f"[megakernel]   ...{time.perf_counter()-t0:.1f}s", flush=True)
 
         if verbose: print("[megakernel] packing layer pointers...", flush=True)
         self.layer_blob = pack_layer_weights(self.weights["layer_data"])

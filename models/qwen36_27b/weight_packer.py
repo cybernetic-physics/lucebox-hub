@@ -126,6 +126,46 @@ def _check_shape(t: torch.Tensor, expected: tuple, name: str):
 # Loader
 # ---------------------------------------------------------------------------
 
+def _unify_from_hf_model(model, verbose: bool = False):
+    """Build the kernel-shaped weights dict from an already-loaded HF
+    model. Tensors are views into model.state_dict() — no new allocation.
+    The caller is responsible for keeping `model` alive."""
+    state = dict(model.state_dict())
+    # Strip PEFT base_layer aliasing if any.
+    for k, v in list(state.items()):
+        if k.endswith(".base_layer.weight"):
+            short = k[: -len(".base_layer.weight")] + ".weight"
+            state[short] = v
+
+    layer_data = []
+    for i in range(NUM_LAYERS):
+        if LAYER_TYPE[i] == 1:
+            keys = _hf_keys_fa(i)
+            order = ("input_layernorm", "q_proj", "k_proj", "v_proj",
+                     "q_norm", "k_norm", "o_proj", "post_attn_layernorm",
+                     "gate_proj", "up_proj", "down_proj")
+        else:
+            keys = _hf_keys_dn(i)
+            order = ("input_layernorm", "qkv_proj", "z_proj", "beta_proj",
+                     "alpha_proj", "conv1d", "a_log", "dt_bias", "norm_weight",
+                     "out_proj", "post_attn_layernorm", "gate_proj", "up_proj",
+                     "down_proj")
+        ptrs = [state[keys[k]].contiguous() for k in order]
+        # conv1d in HF: [DN_CONV_CH, 1, KERNEL] -> squeeze to [DN_CONV_CH, KERNEL]
+        if LAYER_TYPE[i] == 0 and ptrs[5].dim() == 3:
+            ptrs[5] = ptrs[5].squeeze(1).contiguous()
+        layer_data.append({"type": int(LAYER_TYPE[i]), "ptrs": ptrs})
+
+    embed = state["model.embed_tokens.weight"].contiguous()
+    fnorm = state["model.norm.weight"].contiguous()
+    lm_head = state.get("lm_head.weight", embed).contiguous()
+    return dict(
+        embed_weight=embed, final_norm_weight=fnorm,
+        lm_head_weight=lm_head, layer_data=layer_data,
+        _hf_keepalive=model,
+    )
+
+
 def load_27b_weights(
     model_name: str = "Qwen/Qwen3.6-27B",
     device: str = "cuda",
