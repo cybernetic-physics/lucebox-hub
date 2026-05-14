@@ -35,16 +35,28 @@
 
 namespace lucebox::qwen3x {
 
-// Variant per-layer weight pointer block: union-style with both FA and DN.
+// Variant per-layer weight pointer block. Sized to exactly 128 bytes
+// so the Python packer's stride-128 layout in weight_packer.py matches
+// `sizeof(LayerWeights<Cfg>)` exactly. The union holds the per-layer-
+// type pointer struct (FA = 11 ptrs, DN = 14 ptrs; DN is the larger).
 template<typename Cfg>
 struct LayerWeights {
-    int layer_type;       // 0 = DN, 1 = FA  (matches FamilyInvariants::is_fa_layer)
-    int _pad;
+    int layer_type;       // 0 = DN, 1 = FA
+    int _pad0;
     union {
         FullAttnWeights<Cfg> fa;
         DeltaNetWeights<Cfg> dn;
+        char _force_size[120];   // forces union to 120 bytes; total struct = 128
     };
+    // Layout:
+    //   bytes [0..4)    layer_type
+    //   bytes [4..8)    _pad0
+    //   bytes [8..128)  union of FA(88B)/DN(112B), trailing bytes are pad
 };
+static_assert(sizeof(LayerWeights<Cfg_0p8B>) == 128,
+              "LayerWeights<Cfg_0p8B> must be 128 bytes");
+static_assert(sizeof(LayerWeights<Cfg_27B>)  == 128,
+              "LayerWeights<Cfg_27B> must be 128 bytes");
 
 template<typename Cfg>
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
