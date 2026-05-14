@@ -141,12 +141,15 @@ __device__ void full_attention_layer(
     }
 
     // 3b. Q-norm + RoPE (split across blocks; one query head per warp slot).
+    // Q-proj output layout: [Q_h0..Q_hN-1, gate_h0..gate_hN-1] (split, not
+    // interleaved). Q[qh] is at g_q[qh*D .. (qh+1)*D); gate[qh] is at
+    // g_q[Q_SIZE + qh*D .. Q_SIZE + (qh+1)*D).
     int hpb = (Q_H + num_blocks - 1) / num_blocks;
     int hs = block_id * hpb;
     int he = min(hs + hpb, Q_H);
     for (int qh = hs; qh < he; ++qh) {
         if (warp_id == 0) {
-            float *qhp = g_q + qh * D * 2;  // q | gate interleaved (Q first half)
+            float *qhp = g_q + qh * D;
             head_norm_rope<Cfg>(qhp, w.q_norm_weight, position, pos_h, pos_w,
                                 g_rope_inv_freq, yp, sections, lane_id);
         }
@@ -175,7 +178,7 @@ __device__ void full_attention_layer(
             int t_start = my_split * per_split;
             int t_end   = min(t_start + per_split, cache_len);
             int kvh = my_qh / GQA;
-            const float *qh = g_q + my_qh * D * 2;     // skip gate, Q first half
+            const float *qh = g_q + my_qh * D;     // split layout: Q-block
 
             float q_local[EPL];
             #pragma unroll
@@ -252,8 +255,8 @@ __device__ void full_attention_layer(
 
         if (block_id < Q_H) {
             int qh = block_id;
-            const float *qhp = g_q + qh * D * 2;
-            const float *gate = qhp + D;  // gate occupies second half of pair
+            // Split layout: gate is in second half of g_q, at Q_SIZE + qh*D.
+            const float *gate = g_q + Q_SIZE + qh * D;
             if (warp_id == 0) {
                 float gm = -INFINITY;
                 for (int s = 0; s < num_splits; ++s)
