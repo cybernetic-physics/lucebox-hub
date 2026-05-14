@@ -277,7 +277,10 @@ __device__ void full_attention_layer(
                 #pragma unroll
                 for (int e = 0; e < EPL; ++e) {
                     int idx = lane_id * EPL + e;
-                    g_attn_out[qh * D + idx] = go[e] * rcp * fast_sigmoid(gate[idx]);
+                    // Qwen3.6 uses output_gate_type="swish" (SiLU): the gate
+                    // is multiplied by sigmoid(gate), NOT just sigmoid(gate).
+                    // 0.8B used plain sigmoid; 27B uses SiLU.
+                    g_attn_out[qh * D + idx] = go[e] * rcp * fast_silu(gate[idx]);
                 }
             }
         }
