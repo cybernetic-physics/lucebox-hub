@@ -71,7 +71,11 @@ N_DN = sum(1 for t in LAYER_TYPE if t == 0)   # 48
 # has shape [out_channels, 1, kernel] in HF (we squeeze to [out, kernel]).
 
 def _hf_keys_fa(i: int) -> dict:
-    p = f"model.language_model.layers.{i}."
+    # NOTE: state_dict prefix is `model.layers.X.*` even though the safetensors
+    # file uses `model.language_model.layers.X.*` — HF's AutoModelForCausalLM
+    # instantiates Qwen3_5TextModel which flattens that wrapper. The
+    # safetensors->state_dict mapping happens automatically at from_pretrained.
+    p = f"model.layers.{i}."
     return {
         "input_layernorm":       p + "input_layernorm.weight",
         "q_proj":                p + "self_attn.q_proj.weight",
@@ -88,7 +92,11 @@ def _hf_keys_fa(i: int) -> dict:
 
 
 def _hf_keys_dn(i: int) -> dict:
-    p = f"model.language_model.layers.{i}."
+    # NOTE: state_dict prefix is `model.layers.X.*` even though the safetensors
+    # file uses `model.language_model.layers.X.*` — HF's AutoModelForCausalLM
+    # instantiates Qwen3_5TextModel which flattens that wrapper. The
+    # safetensors->state_dict mapping happens automatically at from_pretrained.
+    p = f"model.layers.{i}."
     return {
         "input_layernorm":       p + "input_layernorm.weight",
         # Qwen3.6 DN uses an in_proj_qkv that concatenates Q, K, V along the
@@ -153,6 +161,18 @@ def load_27b_weights(
             aliased[short] = v
     state = aliased
 
+    # Diagnostic: if the expected prefix isn't found, sample available keys
+    # so the user can see what HF actually wrapped.
+    probe_key = _hf_keys_fa(3)["input_layernorm"]   # any FA-layer key works
+    if probe_key not in state:
+        sample = [k for k in state.keys() if "input_layernorm" in k][:5]
+        raise KeyError(
+            f"weight_packer probe failed: {probe_key!r} not in state_dict.\n"
+            f"  Sample input_layernorm keys found in state_dict: {sample}\n"
+            f"  This means HF wrapped the model differently than expected; "
+            f"update _hf_keys_fa / _hf_keys_dn to match."
+        )
+
     layer_data = []
     for i in range(NUM_LAYERS):
         if LAYER_TYPE[i] == 1:
@@ -199,15 +219,12 @@ def load_27b_weights(
             _check_shape(ptrs[13], (HIDDEN_SIZE, INTERMEDIATE_SIZE),            f"L{i} down_proj")
             layer_data.append({"type": 0, "ptrs": ptrs})
 
-    # HF Qwen3.6-27B keys: prefixed with model.language_model.
-    embed_key = "model.language_model.embed_tokens.weight"
-    fnorm_key = "model.language_model.norm.weight"
-    if embed_key not in state:
-        embed_key = "model.embed_tokens.weight"  # fallback for variants
-    if fnorm_key not in state:
-        fnorm_key = "model.norm.weight"
-    embed = state[embed_key].contiguous()
-    fnorm = state[fnorm_key].contiguous()
+    # State-dict keys for Qwen3_5TextModel (the CausalLM-wrapped variant)
+    # use the standard `model.embed_tokens.weight` etc. — no `language_model`
+    # middle. The safetensors file has `model.language_model.embed_tokens.weight`
+    # but HF strips that wrapper at load time.
+    embed = state["model.embed_tokens.weight"].contiguous()
+    fnorm = state["model.norm.weight"].contiguous()
     lm_head = state.get("lm_head.weight", embed).contiguous()
     _check_shape(embed, (VOCAB_SIZE, HIDDEN_SIZE), "embed")
     _check_shape(fnorm, (HIDDEN_SIZE,), "final_norm")
