@@ -125,14 +125,16 @@ _FP4_SCALE_CANDIDATES = [
 ]
 
 
-def _optimal_quantize_matrix_nvfp4(weight, group_size):
+def _optimal_quantize_matrix_nvfp4(weight, group_size, row_chunk: int = 4096):
     """Optimal-MSE FP4 group quantizer. Picks per-group scale that
     minimizes squared error against the FP4 codeword grid, instead of
     the saturating amax/6 default. Verified to give 32/32 greedy parity
     with HF on Qwen3.5-0.8B at NVFP4_GROUP_SIZE=32.
 
-    Pure-PyTorch implementation; runs once at load time. Drop-in
-    replacement for `_quantize_matrix_nvfp4`.
+    Pure-PyTorch implementation, vectorized with `torch.bucketize` over
+    the FP4 E2M1 thresholds so we don't materialize an 8-way magnitude
+    broadcast. Runs once at load time. Drop-in replacement for
+    `_quantize_matrix_nvfp4`.
     """
     if weight.dtype != torch.bfloat16:
         raise TypeError(f"expected bfloat16 weight, got {weight.dtype}")
@@ -145,45 +147,56 @@ def _optimal_quantize_matrix_nvfp4(weight, group_size):
 
     g = group_size
     G = cols // g
-    Wf = weight.float()
-    Wg = Wf.reshape(rows, G, g)  # [rows, G, g]
-    pos = torch.tensor(_FP4_POS_MAGS, dtype=torch.float32, device=weight.device)
-    cands = torch.tensor(_FP4_SCALE_CANDIDATES, dtype=torch.float32, device=weight.device)
+    dev = weight.device
+    pos = torch.tensor(_FP4_POS_MAGS, dtype=torch.float32, device=dev)
+    # Midpoint thresholds between adjacent FP4 magnitudes — for nearest-
+    # codeword rounding via bucketize (no 8-way broadcast).
+    thresh = torch.tensor(
+        [(_FP4_POS_MAGS[i] + _FP4_POS_MAGS[i+1]) / 2.0
+         for i in range(len(_FP4_POS_MAGS) - 1)],
+        dtype=torch.float32, device=dev)  # [7]
+    cands = torch.tensor(_FP4_SCALE_CANDIDATES, dtype=torch.float32, device=dev)
+    C = cands.numel()
 
-    amax = Wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # [rows, G, 1]
-    base = amax / 6.0  # [rows, G, 1]
-    # cand_scales: [rows, G, 1, C]
-    cand_scales = base.unsqueeze(-1) * cands.view(1, 1, 1, -1)
-    inv = 1.0 / cand_scales  # same shape
+    packed_out = torch.empty((rows, cols // 2), dtype=torch.uint8, device=dev)
+    scales_out = torch.empty((rows, G), dtype=torch.float16, device=dev)
 
-    Wg4 = Wg.unsqueeze(-1)  # [rows, G, g, 1]
-    norm = Wg4 * inv  # [rows, G, g, C]
-    sign = norm.sign()
-    abs_norm = norm.abs()  # [rows, G, g, C]
-    # Round abs to nearest FP4 positive magnitude.
-    idx = (abs_norm.unsqueeze(-1) - pos).abs().argmin(dim=-1)  # [rows, G, g, C]
-    qmag = pos[idx]  # [rows, G, g, C]
-    qval = qmag * sign * cand_scales  # back to weight units
+    for r0 in range(0, rows, row_chunk):
+        r1 = min(r0 + row_chunk, rows)
+        Wg = weight[r0:r1].float().reshape(r1 - r0, G, g)  # [n, G, g]
 
-    err = (qval - Wg4).pow(2).sum(dim=2)  # [rows, G, C]
-    best_c = err.argmin(dim=-1)  # [rows, G]
-    best_scale = cand_scales.squeeze(-2).gather(
-        -1, best_c.unsqueeze(-1)).squeeze(-1)  # [rows, G]
+        amax = Wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # [n, G, 1]
+        base = amax / 6.0  # [n, G, 1]
+        # Loop candidate scales (small C, large per-iteration tensors).
+        # Per candidate we get total squared error per group. Pick min.
+        best_err = torch.full((r1 - r0, G), float("inf"), device=dev)
+        best_scale = torch.empty((r1 - r0, G), dtype=torch.float32, device=dev)
+        for c in range(C):
+            s = base.squeeze(-1) * cands[c]  # [n, G]
+            inv = 1.0 / s.unsqueeze(-1)  # [n, G, 1]
+            norm = Wg * inv  # [n, G, g]
+            abs_norm = norm.abs()  # [n, G, g]
+            sign_n = norm.sign()
+            idx = torch.bucketize(abs_norm.contiguous(), thresh)  # [n, G, g] in [0, 7]
+            qmag = pos[idx]  # [n, G, g]
+            qval = qmag * sign_n * s.unsqueeze(-1)  # [n, G, g]
+            err = (qval - Wg).pow(2).sum(dim=-1)  # [n, G]
+            mask = err < best_err
+            best_err = torch.where(mask, err, best_err)
+            best_scale = torch.where(mask, s, best_scale)
 
-    # Re-quantize at the best per-group scale.
-    inv_best = (1.0 / best_scale).unsqueeze(-1)  # [rows, G, 1]
-    norm_b = Wg * inv_best
-    sign_b = norm_b.sign()
-    abs_b = norm_b.abs()
-    idx_b = (abs_b.unsqueeze(-1) - pos).abs().argmin(dim=-1)  # [rows, G, g]
-    # FP4 code: sign bit at bit 3, magnitude bits 0-2.
-    is_neg = (sign_b < 0).to(torch.uint8)
-    code = (is_neg << 3) | idx_b.to(torch.uint8)  # [rows, G, g] in [0, 16)
-    code_flat = code.reshape(rows, G * g)  # [rows, cols]
-    packed = (code_flat[:, 1::2] << 4) | code_flat[:, 0::2]  # [rows, cols//2]
+        # Re-quantize at the best per-group scale.
+        inv_best = (1.0 / best_scale).unsqueeze(-1)  # [n, G, 1]
+        norm_b = Wg * inv_best
+        sign_b = norm_b.sign()
+        idx_b = torch.bucketize(norm_b.abs().contiguous(), thresh)  # [n, G, g]
+        is_neg = (sign_b < 0).to(torch.uint8)
+        code = (is_neg << 3) | idx_b.to(torch.uint8)
+        code_flat = code.reshape(r1 - r0, G * g)
+        packed_out[r0:r1] = (code_flat[:, 1::2] << 4) | code_flat[:, 0::2]
+        scales_out[r0:r1] = best_scale.to(torch.float16)
 
-    scales_fp16 = best_scale.to(torch.float16)  # [rows, G]
-    return {"packed": packed.contiguous(), "scales": scales_fp16.contiguous()}
+    return {"packed": packed_out.contiguous(), "scales": scales_out.contiguous()}
 
 
 def _quantize_matrix_nvfp4(weight, group_size):
