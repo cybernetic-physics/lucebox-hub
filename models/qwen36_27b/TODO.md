@@ -93,9 +93,49 @@ certainly surfaces bugs; the next ~5 items are the tight debug loop.
 - **Acceptance**: cos ≥ 0.999 at the previously-divergent layer.
 
 ### C5. Loop C2-C4 until all 64 layers agree
-- **Status**: TODO  | **Prio**: P0  | **Effort**: M  | **Deps**: C4
+- **Status**: WIP  | **Prio**: P0  | **Effort**: M  | **Deps**: C4
 - Each fix may surface the next divergence point. Bound the loop by
   the layer count.
+
+**Current state from C3 diff** (`tests/test_c3_layer_diff.py` on
+real Qwen3.6-27B weights, single space token at position 0):
+
+```
+DN layers 0..2  : cos > 0.9999   (essentially perfect)
+FA layer 3      : cos = 0.997    (first FA, ~0.003 drift)
+FA layers 7-43  : cos ~ 0.997-0.999  (compounds slowly)
+FA layer 47+    : cos ~ 0.98 -> 0.28  (catastrophic by L63)
+final logits    : cos = 0.87, top-1 mismatch (HF=16 ours=220)
+```
+
+**Diagnosis so far**:
+- The DN V/QK split (the new code we were most worried about) is
+  CORRECT. DN layers match HF essentially bit-exactly.
+- Bug is localized to the FA layer; produces ~0.003 cosine drift
+  per FA pass, compounds over 16 FA layers to 0 cos.
+
+**Tested**:
+- `swish` interpretation of output gate (`fast_silu(gate)`): WORSE
+  (cos=0.81 at layer 3). HF must be applying plain sigmoid even
+  though config says "swish".
+
+**Remaining suspects, in priority**:
+1. Q-proj output layout — `[Q_h0..gate_h0, Q_h1..gate_h1, ...]`
+   interleaved vs `[Q_all, gate_all]` split. The 0.8B reference uses
+   interleaved and matches HF, but Qwen3.6 may use a different
+   convention. Verify by inspecting an HF q_proj output row count
+   per head.
+2. Per-head QK-norm placement relative to RoPE (before vs after).
+   For position 0 RoPE is identity so this can't cause the layer-3
+   drift; but it'd surface at non-zero positions.
+3. The attention `1/sqrt(head_dim)` scaling vs `1/sqrt(rotary_dim)`.
+4. KV cache row stride at the FA-layer index level.
+
+**Next debug step**: add intermediate-value capture buffers to the FA
+kernel (Q-proj output, gate slice, V output, attn_out, post-gate
+attn_out) and compare element-by-element with HF using a hook on
+the corresponding modules. ~1 day of scratch-buffer plumbing.
+
 - **Acceptance**: top-1 + cos ≥ 0.999 against HF on a single-prompt
   forward at S=1.
 
