@@ -40,7 +40,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="qwen3x_C",
-            sources=["torch_bindings.cpp", "kernel_decode.cu"],
+            sources=["torch_bindings.cpp", "kernel_decode.cu", "kernel_decode_full.cu"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": [

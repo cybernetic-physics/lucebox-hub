@@ -23,21 +23,20 @@ Build + test:
 /home/sparkz/rl/.venv/bin/python3 test_mlp_smoke.py
 ```
 
-## What's left (clearly scoped)
+## Status update (post second session)
 
 | component | status | notes |
 |---|---|---|
-| `mlp_forward<Cfg>` | done | RMSNorm + SwiGLU + down + residual |
-| `full_attention_layer<Cfg>` | TODO | port from `models/qwen35_0p8b/kernel.cu:409`; mostly parameterization (GQA ratio 24/4 vs 8/2 just scales) |
-| `delta_net_layer<Cfg>` | **TODO new code** | DN V/QK split (`DN_V_PER_QK`) — 0.8B is 1, 27B is 3. Each QK head feeds 3 V heads via GQA-style replication |
-| `yarn_rope<Cfg>` | TODO | Qwen3.6 RoPE extension to 262k; 0.8B doesn't use it |
-| `mrope_interleaved<Cfg>` | TODO | multimodal RoPE; text-only path concatenates sections on the temporal axis |
-| `decode_kernel<Cfg>` | TODO | the persistent megakernel that walks all `NUM_LAYERS` layers per token (cooperative-groups grid sync) |
-| `prefill_megakernel<Cfg>` | TODO | multi-token prefill — port `models/qwen35_0p8b/prefill_megakernel.cu` |
-| 27B weight packer | TODO | python; mirror `models/qwen35_0p8b/model.py:_pack_layer_weights` for the 27B shapes |
-| NVFP4 KV at 27B | TODO | re-use `models/qwen35_0p8b/nvfp4_kv.cuh` — same head_dim=256 |
-| NVFP4 weights at 27B | TODO | port the existing 0.8B optimal-MSE quantizer |
-| MTP speculative decode | TODO | Qwen3.6 ships a native NEXTN draft head |
+| `mlp_forward<Cfg>` | **done, tested** | cos=1.000 vs torch ref on both 0.8B and 27B shapes |
+| `full_attention_layer<Cfg>` | **done, compiles** | Cfg-templated RMSNorm + Q/K/V proj + per-head QK-norm + RoPE + split-K online softmax + O-proj. End-to-end test pending the 54 GB HF weight pull |
+| `delta_net_layer<Cfg>` | **done, compiles** | with the DN V/QK split (`V_PER_QK`). Per-V-head recurrent state of shape [V_HEADS, VAL, KEY]. End-to-end test pending HF weights |
+| `rope.cuh` (YaRN + MRoPE) | **done** | NTK-aware ramp blend + MRoPE-interleaved sections `{11, 11, 10}`. Text-only path concatenates on temporal axis (h=w=0) |
+| `decode_kernel<Cfg>` | **done, compiles** | persistent megakernel layer walker — both Cfg specializations build cleanly for sm_121a |
+| `prefill_megakernel<Cfg>` | TODO | multi-token; same primitives, different shmem layout |
+| 27B weight packer | **done** | `../weight_packer.py` with HF state-dict mapping + shape checks per layer |
+| NVFP4 KV at 27B | **done (Python plumbing)** | `../nvfp4_27b.py` — re-uses the 0.8B helpers (head_dim=256 identical). Footprint: 0.56 GB at 32k ctx, 4.5 GB at 262k ctx |
+| NVFP4 weights at 27B | **done (Python plumbing)** | applies the existing optimal-MSE quantizer. Footprint: 13.3 GB total. **Fits on a 24 GB consumer card** |
+| MTP speculative decode | **chain version implemented**, tree-verify TODO | `../mtp_speculative.py`. Chain MTP works against any runtime; tree-verify needs `prefill_megakernel_tree<Cfg>` (~3 days kernel work) |
 
 ## Phase ordering recommendation
 
