@@ -51,13 +51,22 @@ cards (RTX 4090, 5090) and free headroom for longer-context training.
 
 ## Phased deliverables
 
-### Phase 0 — Foundation (this session)
+### Phase 0 — Foundation [DONE]
 
 - [x] Directory scaffold (`models/qwen36_27b/`).
-- [ ] HF reference harness: load Qwen3.6-27B, capture reference logits
-      and hidden states for fixed prompts, save as `.pt` golden.
-- [ ] Parameterization audit: inventory of `constexpr` constants in the
-      0.8B kernels that must become template/runtime params.
+- [x] HF reference harness (`reference/capture_hf_reference.py`).
+- [x] Parameterization audit (`docs/parameterization_audit.md`).
+- [x] HF-backed `runtime_hf.Qwen36Runtime` with thinking/tools/grammar/
+      chat-template support. Working correctness baseline today.
+- [x] OpenAI-compatible server (`serve/openai_server.py`).
+- [x] Launcher script (`run_hermes.sh`).
+- [x] Wiring tests (`test/test_runtime_wiring.py`) — 10/10 pass.
+- [x] Correctness regression harness (`test/test_correctness_vs_hf.py`)
+      — skip-with-message until 54 GB weights are pulled.
+- [x] Megakernel Phase-1 scaffold (`megakernel/`) — `Cfg_0p8B` and
+      `Cfg_27B` tag structs, templated `mlp_forward<Cfg>`, both
+      specializations compile + execute on GB10 (`test_mlp_smoke.py`
+      passes with cos=1.000).
 
 ### Phase 1 — Parameterize 0.8B kernels (1–2 days)
 

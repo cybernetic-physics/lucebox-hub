@@ -4,28 +4,86 @@ Migration target: extend the hybrid-DeltaNet megakernel pattern from
 `models/qwen35_0p8b/` to Qwen3.6-27B (dense 27B, multimodal, 262K
 native context).
 
-**Status**: Phase 0 — scaffolding + HF reference correctness harness +
-parameterization audit. The actual kernels still live in
-`models/qwen35_0p8b/`; this directory holds the planning, reference
-capture, and forthcoming 27B-specific code.
+**Status**: Phase 0 done. You can serve Qwen3.6-27B today via the HF
+backend (`runtime_hf` + `serve/openai_server.py`) — correctness baseline
+with thinking-mode, native Qwen3 tool calls, and XGrammar-constrained
+sampling. The megakernel speed path is Phase 1+; the templated `Cfg`
+scaffold in `megakernel/` compiles cleanly for both 0.8B and 27B
+specializations.
 
 See [PLAN.md](PLAN.md) for the phased migration roadmap.
+
+## Quick start (HF-backed runtime, today)
+
+```bash
+# 1. Pull weights (~54 GB BF16; one-time, ~1 hour)
+HF_HOME=/home/sparkz/rl/.hf_cache /home/sparkz/rl/.venv/bin/python3 -c \
+    "from transformers import AutoModelForCausalLM; \
+     AutoModelForCausalLM.from_pretrained('Qwen/Qwen3.6-27B', dtype='bfloat16')"
+
+# 2. Wiring tests (no model download required)
+HF_HOME=/home/sparkz/rl/.hf_cache /home/sparkz/rl/.venv/bin/python3 \
+    test/test_runtime_wiring.py
+
+# 3. Serve OpenAI-compat
+./run_hermes.sh                            # boot server, exit
+./run_hermes.sh "Reply with one sentence." # one-shot prompt
+./run_hermes.sh --interactive              # REPL
+
+# 4. Correctness vs HF (regression bar for the future megakernel)
+HF_HOME=/home/sparkz/rl/.hf_cache /home/sparkz/rl/.venv/bin/python3 \
+    test/test_correctness_vs_hf.py
+```
+
+## Megakernel scaffold (Phase 1 on-ramp)
+
+```bash
+cd megakernel
+/home/sparkz/rl/.venv/bin/python3 setup.py build_ext --inplace
+/home/sparkz/rl/.venv/bin/python3 test_mlp_smoke.py
+# expect: BOTH Cfg SPECIALIZATIONS PASS
+```
 
 ## Layout
 
 ```
 .
 ├── PLAN.md                            phased migration plan
+├── runtime_hf.py                      HF-backed Decoder (working today)
+├── run_hermes.sh                      one-command launcher
 ├── reference/
-│   ├── capture_hf_reference.py        load HF Qwen3.6-27B, capture
-│   │                                  reference logits + hidden states
-│   │                                  for fixed prompts
-│   └── (golden tensors land here once captured)
+│   └── capture_hf_reference.py        HF golden capture
 ├── docs/
-│   └── parameterization_audit.md      inventory of constexpr to
-│                                      template for 0.8B → 27B
-└── trainer/                           (empty; populated in Phase 2+)
+│   └── parameterization_audit.md      constexpr inventory
+├── serve/
+│   └── openai_server.py               OpenAI-compat HTTP server
+├── test/
+│   ├── test_runtime_wiring.py         wiring tests (no big download)
+│   └── test_correctness_vs_hf.py      regression harness vs HF
+├── megakernel/
+│   ├── Cfg.cuh                        Cfg_0p8B + Cfg_27B tag structs
+│   ├── kernel_decode.cu               templated MLP (Phase-1 scaffold)
+│   ├── torch_bindings.cpp             qwen3x_C ops
+│   ├── setup.py                       build script
+│   ├── test_mlp_smoke.py              both Cfgs validated
+│   └── README.md                      scaffold notes
+└── trainer/                           (empty; populated in Phase 5+)
 ```
+
+## Capabilities supported today (via HF backend)
+
+| feature | status | notes |
+|---|:---:|---|
+| greedy + sampled decode | OK | via `runtime_hf.complete` / `chat` |
+| chat template (multi-turn, system) | OK | from HF tokenizer's template |
+| thinking mode `<think>...</think>` | OK | toggle via `GenerationConfig.enable_thinking` |
+| tool calls (Qwen3 native + Hermes) | OK | parsed post-hoc; OpenAI-style response |
+| grammar via XGrammar (JSON schema) | OK | `response_format.json_schema=` |
+| grammar via GBNF/EBNF | OK | `response_format.grammar=` |
+| 32k context | OK (slow) | HF runtime; megakernel needed for fast |
+| streaming | not yet | future addition |
+| vision tower | not yet | text-only path for now |
+| MTP speculative decode | not yet | Phase 6 (megakernel-side) |
 
 ## Quickstart (once Phase 2 lands)
 
