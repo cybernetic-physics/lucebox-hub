@@ -107,6 +107,7 @@ Need parallel-S prefill (S2) for usable long-context speed.
 | NVFP4 weight quantization | ✓ top-1 match HF; **2.97× decode speed** vs BF16 (13.4 vs 4.5 tok/s) |
 | NVFP4 KV cache | helpers only; not wired into FA |
 | Multi-turn KV reuse (KV prefill from `start_position`) | ✓ |
+| prefill_via_hf (HF batched forward, ~50× prefill speedup) | BROKEN — first token OK, subsequent decodes diverge. Cache-layout bug |
 | Concurrent request batching | not yet |
 | Vision tower | not yet |
 | Long-context (>32k) via prefill_megakernel | requires S2 |
