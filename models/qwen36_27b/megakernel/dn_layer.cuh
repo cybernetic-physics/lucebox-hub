@@ -135,6 +135,13 @@ __device__ void delta_net_layer(
         __shared__ float s_v[Cfg::DN_VALUE_DIM];
 
         // Three regions to conv1d: Q[qk_head], K[qk_head], V[v_head].
+        // S8 NOTE: with V_PER_QK > 1, V-head siblings sharing a QK head
+        // redundantly do the Q/K conv1d AND write the same conv_buf
+        // slots in parallel. The writes are race-immune (identical
+        // values) but the work is duplicated V_PER_QK× per layer.
+        // A dedup attempt was reverted because non-owner blocks would
+        // need a grid.sync to see owner's conv_buf writes, which
+        // costs more than the dedup saves at V_PER_QK=3.
         struct Region { int ch_base; int count; float *dst; };
         Region regs[3] = {
             { qk_head * KEY,             KEY, s_q },

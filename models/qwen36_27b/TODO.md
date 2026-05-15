@@ -301,17 +301,17 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   head instead of the LM-head approximation it uses now.
 - **Acceptance**: chain MTP achieves AL ≥ 3 on natural text.
 
-### S8. DN V_PER_QK conv1d deduplication
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: —
-- In the DN layer, V_PER_QK=3 sibling blocks (sharing a QK head) ALL
-  redundantly do the conv1d for their shared Q/K channels and race
-  on the `conv_buf` writes (same data → no functional bug, but
-  wasteful). Designate the v_head % V_PER_QK == 0 block as the
-  "owner" that does the Q/K conv1d once; have the other siblings
-  read its s_q/s_k via cooperative shmem or just re-read conv_buf
-  after the owner writes.
-- Estimated savings: small (~few µs/layer × 48 DN ≈ <1 ms total).
-  Low priority but a real waste.
+### S8. DN V_PER_QK conv1d deduplication [WONT-FIX]
+- **Status**: WONT-FIX  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- Attempted: only the v_head % V_PER_QK == 0 block does the Q/K shift+
+  write; siblings just re-dot from the already-shifted conv_buf.
+- Reverted: requires a grid.sync between V region and Q+K region so
+  non-owner blocks see the owner's writes — and the sync cost (tens of
+  µs) exceeds the dedup savings (~few µs/layer × V_PER_QK=3
+  redundancy). The current race-immune write pattern (all blocks write
+  identical values) is net faster.
+- Code comment in dn_layer.cuh documents this decision so future-us
+  doesn't try again.
 
 ### S6. Tree-verify parallel forward kernel
 - **Status**: TODO  | **Prio**: P1  | **Effort**: L  | **Deps**: S5
