@@ -138,35 +138,53 @@ __device__ void matvec_down_residual(
 // ---------------------------------------------------------------------------
 
 // FP4 E2M1 LUT: 8 positive magnitudes + 8 negatives.
+//
+// Constant-memory broadcast serializes when warp lanes access different
+// indices — and in matvec each lane reads a different FP4 nibble, so we
+// were paying 32 serial cycles per lookup. The fix is to load this
+// 16-entry table into shared memory once per kernel; shared memory
+// resolves divergent-index reads with only bank-conflict cost (16 banks
+// for 16 elements → at worst 2-way conflict).
 __device__ __constant__ float QWEN3X_FP4_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
 };
 
+// Initialize a 16-float shared-memory LUT mirroring the constant LUT.
+// Call once at the start of any block that will do NVFP4 matvecs.
+__device__ __forceinline__ void load_fp4_lut_to_shmem(float *s_lut)
+{
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = QWEN3X_FP4_E2M1_LUT[threadIdx.x];
+    __syncthreads();
+}
+
 // Decode 4 FP4x2 bytes (32 bits = 8 FP4 values) into 8 dequantized floats,
-// multiplied by `scale`, dotted against 8 bf16 activations.
+// multiplied by `scale`, dotted against 8 bf16 activations. `lut` is a
+// 16-entry shared-memory float table.
 __device__ __forceinline__ float dot8_nvfp4_bf16(
-    uint32_t packed, float scale, const __nv_bfloat16 *act)
+    uint32_t packed, float scale, const __nv_bfloat16 *act,
+    const float *__restrict__ lut)
 {
     float sum = 0.0f;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         unsigned int byte = (packed >> (i * 8)) & 0xff;
-        sum += QWEN3X_FP4_E2M1_LUT[byte & 0xf] * __bfloat162float(act[i * 2 + 0]);
-        sum += QWEN3X_FP4_E2M1_LUT[byte >> 4]  * __bfloat162float(act[i * 2 + 1]);
+        sum += lut[byte & 0xf] * __bfloat162float(act[i * 2 + 0]);
+        sum += lut[byte >> 4]  * __bfloat162float(act[i * 2 + 1]);
     }
     return sum * scale;
 }
 
 __device__ __forceinline__ float dot8_nvfp4_f32(
-    uint32_t packed, float scale, const float *act)
+    uint32_t packed, float scale, const float *act,
+    const float *__restrict__ lut)
 {
     float sum = 0.0f;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         unsigned int byte = (packed >> (i * 8)) & 0xff;
-        sum += QWEN3X_FP4_E2M1_LUT[byte & 0xf] * act[i * 2 + 0];
-        sum += QWEN3X_FP4_E2M1_LUT[byte >> 4]  * act[i * 2 + 1];
+        sum += lut[byte & 0xf] * act[i * 2 + 0];
+        sum += lut[byte >> 4]  * act[i * 2 + 1];
     }
     return sum * scale;
 }
@@ -185,6 +203,9 @@ __device__ void matvec_nvfp4(
     float *__restrict__ output,
     int in_dim, int out_dim, int num_blocks)
 {
+    __shared__ float s_fp4_lut[16];
+    load_fp4_lut_to_shmem(s_fp4_lut);
+
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -206,7 +227,7 @@ __device__ void matvec_nvfp4(
                     reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
                 int scale_idx = k / GROUP_SIZE;
                 float scale = __half2float(__ldg(s_row + scale_idx));
-                sum += dot8_nvfp4_bf16(packed, scale, s_input + k);
+                sum += dot8_nvfp4_bf16(packed, scale, s_input + k, s_fp4_lut);
             }
             sum = warp_reduce_sum_x(sum);
             if (lane_id == 0) output[m] = sum;
@@ -241,6 +262,9 @@ __device__ void matvec_gate_up_silu_nvfp4(
     float *__restrict__ output,
     int in_dim, int out_dim, int num_blocks)
 {
+    __shared__ float s_fp4_lut[16];
+    load_fp4_lut_to_shmem(s_fp4_lut);
+
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -265,8 +289,8 @@ __device__ void matvec_gate_up_silu_nvfp4(
                 int si = k / GROUP_SIZE;
                 float g_scale = __half2float(__ldg(gs_row + si));
                 float u_scale = __half2float(__ldg(us_row + si));
-                gs += dot8_nvfp4_bf16(gp, g_scale, s_input + k);
-                us += dot8_nvfp4_bf16(up, u_scale, s_input + k);
+                gs += dot8_nvfp4_bf16(gp, g_scale, s_input + k, s_fp4_lut);
+                us += dot8_nvfp4_bf16(up, u_scale, s_input + k, s_fp4_lut);
             }
             gs = warp_reduce_sum_x(gs);
             us = warp_reduce_sum_x(us);
@@ -283,6 +307,9 @@ __device__ void matvec_down_residual_nvfp4(
     __nv_bfloat16 *__restrict__ hidden_out,
     int in_dim, int out_dim, int num_blocks)
 {
+    __shared__ float s_fp4_lut[16];
+    load_fp4_lut_to_shmem(s_fp4_lut);
+
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -302,7 +329,7 @@ __device__ void matvec_down_residual_nvfp4(
                 uint32_t packed = load_32bit(
                     reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
                 float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
-                sum += dot8_nvfp4_f32(packed, scale, s_input + k);
+                sum += dot8_nvfp4_f32(packed, scale, s_input + k, s_fp4_lut);
             }
             sum = warp_reduce_sum_x(sum);
             if (lane_id == 0)
