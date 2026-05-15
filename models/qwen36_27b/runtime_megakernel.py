@@ -72,9 +72,14 @@ class MegakernelGenConfig:
 
 class Qwen36MegakernelDecoder:
     """Loads HF Qwen/Qwen3.6-27B weights, packs them, and serves
-    prefill + decode through `torch.ops.qwen3x_C`."""
+    prefill + decode through `torch.ops.qwen3x_C`.
 
-    MODEL_ID = 1  # Cfg_27B in the kernel
+    `backend` selects the kernel variant:
+      "bf16"  -> MODEL_ID = 1  (BF16 weights, ~50 GB)
+      "nvfp4" -> MODEL_ID = 3  (NVFP4 weights, ~14 GB; runs the
+                                _nvfp4 layer functions and dispatches
+                                to launch_decode_27b_nvfp4).
+    """
 
     def __init__(self,
                  model_name: str = "Qwen/Qwen3.6-27B",
@@ -83,12 +88,20 @@ class Qwen36MegakernelDecoder:
                  num_blocks: int = 0,
                  verbose: bool = True,
                  hf_model=None,        # pre-loaded HF model to share weights
-                 tokenizer=None):
+                 tokenizer=None,
+                 backend: str = "bf16"):
         self.max_seq = max_seq
         self.yarn = yarn or DEFAULT_YARN
         self.num_blocks = num_blocks
         self.position = 0
         self.verbose = verbose
+        self.backend = backend
+        if backend == "bf16":
+            self.MODEL_ID = 1
+        elif backend == "nvfp4":
+            self.MODEL_ID = 3
+        else:
+            raise ValueError(f"backend must be 'bf16' or 'nvfp4', got {backend!r}")
 
         if hf_model is not None:
             if verbose: print("[megakernel] using pre-loaded HF model "
@@ -107,6 +120,16 @@ class Qwen36MegakernelDecoder:
             t0 = time.perf_counter()
             self.weights, self.tokenizer = load_27b_weights(model_name, verbose=verbose)
             if verbose: print(f"[megakernel]   ...{time.perf_counter()-t0:.1f}s", flush=True)
+
+        if backend == "nvfp4":
+            if verbose: print("[megakernel] quantizing layer weights to NVFP4...",
+                              flush=True)
+            from nvfp4_27b import quantize_27b_weights
+            quantized = quantize_27b_weights(self.weights["layer_data"], verbose=verbose)
+            # Remap type: 0 (DN_bf16) -> 2 (DN_nvfp4); 1 (FA_bf16) -> 3 (FA_nvfp4).
+            for ld in quantized:
+                ld["type"] = int(ld["type"]) + 2
+            self.weights["layer_data"] = quantized
 
         if verbose: print("[megakernel] packing layer pointers...", flush=True)
         self.layer_blob = pack_layer_weights(self.weights["layer_data"])

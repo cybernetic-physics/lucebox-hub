@@ -50,7 +50,9 @@ def main():
     print("\nPacking layer pointers...")
     blob = pack_layer_weights(layer_data)
     print(f"  blob size: {blob.numel() / 1024:.1f} KB")
-    print(f"  expected: {NUM_LAYERS * 128} bytes (128 B per layer struct)")
+    from weight_packer import PACK_STRUCT
+    print(f"  expected: {NUM_LAYERS * PACK_STRUCT} bytes "
+          f"({PACK_STRUCT} B per layer struct)")
 
     # Allocate scratch.
     print("\nAllocating scratch (max_seq=32768)...")
