@@ -49,6 +49,7 @@ setup(
                     f"-arch={arch}",
                     "--use_fast_math",
                     "-std=c++17",
+                    "-lineinfo",
                 ],
             },
         ),

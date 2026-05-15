@@ -61,6 +61,28 @@ extern "C" cudaError_t launch_decode_27b(
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
     int num_blocks, void *g_layer_outputs, cudaStream_t stream);
 
+extern "C" cudaError_t launch_decode_0p8b_nvfp4(
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp,
+    int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+
+extern "C" cudaError_t launch_decode_27b_nvfp4(
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp,
+    int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
+    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // Naive prefill: S sequential decode calls. Token i is read from
 // host_token_ids[i] (a device-side int32 array). Last position's logits
@@ -84,7 +106,10 @@ static cudaError_t prefill_naive_impl(
     // Copy each token id to host (could be batched, but S is at most 32k
     // and the copy is small — bound by the kernel launch latency, not the
     // memcpy.)
-    auto launcher = (CFG_ID == 0) ? &launch_decode_0p8b : &launch_decode_27b;
+    auto launcher = (CFG_ID == 0) ? &launch_decode_0p8b
+                  : (CFG_ID == 1) ? &launch_decode_27b
+                  : (CFG_ID == 2) ? &launch_decode_0p8b_nvfp4
+                                  : &launch_decode_27b_nvfp4;
     for (int pos = 0; pos < S; ++pos) {
         int32_t tok = 0;
         cudaError_t err = cudaMemcpyAsync(&tok, device_token_ids + pos,
@@ -147,6 +172,50 @@ extern "C" cudaError_t launch_prefill_naive_27b(
     void *g_layer_outputs, cudaStream_t stream)
 {
     return prefill_naive_impl<1>(
+        device_token_ids, S,
+        embed_weight, final_norm_weight, layer_weights,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden_buffer, g_residual,
+        g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
+        g_z_scratch, g_beta_scratch, g_alpha_scratch,
+        g_normalized, g_fa_partials, g_rope_inv_freq,
+        yp, max_seq_len, num_blocks, g_layer_outputs, stream);
+}
+
+extern "C" cudaError_t launch_prefill_naive_0p8b_nvfp4(
+    const int32_t *device_token_ids, int S,
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp, int max_seq_len, int num_blocks,
+    void *g_layer_outputs, cudaStream_t stream)
+{
+    return prefill_naive_impl<2>(
+        device_token_ids, S,
+        embed_weight, final_norm_weight, layer_weights,
+        fa_k_cache, fa_v_cache, dn_states, conv_bufs,
+        hidden_buffer, g_residual,
+        g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
+        g_z_scratch, g_beta_scratch, g_alpha_scratch,
+        g_normalized, g_fa_partials, g_rope_inv_freq,
+        yp, max_seq_len, num_blocks, g_layer_outputs, stream);
+}
+
+extern "C" cudaError_t launch_prefill_naive_27b_nvfp4(
+    const int32_t *device_token_ids, int S,
+    void *embed_weight, void *final_norm_weight, void *layer_weights,
+    void *fa_k_cache, void *fa_v_cache, void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
+    void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
+    void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
+    YarnParams yp, int max_seq_len, int num_blocks,
+    void *g_layer_outputs, cudaStream_t stream)
+{
+    return prefill_naive_impl<3>(
         device_token_ids, S,
         embed_weight, final_norm_weight, layer_weights,
         fa_k_cache, fa_v_cache, dn_states, conv_bufs,

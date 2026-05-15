@@ -53,6 +53,18 @@ extern "C" cudaError_t launch_decode_27b(
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
     int, int, int, int, int, int, void*, cudaStream_t);
+extern "C" cudaError_t launch_decode_0p8b_nvfp4(
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, int, int, int, int, void*, cudaStream_t);
+extern "C" cudaError_t launch_decode_27b_nvfp4(
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, int, int, int, int, void*, cudaStream_t);
 
 extern "C" cudaError_t launch_prefill_naive_0p8b(
     const int32_t*, int,
@@ -62,6 +74,20 @@ extern "C" cudaError_t launch_prefill_naive_0p8b(
     YarnParamsHost,
     int, int, void*, cudaStream_t);
 extern "C" cudaError_t launch_prefill_naive_27b(
+    const int32_t*, int,
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, void*, cudaStream_t);
+extern "C" cudaError_t launch_prefill_naive_0p8b_nvfp4(
+    const int32_t*, int,
+    void*, void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    YarnParamsHost,
+    int, int, void*, cudaStream_t);
+extern "C" cudaError_t launch_prefill_naive_27b_nvfp4(
     const int32_t*, int,
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
@@ -180,8 +206,9 @@ void decode_qwen3x(
     int64_t num_blocks,
     c10::optional<torch::Tensor> g_layer_outputs)
 {
-    TORCH_CHECK(model_id == 0 || model_id == 1,
-                "model_id must be 0 (Cfg_0p8B) or 1 (Cfg_27B)");
+    TORCH_CHECK(model_id >= 0 && model_id <= 3,
+                "model_id must be 0..3 (0=0.8B bf16, 1=27B bf16, "
+                "2=0.8B nvfp4, 3=27B nvfp4)");
     TORCH_CHECK(embed_weight.is_cuda() && layer_weights.is_cuda(),
                 "weights must be CUDA");
 
@@ -196,7 +223,10 @@ void decode_qwen3x(
     int nb = (num_blocks > 0) ? (int)num_blocks : default_num_blocks_for((int)model_id);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    auto launcher = (model_id == 0) ? &launch_decode_0p8b : &launch_decode_27b;
+    auto launcher = (model_id == 0) ? &launch_decode_0p8b
+                  : (model_id == 1) ? &launch_decode_27b
+                  : (model_id == 2) ? &launch_decode_0p8b_nvfp4
+                                    : &launch_decode_27b_nvfp4;
     void *layer_outs_ptr = nullptr;
     if (g_layer_outputs.has_value()) {
         const auto &t = *g_layer_outputs;
@@ -241,7 +271,7 @@ void prefill_qwen3x_naive(
     int64_t num_blocks,
     c10::optional<torch::Tensor> g_layer_outputs)
 {
-    TORCH_CHECK(model_id == 0 || model_id == 1, "model_id must be 0 or 1");
+    TORCH_CHECK(model_id >= 0 && model_id <= 3, "model_id must be 0..3");
     TORCH_CHECK(tokens.is_cuda() && tokens.is_contiguous()
                 && tokens.scalar_type() == torch::kInt32,
                 "tokens must be contiguous CUDA int32 [S]");
@@ -258,7 +288,9 @@ void prefill_qwen3x_naive(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     auto launcher = (model_id == 0) ? &launch_prefill_naive_0p8b
-                                    : &launch_prefill_naive_27b;
+                  : (model_id == 1) ? &launch_prefill_naive_27b
+                  : (model_id == 2) ? &launch_prefill_naive_0p8b_nvfp4
+                                    : &launch_prefill_naive_27b_nvfp4;
     void *layer_outs_ptr = nullptr;
     if (g_layer_outputs.has_value()) {
         const auto &t = *g_layer_outputs;

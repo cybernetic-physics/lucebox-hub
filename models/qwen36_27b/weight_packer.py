@@ -297,9 +297,11 @@ def load_27b_weights(
 #     FA_bf16   = 11 ptrs ( 88 B)
 #     FA_nvfp4  = 4 bf16 ptrs + 7 * PackedMatrixNVFP4 (2 ptrs ea) = 18 ptrs (144 B)
 #     DN_nvfp4  = 5 bf16 ptrs + 8 * PackedMatrixNVFP4 (2 ptrs ea) = 21 ptrs (168 B)
+# C++ struct size is 192 (forced by `char _force_size[184]` + 8 header).
 PACK_HEADER  = 8
-PACK_MAX_PTR = 21
-PACK_STRUCT  = ((PACK_HEADER + PACK_MAX_PTR * 8 + 15) // 16) * 16   # 192
+PACK_STRUCT  = 192
+PACK_MAX_PTR = (PACK_STRUCT - PACK_HEADER) // 8   # 23 — caps usable slots
+assert PACK_STRUCT == 192, "must match LayerWeights<Cfg> in kernel_decode_full.cu"
 
 def pack_layer_weights(layer_data: list[dict]) -> torch.Tensor:
     """Return a uint8 CUDA tensor laid out exactly like
