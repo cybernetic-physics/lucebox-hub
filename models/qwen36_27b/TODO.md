@@ -404,13 +404,21 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: `curl --no-buffer http://.../v1/chat/completions
   -d '{"stream": true, ...}'` emits incremental chunks.
 
-### F2. Multi-turn KV cache reuse [DONE]
-- **Status**: DONE  | **Prio**: P1  | **Effort**: S  | **Deps**: C5
-- `prefill_qwen3x_naive` now accepts `start_position`; the runtime
-  threads it as `dec.prefill(new_ids, start_position=dec.position)`.
-- Smoke test: `test/test_f2_multiturn_dispatch.py`.
-- TODO: real-weight correctness test against HF on a concatenated
-  sequence (S1e-style for F2).
+### F2. Multi-turn KV cache reuse [BROKEN — F8 fail]
+- **Status**: BROKEN  | **Prio**: P0  | **Effort**: M  | **Deps**: —
+- Dispatch + position arithmetic landed (commit 6a84333), smoke
+  `test_f2_multiturn_dispatch.py` passes with ZERO weights.
+- F8 (real-weight test) FAILS: `dec.prefill(ids[:S1])` then
+  `dec.prefill(ids[S1:], start_position=S1)` produces NaN logits at
+  the end. One-shot prefill on same prompt produces correct output.
+- Smoke test couldn't catch it (all-zero weights → no NaN propagation).
+- Suspect: some persistent buffer (g_residual maybe?, dn_states,
+  conv_bufs) carries stale data between consecutive `prefill_qwen3x_naive`
+  calls that corrupts the second prefill's first step. Or a stale
+  `g_fa_partials` value from the previous call's last token.
+- Next debug step: layer-by-layer hidden-state capture comparison
+  between one-shot prefill and split prefill (analogous to C3
+  debug strategy) to find first divergent layer.
 
 ### F3. Concurrent request batching
 - **Status**: TODO  | **Prio**: P2  | **Effort**: L  | **Deps**: S2
