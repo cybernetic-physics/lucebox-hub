@@ -132,32 +132,78 @@ def _import_quantizer():
     return mod._optimal_quantize_matrix_nvfp4
 
 
+DEFAULT_NVFP4_CACHE = os.path.join(
+    os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+    "qwen3x_nvfp4_27b_cache.pt")
+
+
 def quantize_27b_weights(layer_data: list[dict],
                          group_size: int = NVFP4_GROUP_SIZE,
-                         verbose: bool = True) -> list[dict]:
+                         verbose: bool = True,
+                         cache_path: str | None = DEFAULT_NVFP4_CACHE) -> list[dict]:
     """Quantize every 2D projection weight in `layer_data` to NVFP4
     (packed uint8 + fp16 scales). 1D weights (norms, biases) stay bf16.
 
     Returns a parallel `layer_data_nvfp4` whose `ptrs` are a mix of
     bf16 tensors (norms) and (packed, scales) tuples (projections).
+
+    If `cache_path` is given (default: ~/.cache/huggingface/...), the
+    packed tensors are loaded from disk on subsequent invocations
+    instead of recomputed (~30+ min savings).
     """
+    if cache_path and os.path.exists(cache_path):
+        if verbose: print(f"  [nvfp4] loading cached quantized weights "
+                          f"<- {cache_path}", flush=True)
+        cached = torch.load(cache_path, map_location="cuda", weights_only=False)
+        if cached.get("group_size") != group_size:
+            if verbose: print(f"  [nvfp4] cache group_size mismatch "
+                              f"({cached.get('group_size')} vs {group_size}); "
+                              f"re-quantizing")
+        elif len(cached.get("layers", [])) != len(layer_data):
+            if verbose: print(f"  [nvfp4] cache layer count mismatch; "
+                              f"re-quantizing")
+        else:
+            # Rebuild the output layer_data structure from cached tensors.
+            out = []
+            for i, ld in enumerate(layer_data):
+                cl = cached["layers"][i]
+                new_ptrs = []
+                for j, t in enumerate(ld["ptrs"]):
+                    if t.dim() == 2 and t.shape[-1] >= group_size:
+                        data, scales = cl[j]
+                        new_ptrs.append((data, scales))
+                    else:
+                        new_ptrs.append(t)
+                out.append({"type": ld["type"], "ptrs": new_ptrs})
+            if verbose: print(f"  [nvfp4] cache hit; {len(out)} layers loaded")
+            return out
+
     quantize = _import_quantizer()
     out = []
+    cache_layers = []
     for i, ld in enumerate(layer_data):
         new_ptrs = []
+        cache_ptrs = []
         for j, t in enumerate(ld["ptrs"]):
             if t.dim() == 2 and t.shape[-1] >= group_size:
-                # Run on CPU then move back -- the quantizer needs a fairly
-                # large working set per chunk; rely on its built-in
-                # row_chunk=4096 to bound memory.
                 packed = quantize(t, group_size)
-                new_ptrs.append((packed["packed"].cuda().contiguous(),
-                                 packed["scales"].cuda().contiguous()))
+                data = packed["packed"].cuda().contiguous()
+                scales = packed["scales"].cuda().contiguous()
+                new_ptrs.append((data, scales))
+                cache_ptrs.append((data, scales))
             else:
                 new_ptrs.append(t)
+                cache_ptrs.append(None)
         out.append({"type": ld["type"], "ptrs": new_ptrs})
+        cache_layers.append(cache_ptrs)
         if verbose and (i % 8 == 0 or i == len(layer_data) - 1):
             print(f"  quantized layer {i+1}/{len(layer_data)}")
+
+    if cache_path:
+        if verbose: print(f"  [nvfp4] writing cache -> {cache_path}", flush=True)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save({"group_size": group_size, "layers": cache_layers},
+                    cache_path)
     return out
 
 
