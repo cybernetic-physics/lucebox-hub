@@ -298,6 +298,48 @@ class Qwen36MegakernelDecoder:
             if eos_id is not None and next_id == eos_id: break
         return torch.tensor(new_tokens, dtype=torch.int32)
 
+    def generate_sample(self, prompt_ids: torch.Tensor, max_new_tokens: int,
+                         temperature: float = 1.0,
+                         top_k: int = 0, top_p: float = 1.0,
+                         eos_id: int | None = None,
+                         seed: int | None = None) -> torch.Tensor:
+        """Prefill + sampling decode. Use temperature=0 for greedy.
+        Returns the int32 list of generated token ids."""
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device="cuda").manual_seed(seed)
+        next_id = self.prefill(prompt_ids)
+        if temperature > 0.0 or top_k > 0 or top_p < 1.0:
+            # Replace the prefill's argmax with a sampled first token by
+            # running sample() on the existing g_normalized. We DON'T
+            # need to re-run the decode kernel; prefill already left
+            # g_normalized populated.
+            logits = self.logits_for_last()
+            if temperature > 0.0 and temperature != 1.0:
+                logits = logits / temperature
+            if top_k > 0:
+                v, _ = torch.topk(logits, top_k); cutoff = v[-1]
+                logits = torch.where(logits < cutoff,
+                                       torch.full_like(logits, -float("inf")), logits)
+            if top_p < 1.0:
+                sl, si = torch.sort(logits, descending=True)
+                cp = torch.cumsum(torch.softmax(sl, dim=-1), dim=-1)
+                km = cp <= top_p; km[0] = True
+                mask = torch.zeros_like(logits, dtype=torch.bool)
+                mask.scatter_(0, si[km], True)
+                logits = torch.where(mask, logits, torch.full_like(logits, -float("inf")))
+            probs = torch.softmax(logits, dim=-1)
+            next_id = int(torch.multinomial(probs, 1, generator=rng).item())
+        new_tokens = [next_id]
+        if eos_id is not None and next_id == eos_id:
+            return torch.tensor(new_tokens, dtype=torch.int32)
+        for _ in range(max_new_tokens - 1):
+            next_id = self.sample(next_id, temperature=temperature,
+                                    top_k=top_k, top_p=top_p, rng=rng)
+            new_tokens.append(next_id)
+            if eos_id is not None and next_id == eos_id: break
+        return torch.tensor(new_tokens, dtype=torch.int32)
+
     def decode_chain(self, n_tokens: int) -> torch.Tensor:
         """Async decode that keeps the next-token id on-device between
         steps. After a prefill, calls decode_qwen3x N times consecutively
@@ -352,6 +394,74 @@ class Qwen36MegakernelDecoder:
             out_history[i].copy_(device_token[0])
             self.position += 1
         return out_history.cpu()
+
+    def _run_decode_kernel(self, token_id: int) -> None:
+        """Run the megakernel decode for one token, advance position.
+        Leaves g_normalized populated with the post-final-norm hidden
+        state; caller chooses argmax vs sample."""
+        ops = torch.ops.qwen3x_C
+        ops.decode_qwen3x(
+            self.MODEL_ID,
+            self.weights["embed_weight"], self.weights["final_norm_weight"],
+            self.layer_blob,
+            self.sc.fa_k_cache, self.sc.fa_v_cache,
+            self.sc.dn_states, self.sc.conv_bufs,
+            self.sc.hidden_buffer, self.sc.g_residual,
+            self.sc.g_qkv_scratch, self.sc.g_kv_scratch,
+            self.sc.g_attn_out, self.sc.g_mlp_inter,
+            self.sc.g_z_scratch, self.sc.g_beta_scratch, self.sc.g_alpha_scratch,
+            self.sc.g_normalized, self.sc.g_fa_partials, self.sc.g_rope_inv_freq,
+            int(token_id), self.position, self.position, self.position,
+            self.max_seq,
+            float(self.yarn["scale"]), float(self.yarn["beta_fast"]),
+            float(self.yarn["beta_slow"]),
+            int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),
+            int(self.num_blocks),
+            self.layer_capture,
+        )
+        self.position += 1
+
+    def sample(self, token_id: int, temperature: float = 1.0,
+                top_k: int = 0, top_p: float = 1.0,
+                rng: torch.Generator | None = None) -> int:
+        """One decode step + sample from the resulting logits.
+
+        Args:
+          token_id: previous token (input to this step).
+          temperature: logit scale; 0 falls back to greedy argmax.
+          top_k:  keep only top-K logits; 0 = no filter.
+          top_p:  nucleus filter; 1.0 = no filter.
+          rng:    optional torch.Generator for determinism.
+
+        Returns the sampled token id. Advances position by 1.
+        """
+        self._run_decode_kernel(token_id)
+        if temperature <= 0.0 and top_k == 0 and top_p >= 1.0:
+            return self._argmax_from_normalized()
+        # Compute fp32 logits via the slow path (fast kernel only does
+        # argmax; full-logits requires the matmul). Cost is ~50 ms;
+        # negligible vs sampling tail latency on a chat workload.
+        logits = self.logits_for_last()
+        if temperature > 0.0 and temperature != 1.0:
+            logits = logits / temperature
+        if top_k > 0:
+            v, _ = torch.topk(logits, top_k)
+            cutoff = v[-1]
+            logits = torch.where(logits < cutoff,
+                                   torch.full_like(logits, -float("inf")),
+                                   logits)
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(probs, dim=-1)
+            keep_mask = cumulative <= top_p
+            keep_mask[0] = True   # always keep top-1 even if its prob > p
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            mask.scatter_(0, sorted_idx[keep_mask], True)
+            logits = torch.where(mask, logits, torch.full_like(logits, -float("inf")))
+        probs = torch.softmax(logits, dim=-1)
+        next_id = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        return next_id
 
     def decode(self, token_id: int) -> int:
         """One decode step. Advances position by 1."""
