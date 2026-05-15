@@ -195,6 +195,70 @@ class Qwen36MegakernelDecoder:
         self.position = start_position + int(prompt_ids.numel())
         return self._argmax_from_normalized()
 
+    def prefill_via_hf(self, prompt_ids: torch.Tensor) -> int:
+        """Fast prefill using the HF model's batched forward.
+
+        Runs the HF Qwen3.6-27B forward with `use_cache=True` on the
+        full prompt (cuBLAS-batched matmuls — ~500 ms at S=256 vs our
+        host-loop prefill's 54 s). Then copies HF's KV / DN state
+        into our scratch so subsequent `decode()` calls continue
+        seamlessly via the megakernel.
+
+        Requires that this decoder was built with `hf_model=hf` so
+        weights are shared. Returns the next-token argmax.
+        """
+        hf = self.weights.get("_hf_keepalive")
+        if hf is None:
+            raise RuntimeError(
+                "prefill_via_hf requires the runtime to have been built "
+                "with `hf_model=hf` so HF weights stay loaded.")
+
+        if not prompt_ids.is_cuda:
+            prompt_ids = prompt_ids.cuda()
+        if prompt_ids.dtype != torch.long:
+            prompt_ids = prompt_ids.to(torch.long)
+        S = prompt_ids.numel()
+        if S > self.max_seq:
+            raise ValueError(f"prefill length {S} > max_seq {self.max_seq}")
+
+        with torch.no_grad():
+            out = hf(input_ids=prompt_ids.unsqueeze(0), use_cache=True)
+
+        # Walk HF's past_key_values + cache_params (the Qwen3.6 cache
+        # exposes FA K/V via past_key_values and DN state via
+        # cache_params; both are on `out.past_key_values` for this
+        # HF release — verified empirically against modeling_qwen3_5.py).
+        cache = out.past_key_values
+        # FA mapping: cache.layers[layer_idx] -> our fa_k_cache[fa_idx]
+        from weight_packer import LAYER_TYPE, N_FA, N_DN
+        fa_idx = 0; dn_idx = 0
+        for layer_idx in range(len(LAYER_TYPE)):
+            cl = cache.layers[layer_idx]
+            if LAYER_TYPE[layer_idx] == 1:    # FA layer
+                # HF K/V: [1, num_kv_heads, S, head_dim]
+                k = cl.keys   if hasattr(cl, "keys")   else cl.key_cache
+                v = cl.values if hasattr(cl, "values") else cl.value_cache
+                # Squeeze batch dim and copy into our [KV_H, max_seq, head_dim]
+                self.sc.fa_k_cache[fa_idx, :, :S, :].copy_(
+                    k[0].to(torch.bfloat16))
+                self.sc.fa_v_cache[fa_idx, :, :S, :].copy_(
+                    v[0].to(torch.bfloat16))
+                fa_idx += 1
+            else:                              # DN layer
+                conv = getattr(cl, "conv_states", None)
+                rec  = getattr(cl, "recurrent_states", None)
+                if conv is not None:
+                    self.sc.conv_bufs[dn_idx].copy_(conv[0].to(torch.float32))
+                if rec is not None:
+                    self.sc.dn_states[dn_idx].copy_(rec[0].to(torch.float32))
+                dn_idx += 1
+
+        self.position = S
+        # Fill g_normalized + argmax for the next token from HF's last
+        # logits so subsequent decode() calls start from a consistent state.
+        last_logits = out.logits[0, -1].to(torch.float32)
+        return int(last_logits.argmax().item())
+
     def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int,
                   eos_id: int | None = None) -> torch.Tensor:
         """Sequential prefill + decode wrapper. EOS-aware."""
