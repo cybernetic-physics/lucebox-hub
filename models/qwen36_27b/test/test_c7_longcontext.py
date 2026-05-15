@@ -49,7 +49,11 @@ def main():
     print(f"  wikitext source: {all_ids.numel()} tokens available")
 
     from runtime_megakernel import Qwen36MegakernelDecoder
-    dec = Qwen36MegakernelDecoder(max_seq=8192, verbose=True, hf_model=hf, tokenizer=tok)
+    # Hard-cap max_seq based on the largest S we'll actually test. The
+    # fa_k_cache scales linearly with max_seq (256MB at 8192, 32MB at 1024).
+    max_seq_needed = 1024
+    dec = Qwen36MegakernelDecoder(max_seq=max_seq_needed, verbose=True,
+                                   hf_model=hf, tokenizer=tok)
 
     print(f"\n{'S':>6}  {'top1_ref':>8}  {'top1_ours':>9}  {'match':>5}  "
           f"{'cos':>9}  {'max_abs':>8}  {'kl':>9}  {'top5_ov':>7}  ours_step_ms")
