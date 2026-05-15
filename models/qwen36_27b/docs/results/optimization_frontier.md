@@ -43,15 +43,27 @@ follow-on optimizations:
 
 3. **Hardware FP4→FP16 cvt via `__nv_cvt_fp4x2_to_halfraw2`** (cuda_fp4.h,
    sm_120+ intrinsic = one PTX `cvt` per FP4 pair). Replaced the shmem
-   LUT entirely. Impact: 8.01 → 8.35 tok/s (no measurable speedup).
+   LUT entirely. Impact: 8.01 → 8.35 tok/s.
 
-The three follow-on attempts land at the same ~125 ms/token. **The
-remaining ~70 ms gap to the 51 ms NVFP4 HBM floor is NOT in the FP4
-decode itself.** It's elsewhere — likely grid sync overhead (400
-syncs × 10-100 µs each), FA scan compute, and cooperative launch
-serialization with 1 block per SM. Profiling with Nsight is the next
-step to pinpoint; without it, further matvec micro-opts won't move
-the needle.
+4. **`__hfma2` half2 SIMD multiply-add** in the dot product. Pre-convert
+   activations bf16 → half once into registers, accumulate in half2
+   (1 hfma2 = 2 half mul+adds = 1 PTX instruction), reduce to fp32 only
+   at the end. Impact: 8.35 → 8.36 tok/s.
+
+**Four independent inner-loop optimizations all land at ~8.3 tok/s.**
+The bottleneck is definitively NOT the matvec compute. The remaining
+~70 ms gap to the 51 ms NVFP4 HBM floor is elsewhere — likely a
+combination of:
+- Grid sync overhead (~400 syncs/token × tens of µs each = 5-20 ms)
+- Cooperative launch serialization with 1 block per SM (forced by
+  the 68 KB static shmem requirement on Cfg_27B)
+- FA/DN scan compute paths (small but cumulative across 64 layers)
+- HBM efficiency loss from non-contiguous weight access patterns in
+  the cooperative scheduling
+
+Profiling with Nsight Compute / Systems is the next step to actually
+pin it down. Without that, further matvec micro-opts won't help —
+they've all been tried.
 
 Possible bigger wins from here:
 - Reduce grid syncs by fusing layer phases (FA scan + O-proj into
