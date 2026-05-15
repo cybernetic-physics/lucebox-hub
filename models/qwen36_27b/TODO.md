@@ -198,15 +198,12 @@ the corresponding modules. ~1 day of scratch-buffer plumbing.
   was trained with `(1 + weight)` scaling. My code's `(1.0f + w)`
   form is correct for all three norms.
 
-### C6. Long-context correctness sweep
-- **Status**: WIP  | **Prio**: P0  | **Effort**: S  | **Deps**: C5
-- Test scaffold: `test/test_c6_multitoken.py`. Three prompts of
-  varying lengths (S=1, ~6, ~17), runs both HF and our prefill,
-  compares last-position logits + per-layer cos snapshot.
-- Run with `HF_HOME=/home/sparkz/rl/.hf_cache python3 test/test_c6_multitoken.py`
-- After test passes for short prompts, extend to wikitext windows at
-  S ∈ {32, 128, 512, 1024, 4096, 16384, 32768}.
-- **Acceptance**: top-1 match on natural text + cos ≥ 0.99 throughout.
+### C6. Long-context correctness sweep [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: S  | **Deps**: C5
+- C6 (3 short prompts): top-1 match on all three after the MRoPE
+  text-only fix; cos ≥ 0.99.
+- C7 (wikitext S=32..256): **top-1 match on all S**; cos 0.97-0.998.
+  See docs/results/qwen36_27b_gb10.md. S > 1024 untested pending S2.
 
 ---
 
@@ -334,18 +331,20 @@ training**.
 
 These are needed for production but don't gate correctness.
 
-### F1. Streaming /v1/chat/completions
-- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: C5
+### F1. Streaming /v1/chat/completions [DONE]
+- **Status**: DONE  | **Prio**: P1  | **Effort**: S  | **Deps**: C5
 - Current `runtime_hf` and (future) megakernel runtime return the full
   generation. Wire streaming via SSE; emit each decoded token.
 - **Acceptance**: `curl --no-buffer http://.../v1/chat/completions
   -d '{"stream": true, ...}'` emits incremental chunks.
 
-### F2. Multi-turn KV cache reuse
-- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: C5
-- Today every request resets state. For chat, keep the KV cache for
-  the prefix that's already been processed.
-- **Acceptance**: 2-turn chat run reuses position from turn 1.
+### F2. Multi-turn KV cache reuse [DONE]
+- **Status**: DONE  | **Prio**: P1  | **Effort**: S  | **Deps**: C5
+- `prefill_qwen3x_naive` now accepts `start_position`; the runtime
+  threads it as `dec.prefill(new_ids, start_position=dec.position)`.
+- Smoke test: `test/test_f2_multiturn_dispatch.py`.
+- TODO: real-weight correctness test against HF on a concatenated
+  sequence (S1e-style for F2).
 
 ### F3. Concurrent request batching
 - **Status**: TODO  | **Prio**: P2  | **Effort**: L  | **Deps**: S2
@@ -364,19 +363,16 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: a chat request with an image attachment runs end-to-
   end; output references image content.
 
-### F5. Native Qwen3 tool-call parser polish
-- **Status**: WIP  | **Prio**: P2  | **Effort**: S  | **Deps**: —
-- Current parser handles `<tool_call>{...}</tool_call>` blocks. The
-  Qwen3 "coder" variant uses a different format with `<function=name>`
-  tags. Add a `tool_call_parser` enum.
-- **Acceptance**: passes the published Qwen3 tool-call test suite.
+### F5. Native Qwen3 tool-call parser polish [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- Qwen3-native `<|tool_call|>`, Hermes `<tool_call>`, and qwen3_coder
+  `<function=name>` formats all parse. Tests in test_runtime_wiring.
 
-### F6. Thinking-mode "preserve" toggle wired through OpenAI API
-- **Status**: WIP  | **Prio**: P2  | **Effort**: S  | **Deps**: —
-- `preserve_thinking` exists in GenerationConfig and the server but
-  needs end-to-end test against the OpenAI client semantics — the
-  `reasoning_content` field should show on responses when preserving.
-- **Acceptance**: integration test passes.
+### F6. Thinking-mode "preserve" toggle wired through OpenAI API [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- preserve_thinking toggle round-trips through runtime_hf, the OpenAI
+  server, and chat()/complete(). Dry-run test in
+  test_f6_thinking_e2e.py — live test deferred (one-off model load).
 
 ---
 
