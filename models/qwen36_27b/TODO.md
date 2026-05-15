@@ -114,22 +114,38 @@ final logits    : cos = 0.87, top-1 mismatch (HF=16 ours=220)
 - Bug is localized to the FA layer; produces ~0.003 cosine drift
   per FA pass, compounds over 16 FA layers to 0 cos.
 
-**Tested**:
-- `swish` interpretation of output gate (`fast_silu(gate)`): WORSE
-  (cos=0.81 at layer 3). HF must be applying plain sigmoid even
-  though config says "swish".
+**Tested + ruled out**:
+- ✗ Output gate = silu/swish (cos=0.81 at L3, much worse than sigmoid)
+- ✗ Q-proj output split layout `[Q_all, gate_all]` (cos=0.948, worse
+  than interleaved's 0.997; magnitudes blew up 3×)
+- ✓ Per-head interleaved layout `[Q_h, gate_h]` is correct
+- ✓ Output gate = sigmoid is correct (despite config saying "swish")
 
 **Remaining suspects, in priority**:
-1. Q-proj output layout — `[Q_h0..gate_h0, Q_h1..gate_h1, ...]`
-   interleaved vs `[Q_all, gate_all]` split. The 0.8B reference uses
-   interleaved and matches HF, but Qwen3.6 may use a different
-   convention. Verify by inspecting an HF q_proj output row count
-   per head.
-2. Per-head QK-norm placement relative to RoPE (before vs after).
-   For position 0 RoPE is identity so this can't cause the layer-3
-   drift; but it'd surface at non-zero positions.
-3. The attention `1/sqrt(head_dim)` scaling vs `1/sqrt(rotary_dim)`.
-4. KV cache row stride at the FA-layer index level.
+1. **Per-head q_norm/k_norm weight shape**. I assume `[head_dim=256]`
+   shared across heads. If actually `[num_heads*head_dim=6144]` per-
+   head distinct, my code is silently using head-0's weights for all
+   heads. Need to inspect actual safetensors shape. (My
+   `_check_shape` asserts on `[FA_HEAD_DIM,]` so this would have
+   failed at pack time — unless HF reshapes on load.)
+2. **RMSNorm formula in q_norm/k_norm**: my `head_norm_rope` uses
+   `(1+w)` like 0.8B. If Qwen3.6 q_norm uses standard `w` (no +1),
+   my Q,K are over-scaled by ~2×. But softmax over 1 position is
+   trivial; magnitude difference must come from V or gate which
+   don't use this norm.
+3. **Attention scale**: I use `1/sqrt(head_dim=256)` = 1/16. Some
+   impls use `1/sqrt(rotary_dim=64)` = 1/8. The attn output at
+   position 0 doesn't depend on the score (softmax-of-one is 1),
+   so this isn't it for the L3 drift but matters at S>1.
+4. **gate's interaction with V**: maybe HF applies gate as
+   `output = silu(gate * attn_out)` (gate inside silu, applied to
+   the product) rather than `output = silu(gate) * attn_out`.
+
+**Next debug step**: add per-FA-step intermediate capture to the
+kernel. Save Q-proj row, post-Q-norm Q, gate slice, V output, attn-
+out, post-gate attn-out, and O-proj output to a debug global. Hook
+the same in HF via `forward_pre_hook` on `model.layers[3].self_attn.*`.
+Diff each step element-wise. ~1 day of plumbing.
 
 **Next debug step**: add intermediate-value capture buffers to the FA
 kernel (Q-proj output, gate slice, V output, attn_out, post-gate
@@ -138,6 +154,31 @@ the corresponding modules. ~1 day of scratch-buffer plumbing.
 
 - **Acceptance**: top-1 + cos ≥ 0.999 against HF on a single-prompt
   forward at S=1.
+
+### C5b. Intermediate-value capture in FA layer
+- **Status**: TODO  | **Prio**: P0  | **Effort**: M  | **Deps**: C5
+- Add scratch buffers + capture hooks to fa_layer.cuh that, when
+  enabled, write the following to a debug global:
+    1. Q-proj output (first row) [post-matvec]
+    2. Q after RMSNorm + RoPE [per-head]
+    3. K after norm + RoPE
+    4. V after projection
+    5. attn_out after softmax * V
+    6. attn_out * sigmoid(gate)
+    7. O-proj output
+- Add corresponding `forward_pre_hook` on HF `model.layers[3].self_attn`
+  module to capture the same 7 values.
+- Diff element-wise; the FIRST one that differs is the bug.
+
+### C5c. Q-norm/K-norm weight shape verification
+- **Status**: DONE  | **Prio**: P0  | **Effort**: S  | **Deps**: —
+- Inspected via safetensors metadata. Results:
+    q_norm.weight: shape (256,), mean=0.22 std=0.07
+    k_norm.weight: shape (256,), mean=0.21
+    input_layernorm.weight: shape (5120,), mean=0.24
+- All weights centered around 0.2 (not 1.0), confirming the model
+  was trained with `(1 + weight)` scaling. My code's `(1.0f + w)`
+  form is correct for all three norms.
 
 ### C6. Long-context correctness sweep
 - **Status**: TODO  | **Prio**: P0  | **Effort**: S  | **Deps**: C5
