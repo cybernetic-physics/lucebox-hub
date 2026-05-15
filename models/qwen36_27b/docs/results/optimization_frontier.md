@@ -19,9 +19,38 @@ gains require quantization, not kernel tuning.
 The 88% HBM efficiency is **already optimal for one-token-at-a-time
 BF16 inference**. The only paths to faster decode are:
 
-## What's actually left to do (in real ROI order)
+## Update: NVFP4 went live, delivers 1.80× (not 3.5×)
 
-### 1. NVFP4 weights live — 3.5× decode speedup (~12 tok/s)
+| Path | tok/s | ms/tok | HBM floor | % of HBM peak |
+|---|---:|---:|---:|---:|
+| BF16 megakernel | 4.57 | 219 | 183 ms (50 GB) | **84%** |
+| NVFP4 megakernel | 8.23 | 121 | 51 ms (14 GB) | **42%** |
+
+Theoretical was 3.5× (full HBM scaling). Actual is 1.80× because the
+matvec becomes compute-bound on the FP4 → FP32 decode. We did two
+follow-on optimizations:
+
+1. **Moved FP4 LUT from `__constant__` to shared memory.**
+   The constant LUT serialized 32 cycles per lookup (one per lane);
+   shared mem with 16-entry table resolves divergent reads in ~2
+   cycles (worst-case 2-way bank conflict).
+   Impact: **4.39 → 8.23 tok/s (1.88× on NVFP4 path alone).**
+
+2. **uint4 (16-byte) loads instead of uint32 (4-byte).** Each lane now
+   reads one full FP4 group per iter (32 elements, 16 bytes, one
+   scale), 4× fewer warp iters. Impact: 8.23 → 8.01 tok/s (no
+   speedup — confirms compute-bound). Kept for code clarity / future
+   benefit on HBM-bound configurations.
+
+The remaining ~70 ms gap to the 51 ms NVFP4 HBM floor is the LUT
+lookup + bf16→fp32 cast + mul/add per FP4 element. Closing it would
+need either NVIDIA `cvt.rn.f16x2.e2m1x2` PTX (if/when available on
+sm_121) or moving to mma.sync FP4 Tensor Cores for matrix-vector via
+batched-S — i.e., S2 (parallel-S prefill) on the decode side.
+
+## What's still left to do (in real ROI order)
+
+### 1. ~~NVFP4 weights live~~ — DONE (1.80× decode speedup)
 - All wireup is committed (S1a-d). Kernel paths, layer functions,
   192 B `LayerWeights` union with NVFP4 variants, model_id=3
   dispatch, runtime `backend="nvfp4"` flag, optimal-MSE quantizer
