@@ -195,6 +195,19 @@ class Qwen36MegakernelDecoder:
         self.position = start_position + int(prompt_ids.numel())
         return self._argmax_from_normalized()
 
+    def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int,
+                  eos_id: int | None = None) -> torch.Tensor:
+        """Sequential prefill + decode wrapper. EOS-aware."""
+        next_id = self.prefill(prompt_ids)
+        new_tokens = [next_id]
+        if eos_id is not None and next_id == eos_id:
+            return torch.tensor(new_tokens, dtype=torch.int32)
+        for _ in range(max_new_tokens - 1):
+            next_id = self.decode(next_id)
+            new_tokens.append(next_id)
+            if eos_id is not None and next_id == eos_id: break
+        return torch.tensor(new_tokens, dtype=torch.int32)
+
     def decode(self, token_id: int) -> int:
         """One decode step. Advances position by 1."""
         ops = torch.ops.qwen3x_C
