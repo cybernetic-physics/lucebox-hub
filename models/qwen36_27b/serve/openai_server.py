@@ -135,13 +135,84 @@ def list_models():
     return {"data": [{"id": state.model_name, "object": "model", "owned_by": "qwen"}]}
 
 
+def _sse_stream_chat(req: ChatRequest, cfg: GenerationConfig):
+    """SSE streaming generator: yields OpenAI-format chat.completion.chunk
+    events as bytes. Bridges runtime_hf.chat_stream (sync generator on a
+    worker thread) into the async response."""
+    from queue import Queue, Empty
+    from threading import Thread
+    out_q: Queue = Queue()
+
+    def producer():
+        try:
+            for ev in state.runtime.chat_stream(
+                [m.model_dump() for m in req.messages], cfg):
+                out_q.put(ev)
+        except Exception as exc:
+            out_q.put({"type": "error", "msg": str(exc)})
+        finally:
+            out_q.put(None)  # sentinel
+
+    Thread(target=producer, daemon=True).start()
+    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    while True:
+        try:
+            ev = out_q.get(timeout=600.0)
+        except Empty:
+            yield b"data: [DONE]\n\n"
+            return
+        if ev is None:
+            yield b"data: [DONE]\n\n"
+            return
+        if ev["type"] == "chunk":
+            payload = {
+                "id": cmpl_id, "object": "chat.completion.chunk",
+                "created": created, "model": state.model_name,
+                "choices": [{"index": 0,
+                             "delta": {"role": "assistant", "content": ev["text"]},
+                             "finish_reason": None}],
+            }
+            yield ("data: " + json.dumps(payload) + "\n\n").encode("utf-8")
+        elif ev["type"] == "done":
+            # Emit any reasoning_content / tool_calls in a final delta.
+            final_delta: dict[str, Any] = {}
+            if ev.get("thinking"):
+                final_delta["reasoning_content"] = ev["thinking"]
+            if ev.get("tool_calls"):
+                final_delta["tool_calls"] = [
+                    {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+                     "function": {"name": tc["name"],
+                                  "arguments": json.dumps(tc["arguments"])}}
+                    for tc in ev["tool_calls"]
+                ]
+            if final_delta:
+                final = {
+                    "id": cmpl_id, "object": "chat.completion.chunk",
+                    "created": created, "model": state.model_name,
+                    "choices": [{"index": 0, "delta": final_delta,
+                                 "finish_reason": "tool_calls" if ev.get("tool_calls") else "stop"}],
+                }
+                yield ("data: " + json.dumps(final) + "\n\n").encode("utf-8")
+        elif ev["type"] == "error":
+            err = {"error": {"message": ev["msg"]}}
+            yield ("data: " + json.dumps(err) + "\n\n").encode("utf-8")
+            yield b"data: [DONE]\n\n"
+            return
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
     if state.runtime is None:
         raise HTTPException(status_code=503, detail="runtime not loaded")
-    if req.stream:
-        raise HTTPException(status_code=400, detail="streaming not implemented in baseline runtime")
     cfg = _gen_config_from(req)
+    if req.stream:
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            _sse_stream_chat(req, cfg), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    # Non-streaming path
     messages = [m.model_dump() for m in req.messages]
     # Serialize the runtime call to avoid concurrent HF generation on one GPU.
     loop = asyncio.get_event_loop()

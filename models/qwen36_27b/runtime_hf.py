@@ -353,6 +353,92 @@ class Qwen36Runtime:
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
         return text, int(new_tokens.numel())
 
+    def chat_stream(
+        self,
+        messages: list[dict],
+        cfg: GenerationConfig | None = None,
+    ):
+        """Streaming generator. Yields incremental text chunks; final yield
+        is a GenerationResult-shaped dict with usage stats.
+
+        Uses transformers' TextIteratorStreamer running the actual generate
+        call on a background thread; the main thread drains the streamer
+        until EOS.
+        """
+        from threading import Thread
+        from transformers import TextIteratorStreamer, LogitsProcessorList
+
+        cfg = cfg or GenerationConfig()
+        prompt = self.apply_chat_template(
+            messages, enable_thinking=cfg.enable_thinking, tools=cfg.tools,
+        )
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer, skip_prompt=True, skip_special_tokens=False,
+            timeout=600.0,
+        )
+
+        gen_kwargs: dict[str, Any] = dict(
+            input_ids=prompt_ids,
+            max_new_tokens=cfg.max_tokens,
+            do_sample=cfg.temperature > 0,
+            temperature=max(cfg.temperature, 1e-5),
+            top_p=cfg.top_p,
+            top_k=(cfg.top_k if cfg.top_k > 0 else None),
+            pad_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+            streamer=streamer,
+        )
+        if cfg.stop:
+            stop_ids = []
+            for s in cfg.stop:
+                ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                if ids: stop_ids.extend(ids)
+            if stop_ids:
+                gen_kwargs["eos_token_id"] = list(set(
+                    [self.tokenizer.eos_token_id] + stop_ids))
+
+        processors = LogitsProcessorList()
+        if cfg.response_format_json_schema is not None:
+            compiled = self._xgrammar_compile(json_schema=cfg.response_format_json_schema)
+            processors.append(_XGrammarLogitsProcessor(
+                compiled, VOCAB_SIZE, torch.device(self.device)))
+        elif cfg.response_format_grammar is not None:
+            compiled = self._xgrammar_compile(grammar_text=cfg.response_format_grammar)
+            processors.append(_XGrammarLogitsProcessor(
+                compiled, VOCAB_SIZE, torch.device(self.device)))
+        if len(processors) > 0:
+            gen_kwargs["logits_processor"] = processors
+
+        # Drive generate on a worker thread, drain the streamer here.
+        thread = Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread.start()
+        t0 = time.perf_counter()
+        n_tokens = 0
+        accumulated = ""
+        for chunk in streamer:
+            if not chunk: continue
+            accumulated += chunk
+            n_tokens += 1
+            yield {"type": "chunk", "text": chunk}
+        thread.join()
+        elapsed = time.perf_counter() - t0
+
+        body, thinking = split_thinking(accumulated)
+        clean, tools = parse_tool_calls(body)
+        yield {
+            "type": "done",
+            "text": clean if not cfg.preserve_thinking_in_text else accumulated,
+            "thinking": thinking,
+            "tool_calls": [
+                {"name": tc.name, "arguments": tc.arguments} for tc in tools
+            ],
+            "prompt_tokens": int(prompt_ids.shape[1]),
+            "completion_tokens": n_tokens,
+            "elapsed_s": elapsed,
+        }
+
     def chat(
         self,
         messages: list[dict],
