@@ -73,7 +73,15 @@ backend).
 | Path | tok/s | ms/tok | % HBM peak |
 |---|---:|---:|---:|
 | BF16 megakernel | 4.52 | 221 | 83% |
-| **NVFP4 megakernel** | **13.40** | **75** | **68%** |
+| **NVFP4 megakernel** | **13.18** | **76** | **65%** |
+
+S7b (FP4 LM head) was wired and measured: NVFP4 + FP4 LM head =
+13.18 tok/s, basically the same as NVFP4 + BF16 LM head (13.40). The
+FP4 LM head ends up compute-bound at ~10 ms instead of HBM-bound at
+~3 ms, so it doesn't reduce LM-head time vs the BF16 LM head's 10 ms
+HBM-bound execution. Net: neutral. Kept the wireup since it costs no
+extra memory (lm_head goes 2.5 GB → 0.7 GB, saving ~2 GB RAM) but
+don't expect speed gains.
 
 NVFP4 is now at 68% of its 51 ms HBM peak (3.5× theoretical). The
 remaining 24 ms gap is plausibly grid sync overhead (~400/token)
