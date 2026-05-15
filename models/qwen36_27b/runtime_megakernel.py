@@ -248,9 +248,17 @@ class Qwen36MegakernelDecoder:
                 conv = getattr(cl, "conv_states", None)
                 rec  = getattr(cl, "recurrent_states", None)
                 if conv is not None:
+                    # HF: [1, CONV_CH, CONV_K] -> ours: [CONV_CH, CONV_K]
                     self.sc.conv_bufs[dn_idx].copy_(conv[0].to(torch.float32))
                 if rec is not None:
-                    self.sc.dn_states[dn_idx].copy_(rec[0].to(torch.float32))
+                    # HF: [1, V_H, k_head_dim, v_head_dim] = [V_H, KEY, VAL]
+                    # Ours: state[j * KEY + i], i.e. [V_H, VAL, KEY] —
+                    # transpose the last two dims (KEY = VAL = 128 so the
+                    # shape matches without transpose, but the data layout
+                    # would be wrong → top-1 mismatch in the very next
+                    # decode step). Don't drop this transpose.
+                    self.sc.dn_states[dn_idx].copy_(
+                        rec[0].transpose(-1, -2).contiguous().to(torch.float32))
                 dn_idx += 1
 
         self.position = S
