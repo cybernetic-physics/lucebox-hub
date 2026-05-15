@@ -1,0 +1,26 @@
+# Qwen3.6-27B megakernel pinned environment.
+# Verified May 2026 on GB10 (Grace Blackwell, sm_121a) with CUDA 13.2.78,
+# torch 2.11.0+cu130, driver 580.126.09.
+#
+# Qwen3.6 needs trust_remote_code=True with any transformers version
+# that doesn't ship its native config — 5.6.0 works that way. The
+# "official" Qwen3.6-27B config card recommends 4.57.1 (where the
+# config is upstreamed), but our HF runtime + megakernel runtime both
+# work fine on 5.6.0 with trust_remote_code=True.
+torch==2.11.0
+transformers==5.6.0
+safetensors>=0.4.4
+datasets>=2.18.0
+huggingface_hub>=0.23.0
+# Server stack — only needed if you use serve/openai_server.py.
+fastapi>=0.110.0
+uvicorn>=0.29.0
+# Optional accelerators we exercise — fall back to torch implementations
+# if absent. The relevant warning in our runtime logs is harmless.
+# - flash-linear-attention      DeltaNet fast path (CUDA path requires it)
+# - causal-conv1d               conv1d fast path
+# Install separately if you want those:
+#   pip install fla-org/flash-linear-attention
+#   pip install Dao-AILab/causal-conv1d
+# XGrammar for grammar-constrained sampling (response_format JSON schema).
+xgrammar>=0.1.7
