@@ -60,15 +60,14 @@ extern "C" cudaError_t launch_prefill_naive_0p8b(
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, cudaStream_t);
-// NOTE: prefill launcher signature unchanged (no debug capture in prefill yet).
+    int, int, void*, cudaStream_t);
 extern "C" cudaError_t launch_prefill_naive_27b(
     const int32_t*, int,
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, cudaStream_t);
+    int, int, void*, cudaStream_t);
 
 extern "C" void launch_mlp_smoke_0p8b(
     const void *input, const void *gain,
@@ -239,7 +238,8 @@ void prefill_qwen3x_naive(
     int64_t max_seq_len,
     double yarn_scale, double yarn_beta_fast, double yarn_beta_slow,
     int64_t yarn_orig_ctx, bool yarn_enabled,
-    int64_t num_blocks)
+    int64_t num_blocks,
+    c10::optional<torch::Tensor> g_layer_outputs)
 {
     TORCH_CHECK(model_id == 0 || model_id == 1, "model_id must be 0 or 1");
     TORCH_CHECK(tokens.is_cuda() && tokens.is_contiguous()
@@ -259,6 +259,14 @@ void prefill_qwen3x_naive(
 
     auto launcher = (model_id == 0) ? &launch_prefill_naive_0p8b
                                     : &launch_prefill_naive_27b;
+    void *layer_outs_ptr = nullptr;
+    if (g_layer_outputs.has_value()) {
+        const auto &t = *g_layer_outputs;
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous()
+                    && t.scalar_type() == torch::kBFloat16,
+                    "g_layer_outputs must be contiguous CUDA bf16");
+        layer_outs_ptr = t.data_ptr();
+    }
     cudaError_t err = launcher(
         (const int32_t*)tokens.data_ptr(), S,
         embed_weight.data_ptr(), final_norm_weight.data_ptr(),
@@ -270,7 +278,7 @@ void prefill_qwen3x_naive(
         g_attn_out.data_ptr(), g_mlp_inter.data_ptr(),
         g_z_scratch.data_ptr(), g_beta_scratch.data_ptr(), g_alpha_scratch.data_ptr(),
         g_normalized.data_ptr(), g_fa_partials.data_ptr(), g_rope_inv_freq.data_ptr(),
-        yp, (int)max_seq_len, nb, stream);
+        yp, (int)max_seq_len, nb, layer_outs_ptr, stream);
     TORCH_CHECK(err == cudaSuccess,
                 "prefill_qwen3x_naive launch failed: ", cudaGetErrorString(err));
 }
@@ -298,7 +306,8 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "Tensor(k!) g_z_scratch, Tensor(l!) g_beta_scratch, Tensor(m!) g_alpha_scratch, "
             "Tensor(n!) g_normalized, Tensor(o!) g_fa_partials, Tensor(p!) g_rope_inv_freq, "
             "int max_seq_len, float yarn_scale, float yarn_beta_fast, "
-            "float yarn_beta_slow, int yarn_orig_ctx, bool yarn_enabled, int num_blocks) -> ()");
+            "float yarn_beta_slow, int yarn_orig_ctx, bool yarn_enabled, int num_blocks, "
+            "Tensor(q!)? g_layer_outputs) -> ()");
     ops.impl("prefill_qwen3x_naive", torch::kCUDA, &prefill_qwen3x_naive);
 
     ops.def("decode_qwen3x(int model_id, "

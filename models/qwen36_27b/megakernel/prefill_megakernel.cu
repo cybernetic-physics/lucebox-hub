@@ -76,7 +76,10 @@ static cudaError_t prefill_naive_impl(
     void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
     void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
-    YarnParams yp, int max_seq_len, int num_blocks, cudaStream_t stream)
+    YarnParams yp, int max_seq_len, int num_blocks,
+    void *g_layer_outputs,    // optional [NUM_LAYERS, HIDDEN] — captures
+                              // ONLY the last decode step's layer outputs
+    cudaStream_t stream)
 {
     // Copy each token id to host (could be batched, but S is at most 32k
     // and the copy is small — bound by the kernel launch latency, not the
@@ -89,6 +92,11 @@ static cudaError_t prefill_naive_impl(
         if (err != cudaSuccess) return err;
         cudaStreamSynchronize(stream);
 
+        // Capture per-layer outputs only on the LAST step so the buffer
+        // ends up holding the final-position hidden states (matching HF's
+        // hidden_states[i][:, -1, :] semantic).
+        void *capture_this_step = (pos == S - 1) ? g_layer_outputs : nullptr;
+
         err = launcher(
             embed_weight, final_norm_weight, layer_weights,
             fa_k_cache, fa_v_cache, dn_states, conv_bufs,
@@ -99,7 +107,7 @@ static cudaError_t prefill_naive_impl(
             // text-only: pass pos for all 3 MRoPE axes so all rotary
             // pairs rotate (matches HF's text-only position_ids).
             (int)tok, pos, pos, pos, max_seq_len, num_blocks,
-            /*g_layer_outputs=*/nullptr, stream);
+            capture_this_step, stream);
         if (err != cudaSuccess) return err;
     }
     return cudaSuccess;
@@ -113,7 +121,8 @@ extern "C" cudaError_t launch_prefill_naive_0p8b(
     void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
     void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
-    YarnParams yp, int max_seq_len, int num_blocks, cudaStream_t stream)
+    YarnParams yp, int max_seq_len, int num_blocks,
+    void *g_layer_outputs, cudaStream_t stream)
 {
     return prefill_naive_impl<0>(
         device_token_ids, S,
@@ -123,7 +132,7 @@ extern "C" cudaError_t launch_prefill_naive_0p8b(
         g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq,
-        yp, max_seq_len, num_blocks, stream);
+        yp, max_seq_len, num_blocks, g_layer_outputs, stream);
 }
 
 extern "C" cudaError_t launch_prefill_naive_27b(
@@ -134,7 +143,8 @@ extern "C" cudaError_t launch_prefill_naive_27b(
     void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out, void *g_mlp_inter,
     void *g_z_scratch, void *g_beta_scratch, void *g_alpha_scratch,
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
-    YarnParams yp, int max_seq_len, int num_blocks, cudaStream_t stream)
+    YarnParams yp, int max_seq_len, int num_blocks,
+    void *g_layer_outputs, cudaStream_t stream)
 {
     return prefill_naive_impl<1>(
         device_token_ids, S,
@@ -144,7 +154,7 @@ extern "C" cudaError_t launch_prefill_naive_27b(
         g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq,
-        yp, max_seq_len, num_blocks, stream);
+        yp, max_seq_len, num_blocks, g_layer_outputs, stream);
 }
 
 }  // namespace lucebox::qwen3x

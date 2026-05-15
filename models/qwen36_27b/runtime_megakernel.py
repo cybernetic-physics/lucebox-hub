@@ -161,6 +161,7 @@ class Qwen36MegakernelDecoder:
             float(self.yarn["beta_slow"]),
             int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),
             int(self.num_blocks),
+            self.layer_capture,
         )
         self.position = int(prompt_ids.numel())
         return self._argmax_from_normalized()
