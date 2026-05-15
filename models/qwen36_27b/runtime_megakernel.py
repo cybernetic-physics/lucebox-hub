@@ -371,16 +371,16 @@ class Qwen36MegakernelDecoder:
     def _argmax_from_normalized(self) -> int:
         """LM head argmax over g_normalized @ lm_head.T.
 
-        Uses the fast bf16 kernel `lm_head_argmax` for the BF16 backend
-        (skips the fp32 cast + python matmul). NVFP4 path still falls
-        back to the python matmul because the NVFP4 LM head GEMV is
-        a separate (deferred) item — see TODO S7.
+        Uses the fast bf16 kernel `lm_head_argmax` whenever lm_head is
+        BF16 (which it always is — only the layer projections get
+        quantized, not the LM head embedding). The kernel's model_id
+        only selects HIDDEN/VOCAB shape via Cfg dispatch (model_id 0
+        for 0.8B, 1 for 27B); NVFP4 backend (model_id=3) shares the
+        Cfg_27B shape, so we map both 1 and 3 to the 27B kernel.
         """
-        # Fast path: BF16 weights + on-GPU kernel.
         lm_head = self.weights["lm_head_weight"]
         if (lm_head.dtype == torch.bfloat16
-                and not getattr(self, "_force_slow_argmax", False)
-                and self.MODEL_ID in (0, 1)):
+                and not getattr(self, "_force_slow_argmax", False)):
             if not hasattr(self, "_lm_head_scratch"):
                 # 2 blocks per SM (each 256 threads × 20 KB shmem ≈ 40 KB
                 # per SM, well under the 102 KB limit). Empirically the
@@ -396,8 +396,12 @@ class Qwen36MegakernelDecoder:
                     block_max_idxs=torch.zeros(num_blocks, dtype=torch.int32, device="cuda"),
                 )
             s = self._lm_head_scratch
+            # lm_head_argmax is keyed on (HIDDEN, VOCAB) shape only; 27B
+            # bf16 (MODEL_ID=1) and 27B nvfp4 (MODEL_ID=3) share dims,
+            # so always pass the bf16-kernel model id.
+            lm_model_id = 1 if self.MODEL_ID in (1, 3) else 0
             torch.ops.qwen3x_C.lm_head_argmax(
-                self.MODEL_ID, self.sc.g_normalized, lm_head,
+                lm_model_id, self.sc.g_normalized, lm_head,
                 s["out"], s["block_max_vals"], s["block_max_idxs"],
                 s["num_blocks"])
             return int(s["out"].item())
