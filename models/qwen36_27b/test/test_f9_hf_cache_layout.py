@@ -76,9 +76,21 @@ def main():
 
     print("\n--- expected by our prefill_via_hf ---")
     print(f"  FA keys/values: [1, KV_H=4, S, HEAD=256] bf16")
-    print(f"  DN conv_states: [1, CONV_CH=10240, CONV_K=4] f32")
-    print(f"  DN recurrent_states: [1, V_H=48, KEY=128, VAL=128] f32")
-    print(f"    (we transpose -1, -2 -> [1, V_H, VAL, KEY] to match our state[j*KEY+i] layout)")
+    print(f"  DN conv_states: [1, CONV_CH=10240, CONV_K=4] bf16  (we cast to fp32)")
+    print(f"  DN recurrent_states: [1, V_H=48, KEY=128, VAL=128] bf16")
+    print(f"    (we transpose -1, -2 -> [V_H, VAL, KEY] then cast to fp32")
+    print(f"     to match our state[j*KEY+i] layout)")
+
+    # Hard assertions so this becomes a CI regression test if shapes drift.
+    dn = cache.layers[first_dn]
+    fa = cache.layers[first_fa]
+    assert dn.conv_states.shape == (1, 10240, 4), \
+        f"DN conv_states shape changed: {tuple(dn.conv_states.shape)}"
+    assert dn.recurrent_states.shape == (1, 48, 128, 128), \
+        f"DN recurrent_states shape changed: {tuple(dn.recurrent_states.shape)}"
+    assert (fa.keys.shape[1], fa.keys.shape[3]) == (4, 256), \
+        f"FA keys shape changed: {tuple(fa.keys.shape)}"
+    print("\nPASS  all cache shapes/dtypes match prefill_via_hf assumptions")
 
 
 if __name__ == "__main__":
