@@ -42,6 +42,23 @@ struct FullAttnWeights {
     const __nv_bfloat16 *down_proj_weight;         // [HIDDEN, INTER]
 };
 
+// NVFP4 variant: norms stay BF16 (small, frequently accessed), projections
+// switch to packed FP4 + FP16 scales. Memory drops ~3.5×.
+template<typename Cfg>
+struct FullAttnWeightsNVFP4 {
+    const __nv_bfloat16 *input_layernorm_weight;
+    PackedMatrixNVFP4    q_proj;
+    PackedMatrixNVFP4    k_proj;
+    PackedMatrixNVFP4    v_proj;
+    const __nv_bfloat16 *q_norm_weight;
+    const __nv_bfloat16 *k_norm_weight;
+    PackedMatrixNVFP4    o_proj;
+    const __nv_bfloat16 *post_attn_layernorm_weight;
+    PackedMatrixNVFP4    gate_proj;
+    PackedMatrixNVFP4    up_proj;
+    PackedMatrixNVFP4    down_proj;
+};
+
 // One-head RMSNorm + RoPE. lane-cooperative within a warp.
 template<typename Cfg>
 __device__ void head_norm_rope(

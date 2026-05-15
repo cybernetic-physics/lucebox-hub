@@ -59,6 +59,26 @@ struct DeltaNetWeights {
     const __nv_bfloat16 *down_proj_weight;           // [HIDDEN, INTER]
 };
 
+// NVFP4 variant: norms, conv1d, a_log, dt_bias stay BF16. Linear projections
+// move to packed FP4 + FP16 scales.
+template<typename Cfg>
+struct DeltaNetWeightsNVFP4 {
+    const __nv_bfloat16 *input_layernorm_weight;
+    PackedMatrixNVFP4    qkv_proj;
+    PackedMatrixNVFP4    z_proj;
+    PackedMatrixNVFP4    beta_proj;
+    PackedMatrixNVFP4    alpha_proj;
+    const __nv_bfloat16 *conv1d_weight;      // small, stays bf16
+    const __nv_bfloat16 *a_log;
+    const __nv_bfloat16 *dt_bias;
+    const __nv_bfloat16 *norm_weight;
+    PackedMatrixNVFP4    out_proj;
+    const __nv_bfloat16 *post_attn_layernorm_weight;
+    PackedMatrixNVFP4    gate_proj;
+    PackedMatrixNVFP4    up_proj;
+    PackedMatrixNVFP4    down_proj;
+};
+
 template<typename Cfg>
 __device__ void delta_net_layer(
     AtomicGridSync &grid,
