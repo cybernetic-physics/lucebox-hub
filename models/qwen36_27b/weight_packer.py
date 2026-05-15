@@ -186,10 +186,33 @@ def load_27b_weights(
     from transformers import AutoModelForCausalLM, AutoTokenizer
     if verbose:
         print(f"[weight_packer] loading {model_name} ({dtype}) ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=dtype, device_map=device,
-        trust_remote_code=trust_remote_code,
-    )
+    # P5: OOM-safe load. Qwen3.6-27B BF16 is ~50 GB on GPU; check there
+    # is at least 52 GB free up front so we don't fail halfway through the
+    # 4-min load.
+    if device == "cuda" and torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_gb = free_b / (1024 ** 3)
+        need_gb = 52.0 if dtype == torch.bfloat16 else 100.0
+        if free_gb < need_gb:
+            raise RuntimeError(
+                f"Refusing to load {model_name} ({dtype}): need ~{need_gb:.0f} GB "
+                f"of free GPU memory, only {free_gb:.1f} GB available "
+                f"(of {total_b/(1024**3):.0f} GB total). Either free GPU memory "
+                f"first (run `nvidia-smi` to find busy processes), or pass "
+                f"device='cpu' to stage on host (slower init).")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=dtype, device_map=device,
+            trust_remote_code=trust_remote_code,
+        )
+    except torch.cuda.OutOfMemoryError as e:
+        free_b, total_b = torch.cuda.mem_get_info()
+        raise RuntimeError(
+            f"OOM during HF model load of {model_name}. "
+            f"Free GPU at error: {free_b/(1024**3):.1f} GB / "
+            f"{total_b/(1024**3):.0f} GB total. The 27B BF16 weights need ~50 GB. "
+            f"Inspect `nvidia-smi` for competing processes."
+        ) from e
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
     state = model.state_dict()
