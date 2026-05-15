@@ -4,12 +4,19 @@ Migration target: extend the hybrid-DeltaNet megakernel pattern from
 `models/qwen35_0p8b/` to Qwen3.6-27B (dense 27B, multimodal, 262K
 native context).
 
-**Status**: Phase 0 done. You can serve Qwen3.6-27B today via the HF
-backend (`runtime_hf` + `serve/openai_server.py`) — correctness baseline
-with thinking-mode, native Qwen3 tool calls, and XGrammar-constrained
-sampling. The megakernel speed path is Phase 1+; the templated `Cfg`
-scaffold in `megakernel/` compiles cleanly for both 0.8B and 27B
-specializations.
+**Status**: HF backend + megakernel BF16 path both operational.
+BF16 single- and multi-token forward passes top-1 vs HF on natural
+text (cos > 0.998, top-1 match — see
+[docs/results/qwen36_27b_gb10.md](docs/results/qwen36_27b_gb10.md)).
+NVFP4 weight path is wired through the kernel (model_id=3) with a
+dispatch smoke test passing; correctness vs HF on real weights is the
+next gate. Parallel-S prefill (S2) is the open speed item.
+
+Quick state:
+- BF16 inference at ~50 GB GPU on GB10 (max_seq=1024)
+- Multi-turn KV reuse via `prefill(prompt_ids, start_position=...)`
+- OpenAI-compat server with SSE streaming
+- Thinking mode, three tool-call formats, XGrammar — all working
 
 See [PLAN.md](PLAN.md) for the phased migration roadmap.
 
@@ -81,9 +88,12 @@ cd megakernel
 | grammar via XGrammar (JSON schema) | OK | `response_format.json_schema=` |
 | grammar via GBNF/EBNF | OK | `response_format.grammar=` |
 | 32k context | OK (slow) | HF runtime; megakernel needed for fast |
-| streaming | not yet | future addition |
+| streaming | OK | SSE via `serve/openai_server.py` (`stream=true`) |
 | vision tower | not yet | text-only path for now |
-| MTP speculative decode | not yet | Phase 6 (megakernel-side) |
+| MTP speculative decode (chain) | OK | placeholder MTP head; real head TODO |
+| MTP tree-verify | host driver | parallel-forward kernel TODO |
+| NVFP4 weight quantization | dispatch ready | correctness vs HF TODO |
+| Multi-turn KV reuse | OK | `prefill(start_position=...)` |
 
 ## Quickstart (once Phase 2 lands)
 
