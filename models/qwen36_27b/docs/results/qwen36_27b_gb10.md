@@ -33,8 +33,13 @@ After the MRoPE text-only fix (pos_h = pos_w = pos_t):
 
 ### Outstanding
 
-- C7 (long context S=32–256 wikitext) blocked on a hang in scratch
-  alloc at large `max_seq` values — under investigation.
+- C7 (long context S=32–256 wikitext) — re-running after the stride
+  fix. Previous "hang" was a stride mismatch between the 192-byte
+  C++ struct and a 176-byte Python pack (PACK_MAX_PTR=21 in the
+  S1c commit miscomputed `((8 + 21*8 + 15)//16)*16 = 176` instead
+  of 192). The kernel read every layer past 0 from the wrong offset
+  and crashed in the FA gate/up matvec with an OOB load. Fix:
+  hardcode `PACK_STRUCT = 192` + asserts (commit c4b53e6).
 - S>1024 untested; prefill_qwen3x_naive is host-looped so each S costs
   S × decode_kernel calls. Parallel-S prefill (S2) is the unblock.
 
@@ -82,9 +87,9 @@ Need parallel-S prefill (S2) for usable long-context speed.
 | Streaming via SSE (`stream=true`) | ✓ |
 | MTP speculative decode (chain) | ✓ |
 | MTP speculative decode (tree-verify) | host driver only |
-| NVFP4 weight quantization | primitive + structs only; not wired |
+| NVFP4 weight quantization | layer functions + dispatcher wired; correctness vs HF TODO |
 | NVFP4 KV cache | helpers only; not wired into FA |
-| Multi-turn KV reuse | not yet |
+| Multi-turn KV reuse (KV prefill from `start_position`) | ✓ |
 | Concurrent request batching | not yet |
 | Vision tower | not yet |
 | Long-context (>32k) via prefill_megakernel | requires S2 |
