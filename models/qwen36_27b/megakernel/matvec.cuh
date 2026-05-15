@@ -171,25 +171,80 @@ __device__ __forceinline__ __half2 fp4x2_to_h2(unsigned int byte) {
     return h2;
 }
 
-// Decode 4 FP4x2 bytes (32 bits = 8 FP4 values) into 8 dequantized floats,
-// multiplied by `scale`, dotted against 8 bf16 activations. `lut` is a
-// 16-entry shared-memory float table (kept as fallback path; the hardware
-// cvt path below is faster on sm_120+ and is the default).
+// Fast dot: 8 FP4 weights × 8 half activations, half2 SIMD accumulation
+// via __hfma2. The activation must be pre-loaded to fp16 (caller's
+// responsibility — see matvec_nvfp4 / matvec_*_silu_nvfp4 which pre-
+// convert s_input from bf16 to half once per matvec call).
+__device__ __forceinline__ float dot8_nvfp4_h2(
+    uint32_t packed, float scale, const __half *act_h)
+{
+    __half2 sum = __floats2half2_rn(0.0f, 0.0f);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned int byte = (packed >> (i * 8)) & 0xff;
+        __nv_fp4x2_storage_t s = (__nv_fp4x2_storage_t)byte;
+        __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(s, __NV_E2M1);
+        __half2 w = *reinterpret_cast<__half2 *>(&raw);
+        __half2 a = *reinterpret_cast<const __half2 *>(act_h + i * 2);
+        sum = __hfma2(w, a, sum);
+    }
+    float lo = __half2float(__low2half(sum));
+    float hi = __half2float(__high2half(sum));
+    return (lo + hi) * scale;
+}
+
+__device__ __forceinline__ float dot32_nvfp4_h2(
+    uint4 packed4, float scale, const __half *act_h)
+{
+    __half2 sum = __floats2half2_rn(0.0f, 0.0f);
+    uint32_t parts[4] = { packed4.x, packed4.y, packed4.z, packed4.w };
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uint32_t packed = parts[g];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned int byte = (packed >> (i * 8)) & 0xff;
+            __nv_fp4x2_storage_t s = (__nv_fp4x2_storage_t)byte;
+            __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(s, __NV_E2M1);
+            __half2 w = *reinterpret_cast<__half2 *>(&raw);
+            __half2 a = *reinterpret_cast<const __half2 *>(act_h + g * 8 + i * 2);
+            sum = __hfma2(w, a, sum);
+        }
+    }
+    float lo = __half2float(__low2half(sum));
+    float hi = __half2float(__high2half(sum));
+    return (lo + hi) * scale;
+}
+
+// Fast path: 4 FP4x2 bytes × 8 bf16 acts, half2 SIMD fma. Each FP4 pair
+// goes through 1 PTX `cvt.rn.f16x2.e2m1x2` instruction; activations are
+// converted bf16→half once into registers then fed to `__hfma2`. The
+// inner accumulator is half2; reduce to fp32 only once at the end.
 __device__ __forceinline__ float dot8_nvfp4_bf16(
     uint32_t packed, float scale, const __nv_bfloat16 *act,
     const float *__restrict__ /* lut, unused */)
 {
-    float sum = 0.0f;
+    __half2 act_h2[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        act_h2[i] = __halves2half2(
+            __float2half(__bfloat162float(act[i * 2 + 0])),
+            __float2half(__bfloat162float(act[i * 2 + 1])));
+    }
+    __half2 sum = __floats2half2_rn(0.0f, 0.0f);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         unsigned int byte = (packed >> (i * 8)) & 0xff;
-        __half2 h2 = fp4x2_to_h2(byte);
-        sum += __half2float(h2.x) * __bfloat162float(act[i * 2 + 0]);
-        sum += __half2float(h2.y) * __bfloat162float(act[i * 2 + 1]);
+        __nv_fp4x2_storage_t s = (__nv_fp4x2_storage_t)byte;
+        __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(s, __NV_E2M1);
+        __half2 w = *reinterpret_cast<__half2 *>(&raw);
+        sum = __hfma2(w, act_h2[i], sum);
     }
-    return sum * scale;
+    return (__half2float(__low2half(sum)) + __half2float(__high2half(sum))) * scale;
 }
 
+// f32 input variant: activations already fp32, no pre-cvt to half needed.
+// Keep fp32 fmadd for the f32-act path (down_residual reads s_input as fp32).
 __device__ __forceinline__ float dot8_nvfp4_f32(
     uint32_t packed, float scale, const float *act,
     const float *__restrict__ /* lut, unused */)
@@ -212,7 +267,15 @@ __device__ __forceinline__ float dot32_nvfp4_bf16(
     uint4 packed4, float scale, const __nv_bfloat16 *act,
     const float *__restrict__ /* lut, unused */)
 {
-    float sum = 0.0f;
+    // Pre-convert 32 bf16 activations to 16 half2s in registers.
+    __half2 act_h2[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        act_h2[i] = __halves2half2(
+            __float2half(__bfloat162float(act[i * 2 + 0])),
+            __float2half(__bfloat162float(act[i * 2 + 1])));
+    }
+    __half2 sum = __floats2half2_rn(0.0f, 0.0f);
     uint32_t parts[4] = { packed4.x, packed4.y, packed4.z, packed4.w };
     #pragma unroll
     for (int g = 0; g < 4; ++g) {
@@ -220,12 +283,13 @@ __device__ __forceinline__ float dot32_nvfp4_bf16(
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             unsigned int byte = (packed >> (i * 8)) & 0xff;
-            __half2 h2 = fp4x2_to_h2(byte);
-            sum += __half2float(h2.x) * __bfloat162float(act[g * 8 + i * 2 + 0]);
-            sum += __half2float(h2.y) * __bfloat162float(act[g * 8 + i * 2 + 1]);
+            __nv_fp4x2_storage_t s = (__nv_fp4x2_storage_t)byte;
+            __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(s, __NV_E2M1);
+            __half2 w = *reinterpret_cast<__half2 *>(&raw);
+            sum = __hfma2(w, act_h2[g * 4 + i], sum);
         }
     }
-    return sum * scale;
+    return (__half2float(__low2half(sum)) + __half2float(__high2half(sum))) * scale;
 }
 
 __device__ __forceinline__ float dot32_nvfp4_f32(
