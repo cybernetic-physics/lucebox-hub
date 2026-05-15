@@ -161,3 +161,66 @@ kernel that tiles the S-dim and chunks the DN recurrence.
 6. **HF Qwen3.6-27B state_dict prefix** is `model.layers.X.*`, not
    the on-disk safetensors `model.language_model.layers.X.*` (HF's
    Qwen3_5TextModel strips the wrapper).
+
+---
+
+# Addendum — Session 2 (May 14, 2026 evening)
+
+## TL;DR
+
+**C7 closed: top-1 match vs HF on S=32, 64, 128, 256 wikitext.** Cos
+0.97-0.998. Root cause of the "C7 hang" reported in Session 1 was a
+**192 vs 176 pack stride mismatch** introduced by S1c.
+
+## What landed
+
+| Area | What | Status |
+|---|---|---|
+| Correctness | C7 long-context sweep | top-1 match S=32..256 |
+| NVFP4 | S1c layer functions + 192B LayerWeights dispatch | done |
+| NVFP4 | S1d runtime wireup + dispatch smoke test | done |
+| NVFP4 | S1e correctness-vs-HF test scaffold | scaffold only |
+| F2 | Multi-turn KV reuse (`prefill(start_position=...)`) | done + smoke |
+| P2 | bench_pp_tg speed bench script | done |
+| P3 | Memory regression test + baseline | done |
+| P4 | NaN/Inf guard over long random-token decode | done |
+| P5 | OOM-safe HF load (pre-flight VRAM check) | done |
+| P6 | requirements.txt pinned | done |
+| S5 | MTP key probe script | scaffold |
+| S7a | BF16 LM head argmax kernel (skips fp32 cast) | done + matched torch |
+| S2 | Parallel-S prefill — porting checklist | plan only |
+| S3 | NVFP4 KV — wireup checklist | plan only |
+| Docs | D2 migration writeup | done |
+| Docs | D3 README refresh | done |
+| Trainer | trainer/ scaffold + porting README | done (placeholder) |
+
+## The pack stride bug
+
+The 192-byte `LayerWeights<Cfg>` union (added in S1c to hold both BF16
+and NVFP4 variants) was paired with a Python `PACK_STRUCT =
+((8 + 21*8 + 15)//16)*16 = 176`. 21 ptrs was the wrong cap — DN_nvfp4
+needs 22 ptrs. Kernel read each layer past 0 from a 16-byte-off
+offset. The crash was always at the FA gate/up matvec
+(matvec.cuh:83) because that was the first matvec with a "garbage"
+weight pointer pointing into another allocation.
+
+Fix: hardcode `PACK_STRUCT = 192` + `assert PACK_STRUCT == 192` at
+module load. Now there's only one source of truth.
+
+Diagnosed via compute-sanitizer with `-lineinfo`: the OOB read mapped
+to `lucebox::qwen3x::load_128bit (in helpers.cuh:35) -> matvec_gate_up_silu
+(matvec.cuh:83) -> full_attention_layer (fa_layer.cuh:328) ->
+decode_kernel_impl (kernel_decode_full.cu:166)`. Once we had source
+lines, the cause was immediate.
+
+## Open items by effort (for next session)
+
+- **S2** parallel-S prefill (L, 3-5 days) — biggest speed win
+- **S3** NVFP4 KV wired (M, 2-3 days)
+- **S5** real MTP head (M, 1-2 days after probe output)
+- **S6** tree-verify kernel (L, deps S5)
+- **T2/T3** training kernels (L, training-side)
+- **F3** concurrent batching (L)
+- **F4** vision tower (M)
+- **S7b** cuBLASLt FP4 LM head (S)
+- **S1e** actually run the NVFP4 correctness test (slow, ~30 min/run)
