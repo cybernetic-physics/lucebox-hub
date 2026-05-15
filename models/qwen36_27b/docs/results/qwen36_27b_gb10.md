@@ -104,7 +104,7 @@ Need parallel-S prefill (S2) for usable long-context speed.
 | Streaming via SSE (`stream=true`) | ✓ |
 | MTP speculative decode (chain) | ✓ |
 | MTP speculative decode (tree-verify) | host driver only |
-| NVFP4 weight quantization | layer functions + dispatcher wired; correctness vs HF TODO |
+| NVFP4 weight quantization | ✓ top-1 match HF on 3/3 prompts (cos 0.93-0.999), cache populated |
 | NVFP4 KV cache | helpers only; not wired into FA |
 | Multi-turn KV reuse (KV prefill from `start_position`) | ✓ |
 | Concurrent request batching | not yet |
