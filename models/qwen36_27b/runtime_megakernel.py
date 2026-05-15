@@ -112,7 +112,7 @@ class Qwen36MegakernelDecoder:
         self.layer_blob = pack_layer_weights(self.weights["layer_data"])
 
         if verbose: print(f"[megakernel] allocating scratch (max_seq={max_seq})...", flush=True)
-        self.sc = alloc_scratch(max_seq=max_seq)
+        self.sc = alloc_scratch(max_seq=max_seq, verbose=verbose)
 
         # Optional layer-by-layer hidden-state capture buffer. Allocated on
         # demand via enable_layer_capture(). When set, decode_qwen3x writes

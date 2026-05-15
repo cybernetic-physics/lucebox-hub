@@ -343,7 +343,8 @@ class Scratch:
     max_seq: int
 
 
-def alloc_scratch(max_seq: int = 32768, fa_num_splits: int = 128) -> Scratch:
+def alloc_scratch(max_seq: int = 32768, fa_num_splits: int = 128,
+                   verbose: bool = False) -> Scratch:
     """Allocate the persistent + per-token scratch buffers for the 27B
     decode path. Memory budget at max_seq=32768:
         fa_k_cache + fa_v_cache  : 2 * 16*4*32768*256 * 2 B = 1.0 GB
@@ -352,6 +353,56 @@ def alloc_scratch(max_seq: int = 32768, fa_num_splits: int = 128) -> Scratch:
         small per-step buffers   : ~few MB
     Total ~1.2 GB persistent, plus ~54 GB BF16 weights.
     """
+    import time
+    bf16 = dict(dtype=torch.bfloat16, device="cuda")
+    f32  = dict(dtype=torch.float32,  device="cuda")
+    def _t(name):
+        if verbose: print(f"  [alloc_scratch] {name}", flush=True)
+    _t("fa_k_cache")
+    fa_k_cache = torch.zeros(N_FA, FA_NUM_KV_HEADS, max_seq, FA_HEAD_DIM, **bf16)
+    _t("fa_v_cache")
+    fa_v_cache = torch.zeros(N_FA, FA_NUM_KV_HEADS, max_seq, FA_HEAD_DIM, **bf16)
+    _t("dn_states")
+    dn_states = torch.zeros(N_DN, DN_NUM_V_HEADS, DN_HEAD_DIM, DN_HEAD_DIM, **f32)
+    _t("conv_bufs")
+    conv_bufs = torch.zeros(N_DN, DN_CONV_CH, DN_CONV_KERNEL, **f32)
+    _t("hidden_buffer")
+    hidden_buffer = torch.zeros(HIDDEN_SIZE, **bf16)
+    _t("g_residual")
+    g_residual = torch.zeros(HIDDEN_SIZE, **bf16)
+    _t("g_qkv_scratch")
+    g_qkv_scratch = torch.zeros(max(FA_QPROJ_SIZE, DN_CONV_CH), **f32)
+    _t("g_kv_scratch")
+    g_kv_scratch = torch.zeros(FA_KV_SIZE * 2, **f32)
+    _t("g_attn_out")
+    g_attn_out = torch.zeros(max(FA_Q_SIZE, DN_V_SIZE), **f32)
+    _t("g_mlp_inter")
+    g_mlp_inter = torch.zeros(INTERMEDIATE_SIZE, **f32)
+    _t("g_z_scratch")
+    g_z_scratch = torch.zeros(DN_V_SIZE, **f32)
+    _t("g_beta+alpha")
+    g_beta_scratch  = torch.zeros(DN_NUM_V_HEADS, **f32)
+    g_alpha_scratch = torch.zeros(DN_NUM_V_HEADS, **f32)
+    _t("g_normalized")
+    g_normalized = torch.zeros(HIDDEN_SIZE, **f32)
+    _t("g_fa_partials")
+    g_fa_partials = torch.zeros(fa_num_splits * FA_NUM_Q_HEADS * (FA_HEAD_DIM + 2), **f32)
+    _t("g_rope_inv_freq")
+    g_rope_inv_freq = torch.zeros(FA_ROTARY_DIM // 2, **f32)
+    _t("Scratch ctor")
+    return Scratch(
+        fa_k_cache=fa_k_cache, fa_v_cache=fa_v_cache,
+        dn_states=dn_states, conv_bufs=conv_bufs,
+        hidden_buffer=hidden_buffer, g_residual=g_residual,
+        g_qkv_scratch=g_qkv_scratch, g_kv_scratch=g_kv_scratch,
+        g_attn_out=g_attn_out, g_mlp_inter=g_mlp_inter,
+        g_z_scratch=g_z_scratch,
+        g_beta_scratch=g_beta_scratch, g_alpha_scratch=g_alpha_scratch,
+        g_normalized=g_normalized, g_fa_partials=g_fa_partials,
+        g_rope_inv_freq=g_rope_inv_freq, max_seq=max_seq,
+    )
+
+def _alloc_scratch_OLD(max_seq: int = 32768, fa_num_splits: int = 128) -> Scratch:
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
     f32  = dict(dtype=torch.float32,  device="cuda")
     return Scratch(
