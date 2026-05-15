@@ -31,6 +31,10 @@ def parse_args():
     p.add_argument("--measure", type=int, default=3)
     p.add_argument("--max-seq", type=int, default=2048)
     p.add_argument("--backend", default="bf16", choices=("bf16", "nvfp4"))
+    p.add_argument("--prefill-mode", default="naive",
+                    choices=("naive", "hf"),
+                    help="'naive' = host-loop megakernel (slow at S>256), "
+                          "'hf' = HF batched forward + KV copy (~50x faster)")
     p.add_argument("--json", action="store_true")
     return p.parse_args()
 
@@ -65,9 +69,12 @@ def main():
             print(f"skip S={S}: would exceed max_seq={args.max_seq}"); continue
         ids = base_ids[:S].contiguous()
 
+        prefill_fn = (dec.prefill_via_hf if args.prefill_mode == "hf"
+                      else dec.prefill)
+
         # Warmup.
         for _ in range(args.warmup):
-            dec.reset(); dec.prefill(ids)
+            dec.reset(); prefill_fn(ids)
             torch.cuda.synchronize()
 
         # Measure prefill (pp).
@@ -75,14 +82,14 @@ def main():
         for _ in range(args.measure):
             dec.reset()
             t0 = time.perf_counter()
-            next_id = dec.prefill(ids)
+            next_id = prefill_fn(ids)
             torch.cuda.synchronize()
             pp_times.append(time.perf_counter() - t0)
 
         # Measure decode (tg) from the prefilled state.
         tg_times = []
         for _ in range(args.measure):
-            dec.reset(); next_id = dec.prefill(ids); torch.cuda.synchronize()
+            dec.reset(); next_id = prefill_fn(ids); torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(args.gen_tokens):
                 next_id = dec.decode(next_id)

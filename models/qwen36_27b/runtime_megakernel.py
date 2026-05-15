@@ -260,9 +260,21 @@ class Qwen36MegakernelDecoder:
         return int(last_logits.argmax().item())
 
     def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int,
-                  eos_id: int | None = None) -> torch.Tensor:
-        """Sequential prefill + decode wrapper. EOS-aware."""
-        next_id = self.prefill(prompt_ids)
+                  eos_id: int | None = None,
+                  use_hf_prefill: bool | None = None) -> torch.Tensor:
+        """Sequential prefill + decode wrapper. EOS-aware.
+
+        If `use_hf_prefill=True`, uses the HF model's batched forward
+        for prefill (~50× faster at S=256) and our megakernel for
+        decode. Requires `hf_model=hf` was passed at init time.
+        If None (default), auto-picks based on `hf_model` availability.
+        """
+        if use_hf_prefill is None:
+            use_hf_prefill = self.weights.get("_hf_keepalive") is not None
+        if use_hf_prefill:
+            next_id = self.prefill_via_hf(prompt_ids)
+        else:
+            next_id = self.prefill(prompt_ids)
         new_tokens = [next_id]
         if eos_id is not None and next_id == eos_id:
             return torch.tensor(new_tokens, dtype=torch.int32)
