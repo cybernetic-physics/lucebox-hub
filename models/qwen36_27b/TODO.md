@@ -293,13 +293,30 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   (currently expected to be > 80%).
 
 ### S5. Multi-Token Prediction (MTP) wire-up
-- **Status**: WIP  | **Prio**: P1  | **Effort**: M  | **Deps**: S1
-- Probe script at `test/test_s5_mtp_probe.py` reports the actual
-  state_dict layout — run that against HF to discover the exact key
-  prefix (mtp.layers vs model.mtp_head vs nextn.head).
-- Wire `mtp_speculative.MTPDecoder._mtp_predict` to call the real
-  head instead of the LM-head approximation it uses now.
-- **Acceptance**: chain MTP achieves AL ≥ 3 on natural text.
+- **Status**: WIP — blocked on S2  | **Prio**: P1  | **Effort**: M  | **Deps**: S1, **S2**
+- Probe complete (May 2026): MTP head is **1 transformer layer + a
+  pre-fc fusion** for k=1 next-next-token prediction. Total 810 MB
+  of bf16 weights. Direct safetensors load works (HF discards the
+  keys; use `mtp_loader.py`):
+  ```
+  mtp.fc.weight                     (5120, 10240)  ← concat(hidden, embed) -> hidden
+  mtp.pre_fc_norm_{embedding,hidden}.weight  (5120,)
+  mtp.layers.0.self_attn.{q,k,v,o}_proj.weight + q_norm + k_norm
+  mtp.layers.0.mlp.{gate,up,down}_proj.weight
+  mtp.layers.0.{input,post_attention}_layernorm.weight
+  mtp.norm.weight                   (5120,)        ← final pre-LM-head norm
+  ```
+- **Important math note**: this is k=1 (one extra prediction per target
+  forward), NOT k=3-4 as I'd estimated. Per-step math with our
+  current single-token target megakernel:
+    - Without MTP:           target_forward = 75 ms → 13 tok/s
+    - Chain MTP at AL=1:     target + mtp + verify_target = 155 ms → 12.9 tok/s (WORSE)
+  Chain MTP needs **batched verify** (process target at p AND p+1 in
+  one forward) to win. That requires parallel-S decode = S2 territory.
+- Until S2 lands, MTP only pays off via **tree-verify** (S6) which
+  also needs parallel-S forward. So S5/S6 both gate on S2.
+- **Acceptance**: chain MTP achieves AL ≥ 1 on natural text AND
+  wall-clock-positive vs baseline.
 
 ### S8. DN V_PER_QK conv1d deduplication [WONT-FIX]
 - **Status**: WONT-FIX  | **Prio**: P2  | **Effort**: S  | **Deps**: —
