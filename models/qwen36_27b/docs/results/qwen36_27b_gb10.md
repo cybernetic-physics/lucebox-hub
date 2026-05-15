@@ -153,7 +153,7 @@ Bench harness: `bench_results/bench_dflash_ar.sh`, `bench_results/bench_dflash_d
 | MTP speculative decode (tree-verify) | host driver only |
 | NVFP4 weight quantization | ✓ top-1 match HF; **2.97× decode speed** vs BF16 (13.4 vs 4.5 tok/s) |
 | NVFP4 KV cache | helpers only; not wired into FA |
-| Multi-turn KV reuse (KV prefill from `start_position`) | BROKEN — split prefill produces NaN logits on real weights (F8 fail). Smoke tested with zeros only |
+| Multi-turn KV reuse (KV prefill from `start_position`) | ✓ — single-decoder F2 on real HF weights: cos=1.000000, top-1 matches (`test/test_f2_singlerunner.py`). Fix: conv1d ring buffer replaces the racing shift. **Caveat**: creating two `Qwen36MegakernelDecoder` instances in one process NaNs the second one (pre-existing, separate bug — workaround: one decoder + `reset()`) |
 | prefill_via_hf (HF batched forward, ~50× prefill speedup) | BROKEN — first token OK, subsequent decodes diverge. Cache-layout bug |
 | Concurrent request batching | not yet |
 | Vision tower | not yet |

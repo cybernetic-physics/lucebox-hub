@@ -404,21 +404,24 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: `curl --no-buffer http://.../v1/chat/completions
   -d '{"stream": true, ...}'` emits incremental chunks.
 
-### F2. Multi-turn KV cache reuse [BROKEN — F8 fail]
-- **Status**: BROKEN  | **Prio**: P0  | **Effort**: M  | **Deps**: —
-- Dispatch + position arithmetic landed (commit 6a84333), smoke
-  `test_f2_multiturn_dispatch.py` passes with ZERO weights.
-- F8 (real-weight test) FAILS: `dec.prefill(ids[:S1])` then
-  `dec.prefill(ids[S1:], start_position=S1)` produces NaN logits at
-  the end. One-shot prefill on same prompt produces correct output.
-- Smoke test couldn't catch it (all-zero weights → no NaN propagation).
-- Suspect: some persistent buffer (g_residual maybe?, dn_states,
-  conv_bufs) carries stale data between consecutive `prefill_qwen3x_naive`
-  calls that corrupts the second prefill's first step. Or a stale
-  `g_fa_partials` value from the previous call's last token.
-- Next debug step: layer-by-layer hidden-state capture comparison
-  between one-shot prefill and split prefill (analogous to C3
-  debug strategy) to find first divergent layer.
+### F2. Multi-turn KV cache reuse [DONE]
+- **Status**: DONE (commit b754e02)  | **Prio**: P0  | **Effort**: M  | **Deps**: —
+- Root cause was kernel nondeterminism in the DN layer's conv1d
+  buffer update, not a multi-turn-specific bug. V_PER_QK=3 siblings
+  shifted conv_buf via 3-read-then-4-write; inter-block ordering of
+  those writes was racy, so a sibling could read a slot AFTER another
+  sibling had overwritten it, producing a double-shift. Two oneshot
+  prefills of the same input gave cos~0.75.
+- Fix: ring-buffer indexing. Each position writes a single slot
+  (p % CONV_K) with the SAME value across siblings (race-immune).
+  Reads index by (p+t+1) % CONV_K — older slots are never modified
+  in the current step. See `dn_layer.cuh:153-175` (BF16) and
+  `dn_layer.cuh:368-390` (NVFP4).
+- Verified: `test/test_f2_split_vs_oneshot_fast.py` (random weights):
+  cos=1.0000. `test/test_f2_singlerunner.py` (real HF weights):
+  cos=1.000000, top-1 matches one-shot.
+- Caveat: F8 (`test_f8_multiturn_correct.py`) still fails because it
+  creates two decoder instances — separate bug (multi-decoder NaN).
 
 ### F3. Concurrent request batching
 - **Status**: TODO  | **Prio**: P2  | **Effort**: L  | **Deps**: S2
@@ -448,13 +451,29 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: temp/top_p/top_k all observable in chat output;
   greedy path stays at current speed.
 
-### F8. Multi-turn correctness test
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: F2
-- Compare 2-turn chat (turn1 prefill + N decodes, then turn2
-  prefill with start_position=position + M decodes) against HF
-  running both turns concatenated. Verify same tokens.
-- Currently only the dispatch smoke test (`test_f2_multiturn_dispatch.py`)
-  exists; no real-weight correctness check.
+### F8. Multi-turn correctness test [PARTIAL]
+- **Status**: PARTIAL  | **Prio**: P2  | **Effort**: S  | **Deps**: F2
+- `test/test_f2_singlerunner.py` covers split-vs-oneshot on real HF
+  weights using ONE decoder (PASSES, cos=1.000000). This is the
+  real-weight F2 correctness check that was missing.
+- `test/test_f8_multiturn_correct.py` (two decoders) still fails
+  because of the multi-decoder NaN bug, not because of F2. Either
+  rewrite to use one decoder, or fix the multi-decoder bug.
+
+### F10. Multi-decoder NaN [NEW]
+- **Status**: BROKEN  | **Prio**: P2  | **Effort**: M  | **Deps**: —
+- Creating two `Qwen36MegakernelDecoder` instances in one Python
+  process makes the SECOND one's prefill produce NaN on real HF
+  weights. The first decoder's prefill is fine (even after the
+  second is created). Random small weights don't trigger this.
+- Repro: `test/debug_multi_decoder3.py`. Trial 1 (alone) OK; trial 2
+  (after del + empty_cache) OK; trial 3 (two decoders alive
+  simultaneously) NaN on the second.
+- Isolation: replicated by creating a fresh decoder; not caused by
+  `_unify_from_hf_model`, `pack_layer_weights`, or `alloc_scratch`
+  individually. Only the full `__init__` triggers it.
+- Workaround: use ONE decoder + `dec.reset()` between independent
+  prefills.
 
 ### F9. HF cache-layout regression test
 - **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: —
