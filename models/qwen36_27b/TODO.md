@@ -301,6 +301,18 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   head instead of the LM-head approximation it uses now.
 - **Acceptance**: chain MTP achieves AL ≥ 3 on natural text.
 
+### S8. DN V_PER_QK conv1d deduplication
+- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- In the DN layer, V_PER_QK=3 sibling blocks (sharing a QK head) ALL
+  redundantly do the conv1d for their shared Q/K channels and race
+  on the `conv_buf` writes (same data → no functional bug, but
+  wasteful). Designate the v_head % V_PER_QK == 0 block as the
+  "owner" that does the Q/K conv1d once; have the other siblings
+  read its s_q/s_k via cooperative shmem or just re-read conv_buf
+  after the owner writes.
+- Estimated savings: small (~few µs/layer × 48 DN ≈ <1 ms total).
+  Low priority but a real waste.
+
 ### S6. Tree-verify parallel forward kernel
 - **Status**: TODO  | **Prio**: P1  | **Effort**: L  | **Deps**: S5
 - `tree_verify.cuh` primitives are in place. Missing: a
@@ -397,6 +409,36 @@ These are needed for production but don't gate correctness.
   out_hidden_size=5120 projection back into the LM. Run vision as a
   separate stage via HF (no perf sensitivity — single image is < 100ms
   on GB10). Splice vision tokens into the prompt.
+
+### F7. Sampling-based generation (top-k, top-p, temperature)
+- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: —
+- `dec.decode()` returns `int(argmax)` only. Production decoding needs
+  temperature/top-k/top-p sampling. Options:
+  1. Add a `logits_for_last()` method that runs the full BF16 matmul
+     (slow, ~50 ms — same as the old pre-S7a path).
+  2. Write a `lm_head_topk_kernel` that returns the top-K rows + scores
+     and sample on host.
+  3. Move sampling into a Gumbel-noise variant of lm_head_argmax.
+- runtime_hf has sampling logic; port the same control flow.
+- **Acceptance**: temp/top_p/top_k all observable in chat output;
+  greedy path stays at current speed.
+
+### F8. Multi-turn correctness test
+- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: F2
+- Compare 2-turn chat (turn1 prefill + N decodes, then turn2
+  prefill with start_position=position + M decodes) against HF
+  running both turns concatenated. Verify same tokens.
+- Currently only the dispatch smoke test (`test_f2_multiturn_dispatch.py`)
+  exists; no real-weight correctness check.
+
+### F9. HF cache-layout regression test
+- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: —
+- A small unit test that probes HF's `cache.layers[i]` shapes on a
+  current Qwen3.6 checkpoint and asserts the layout matches what
+  `prefill_via_hf` assumes (especially `recurrent_states` is
+  [V_H, KEY, VAL] and conv_states is [CONV_CH, CONV_K]). HF can
+  change cache internals between releases; we already hit a silent
+  transpose bug because we didn't have this test.
 - **Acceptance**: a chat request with an image attachment runs end-to-
   end; output references image content.
 
