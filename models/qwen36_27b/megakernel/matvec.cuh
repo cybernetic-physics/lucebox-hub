@@ -189,6 +189,47 @@ __device__ __forceinline__ float dot8_nvfp4_f32(
     return sum * scale;
 }
 
+// Wide-load variants: take a uint4 (16 bytes = 32 FP4 values = one
+// group at GROUP_SIZE=32) and one scale. ~4x fewer HBM transactions
+// per warp than the uint32-load path.
+__device__ __forceinline__ float dot32_nvfp4_bf16(
+    uint4 packed4, float scale, const __nv_bfloat16 *act,
+    const float *__restrict__ lut)
+{
+    float sum = 0.0f;
+    uint32_t parts[4] = { packed4.x, packed4.y, packed4.z, packed4.w };
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uint32_t packed = parts[g];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned int byte = (packed >> (i * 8)) & 0xff;
+            sum += lut[byte & 0xf] * __bfloat162float(act[g * 8 + i * 2 + 0]);
+            sum += lut[byte >> 4]  * __bfloat162float(act[g * 8 + i * 2 + 1]);
+        }
+    }
+    return sum * scale;
+}
+
+__device__ __forceinline__ float dot32_nvfp4_f32(
+    uint4 packed4, float scale, const float *act,
+    const float *__restrict__ lut)
+{
+    float sum = 0.0f;
+    uint32_t parts[4] = { packed4.x, packed4.y, packed4.z, packed4.w };
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uint32_t packed = parts[g];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned int byte = (packed >> (i * 8)) & 0xff;
+            sum += lut[byte & 0xf] * act[g * 8 + i * 2 + 0];
+            sum += lut[byte >> 4]  * act[g * 8 + i * 2 + 1];
+        }
+    }
+    return sum * scale;
+}
+
 // Packed NVFP4 weight matrix descriptor.
 struct PackedMatrixNVFP4 {
     const uint8_t *data;          // [out_dim, in_dim / 2]   FP4x2 bytes
@@ -196,6 +237,10 @@ struct PackedMatrixNVFP4 {
 };
 
 // NVFP4 matvec: out[m] = sum_k W[m, k] * input[k], W stored in NVFP4.
+// Main loop uses uint4 (16-byte) loads at GROUP_SIZE=32 stride per
+// lane (each lane handles 1 full group per iter). Tail loop handles
+// any leftover < WARP_SIZE*32 elements via uint32 loads (e.g. 0.8B
+// INTER=3584 has a 512-element tail past the 3*1024 main loop).
 template<typename Cfg, int GROUP_SIZE = 32>
 __device__ void matvec_nvfp4(
     const __nv_bfloat16 *__restrict__ s_input,
@@ -203,6 +248,7 @@ __device__ void matvec_nvfp4(
     float *__restrict__ output,
     int in_dim, int out_dim, int num_blocks)
 {
+    static_assert(GROUP_SIZE == 32, "matvec_nvfp4 requires GROUP_SIZE=32");
     __shared__ float s_fp4_lut[16];
     load_fp4_lut_to_shmem(s_fp4_lut);
 
@@ -214,6 +260,7 @@ __device__ void matvec_nvfp4(
     int re = (rs + rows_per_block < out_dim) ? rs + rows_per_block : out_dim;
     int row_bytes  = in_dim / 2;
     int row_scales = in_dim / GROUP_SIZE;
+    int main_end = (in_dim / (WARP_SIZE * 32)) * (WARP_SIZE * 32);
 
     for (int m_base = rs; m_base < re; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
@@ -221,12 +268,17 @@ __device__ void matvec_nvfp4(
             const uint8_t *w_row = weight.data + (size_t)m * row_bytes;
             const __half *s_row  = weight.scales + (size_t)m * row_scales;
             float sum = 0.0f;
-            #pragma unroll 4
-            for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+            #pragma unroll 2
+            for (int k = lane_id * 32; k < main_end; k += WARP_SIZE * 32) {
+                uint4 packed4 = load_128bit(
+                    reinterpret_cast<const uint4 *>(w_row + (k / 2)));
+                float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
+                sum += dot32_nvfp4_bf16(packed4, scale, s_input + k, s_fp4_lut);
+            }
+            for (int k = main_end + lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint32_t packed = load_32bit(
                     reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
-                int scale_idx = k / GROUP_SIZE;
-                float scale = __half2float(__ldg(s_row + scale_idx));
+                float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
                 sum += dot8_nvfp4_bf16(packed, scale, s_input + k, s_fp4_lut);
             }
             sum = warp_reduce_sum_x(sum);
@@ -273,6 +325,7 @@ __device__ void matvec_gate_up_silu_nvfp4(
     int re = (rs + rows_per_block < out_dim) ? rs + rows_per_block : out_dim;
     int row_bytes  = in_dim / 2;
     int row_scales = in_dim / GROUP_SIZE;
+    int main_end = (in_dim / (WARP_SIZE * 32)) * (WARP_SIZE * 32);
 
     for (int m_base = rs; m_base < re; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
@@ -282,8 +335,17 @@ __device__ void matvec_gate_up_silu_nvfp4(
             const uint8_t *u_row = up_w.data + (size_t)m * row_bytes;
             const __half  *us_row = up_w.scales + (size_t)m * row_scales;
             float gs = 0.0f, us = 0.0f;
-            #pragma unroll 4
-            for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+            #pragma unroll 2
+            for (int k = lane_id * 32; k < main_end; k += WARP_SIZE * 32) {
+                uint4 gp = load_128bit(reinterpret_cast<const uint4 *>(g_row + (k / 2)));
+                uint4 up = load_128bit(reinterpret_cast<const uint4 *>(u_row + (k / 2)));
+                int si = k / GROUP_SIZE;
+                float g_scale = __half2float(__ldg(gs_row + si));
+                float u_scale = __half2float(__ldg(us_row + si));
+                gs += dot32_nvfp4_bf16(gp, g_scale, s_input + k, s_fp4_lut);
+                us += dot32_nvfp4_bf16(up, u_scale, s_input + k, s_fp4_lut);
+            }
+            for (int k = main_end + lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint32_t gp = load_32bit(reinterpret_cast<const uint32_t *>(g_row + (k / 2)));
                 uint32_t up = load_32bit(reinterpret_cast<const uint32_t *>(u_row + (k / 2)));
                 int si = k / GROUP_SIZE;
@@ -318,6 +380,7 @@ __device__ void matvec_down_residual_nvfp4(
     int re = (rs + rows_per_block < out_dim) ? rs + rows_per_block : out_dim;
     int row_bytes  = in_dim / 2;
     int row_scales = in_dim / GROUP_SIZE;
+    int main_end = (in_dim / (WARP_SIZE * 32)) * (WARP_SIZE * 32);
 
     for (int m_base = rs; m_base < re; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
@@ -325,7 +388,14 @@ __device__ void matvec_down_residual_nvfp4(
             const uint8_t *w_row = weight.data + (size_t)m * row_bytes;
             const __half  *s_row = weight.scales + (size_t)m * row_scales;
             float sum = 0.0f;
-            for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+            #pragma unroll 2
+            for (int k = lane_id * 32; k < main_end; k += WARP_SIZE * 32) {
+                uint4 packed4 = load_128bit(
+                    reinterpret_cast<const uint4 *>(w_row + (k / 2)));
+                float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
+                sum += dot32_nvfp4_f32(packed4, scale, s_input + k, s_fp4_lut);
+            }
+            for (int k = main_end + lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint32_t packed = load_32bit(
                     reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
                 float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
