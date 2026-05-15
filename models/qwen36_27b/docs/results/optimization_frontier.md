@@ -39,14 +39,29 @@ follow-on optimizations:
 2. **uint4 (16-byte) loads instead of uint32 (4-byte).** Each lane now
    reads one full FP4 group per iter (32 elements, 16 bytes, one
    scale), 4× fewer warp iters. Impact: 8.23 → 8.01 tok/s (no
-   speedup — confirms compute-bound). Kept for code clarity / future
-   benefit on HBM-bound configurations.
+   speedup — confirms compute-bound). Kept for code clarity.
 
-The remaining ~70 ms gap to the 51 ms NVFP4 HBM floor is the LUT
-lookup + bf16→fp32 cast + mul/add per FP4 element. Closing it would
-need either NVIDIA `cvt.rn.f16x2.e2m1x2` PTX (if/when available on
-sm_121) or moving to mma.sync FP4 Tensor Cores for matrix-vector via
-batched-S — i.e., S2 (parallel-S prefill) on the decode side.
+3. **Hardware FP4→FP16 cvt via `__nv_cvt_fp4x2_to_halfraw2`** (cuda_fp4.h,
+   sm_120+ intrinsic = one PTX `cvt` per FP4 pair). Replaced the shmem
+   LUT entirely. Impact: 8.01 → 8.35 tok/s (no measurable speedup).
+
+The three follow-on attempts land at the same ~125 ms/token. **The
+remaining ~70 ms gap to the 51 ms NVFP4 HBM floor is NOT in the FP4
+decode itself.** It's elsewhere — likely grid sync overhead (400
+syncs × 10-100 µs each), FA scan compute, and cooperative launch
+serialization with 1 block per SM. Profiling with Nsight is the next
+step to pinpoint; without it, further matvec micro-opts won't move
+the needle.
+
+Possible bigger wins from here:
+- Reduce grid syncs by fusing layer phases (FA scan + O-proj into
+  one section, etc.). 100-200 syncs of overhead at 50 µs each is
+  a few ms — small but stackable.
+- Use 2 blocks per SM via shmem reduction (would need to push 68 KB
+  static down to ≤51 KB, lossy precision in the silu(gate)*up
+  intermediate).
+- Switch the entire decode to Tensor Core mma.sync FP4 (would
+  require either S2 parallel-S or speculative-decode-style batch).
 
 ## What's still left to do (in real ROI order)
 
