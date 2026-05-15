@@ -179,7 +179,12 @@ class Qwen36MegakernelDecoder:
             self.sc.g_attn_out, self.sc.g_mlp_inter,
             self.sc.g_z_scratch, self.sc.g_beta_scratch, self.sc.g_alpha_scratch,
             self.sc.g_normalized, self.sc.g_fa_partials, self.sc.g_rope_inv_freq,
-            int(token_id), self.position, 0, 0, self.max_seq,
+            # For text-only inference HF's MRoPE position_ids has all 3 axes
+            # set to the temporal position. Passing 0 for pos_h/pos_w would
+            # make the height/width sections of the rotary_dim static, which
+            # is NOT equivalent to standard RoPE.
+            int(token_id), self.position, self.position, self.position,
+            self.max_seq,
             float(self.yarn["scale"]), float(self.yarn["beta_fast"]),
             float(self.yarn["beta_slow"]),
             int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),

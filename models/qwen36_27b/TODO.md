@@ -92,7 +92,25 @@ certainly surfaces bugs; the next ~5 items are the tight debug loop.
      could index off-by-one.
 - **Acceptance**: cos ≥ 0.999 at the previously-divergent layer.
 
-### C5. Loop C2-C4 until all 64 layers agree
+### C5. Loop C2-C4 until all 64 layers agree [DONE]
+**ROOT CAUSE FOUND**: FA layer was missing post-attn-norm + MLP +
+residual entirely. The weight struct declared post_attn_layernorm_weight,
+gate_proj_weight, up_proj_weight, down_proj_weight but they weren't
+USED. Skipping the MLP every 4th layer (16 times total) compounded
+to catastrophic drift.
+
+Fix in fa_layer.cuh: append the standard post-attn-norm + SwiGLU +
+down + residual sequence after the FA O-proj. Reuses g_attn_out as
+the mlp_inter f32 scratch.
+
+After fix:
+  All 64 layers: cos > 0.999 (DN: ~0.99998; FA: 0.99993-0.99999)
+  Final logits:  cos = 0.999640
+  Top-1 match:   YES (HF=16, ours=16)
+
+This closes C5 for single-token forward at position 0.
+
+### C5z. (archived investigation log)
 - **Status**: WIP  | **Prio**: P0  | **Effort**: M  | **Deps**: C4
 - Each fix may surface the next divergence point. Bound the loop by
   the layer count.
@@ -181,11 +199,14 @@ the corresponding modules. ~1 day of scratch-buffer plumbing.
   form is correct for all three norms.
 
 ### C6. Long-context correctness sweep
-- **Status**: TODO  | **Prio**: P0  | **Effort**: S  | **Deps**: C5
-- Run the existing `test/test_correctness_vs_hf.py` plus wikitext
-  windows at S ∈ {1, 32, 128, 512, 1024, 4096, 16384, 32768}. Confirm
-  top-1 match on natural text + cos ≥ 0.99 throughout.
-- **Acceptance**: pass at all 8 sizes.
+- **Status**: WIP  | **Prio**: P0  | **Effort**: S  | **Deps**: C5
+- Test scaffold: `test/test_c6_multitoken.py`. Three prompts of
+  varying lengths (S=1, ~6, ~17), runs both HF and our prefill,
+  compares last-position logits + per-layer cos snapshot.
+- Run with `HF_HOME=/home/sparkz/rl/.hf_cache python3 test/test_c6_multitoken.py`
+- After test passes for short prompts, extend to wikitext windows at
+  S ∈ {32, 128, 512, 1024, 4096, 16384, 32768}.
+- **Acceptance**: top-1 match on natural text + cos ≥ 0.99 throughout.
 
 ---
 

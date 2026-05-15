@@ -96,7 +96,9 @@ static cudaError_t prefill_naive_impl(
             g_qkv_scratch, g_kv_scratch, g_attn_out, g_mlp_inter,
             g_z_scratch, g_beta_scratch, g_alpha_scratch,
             g_normalized, g_fa_partials, g_rope_inv_freq, yp,
-            (int)tok, pos, 0, 0, max_seq_len, num_blocks,
+            // text-only: pass pos for all 3 MRoPE axes so all rotary
+            // pairs rotate (matches HF's text-only position_ids).
+            (int)tok, pos, pos, pos, max_seq_len, num_blocks,
             /*g_layer_outputs=*/nullptr, stream);
         if (err != cudaSuccess) return err;
     }
