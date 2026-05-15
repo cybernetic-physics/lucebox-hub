@@ -51,19 +51,36 @@ follow-on optimizations:
    at the end. Impact: 8.35 → 8.36 tok/s.
 
 **Four independent inner-loop optimizations all land at ~8.3 tok/s.**
-The bottleneck is definitively NOT the matvec compute. The remaining
-~70 ms gap to the 51 ms NVFP4 HBM floor is elsewhere — likely a
-combination of:
-- Grid sync overhead (~400 syncs/token × tens of µs each = 5-20 ms)
-- Cooperative launch serialization with 1 block per SM (forced by
-  the 68 KB static shmem requirement on Cfg_27B)
-- FA/DN scan compute paths (small but cumulative across 64 layers)
-- HBM efficiency loss from non-contiguous weight access patterns in
-  the cooperative scheduling
+Suspicion: the bottleneck wasn't the matvec at all. **Built a
+breakdown bench (cuda events around decode_qwen3x vs lm_head_argmax)
+to find out.** Result:
 
-Profiling with Nsight Compute / Systems is the next step to actually
-pin it down. Without that, further matvec micro-opts won't help —
-they've all been tried.
+  decode_qwen3x:  63.79 ms  (53%)
+  lm_head + sync: **56.48 ms  (47%)**
+
+The LM head fast-path kernel was gated on `MODEL_ID in (0, 1)`. NVFP4
+uses MODEL_ID=3 → it was silently falling back to the Python
+`hidden.float() @ lm_head.float().t()` matmul (~50 ms/token of needless
+fp32 cast + cuBLAS). One-line fix to remap `3 → 1` for the kernel
+dispatch (the kernel only cares about HIDDEN/VOCAB shape, not the
+backend).
+
+5. **LM head fast-path NVFP4 dispatch fix.** Impact:
+   **8.36 → 13.40 tok/s (1.60× alone, 2.95× over the original S1d).**
+
+### Current state — NVFP4 decode 2.97× BF16
+
+| Path | tok/s | ms/tok | % HBM peak |
+|---|---:|---:|---:|
+| BF16 megakernel | 4.52 | 221 | 83% |
+| **NVFP4 megakernel** | **13.40** | **75** | **68%** |
+
+NVFP4 is now at 68% of its 51 ms HBM peak (3.5× theoretical). The
+remaining 24 ms gap is plausibly grid sync overhead (~400/token)
+and FA/DN scan compute. Each is small enough that further matvec or
+single-kernel micro-opts won't move the needle much; the real lever
+is now S2 (parallel-S prefill via Tensor Cores) or grid sync count
+reduction at the layer-fusion level.
 
 Possible bigger wins from here:
 - Reduce grid syncs by fusing layer phases (FA scan + O-proj into
