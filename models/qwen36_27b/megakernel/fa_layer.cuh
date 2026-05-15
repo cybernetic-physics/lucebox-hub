@@ -295,6 +295,31 @@ __device__ void full_attention_layer(
     // 6. O projection + residual.
     matvec_o_residual<Cfg>(g_attn_out, w.o_proj_weight, g_residual, hidden_out,
                             Q_SIZE, H, num_blocks);
+    grid.sync();
+
+    // 7. Post-attn RMSnorm + MLP + residual. Every layer (FA or DN) has the
+    //    same post-attention path: norm -> gate/up SwiGLU -> down -> +residual.
+    //    Missing this for FA was the root cause of the ~0.003 cos drift per
+    //    FA pass we tracked down in C3.
+    __nv_bfloat16 *s_act = shmem;
+    rmsnorm_capture<Cfg>(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+
+    constexpr int INTER = Cfg::INTERMEDIATE;
+    // Reuse g_attn_out as the f32 [INTER] mlp_inter scratch — the gated
+    // attention output is no longer needed after step 6.
+    float *g_mlp_inter = g_attn_out;
+    matvec_gate_up_silu<Cfg>(s_act, w.gate_proj_weight, w.up_proj_weight,
+                              g_mlp_inter, H, INTER, num_blocks);
+    grid.sync();
+
+    {
+        float *s_mlp = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < INTER; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+        __syncthreads();
+        matvec_down_residual<Cfg>(s_mlp, w.down_proj_weight, g_residual, hidden_out,
+                                    INTER, H, num_blocks);
+    }
+    grid.sync();
 }
 
 }  // namespace lucebox::qwen3x
