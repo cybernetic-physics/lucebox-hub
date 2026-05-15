@@ -31,15 +31,32 @@ After the MRoPE text-only fix (pos_h = pos_w = pos_t):
 | "The capital of France is" | 5 | ' Paris' | ' Paris' | ✓ | 0.992 |
 | "In the beginning..." | 16 | ' the' | ' the' | ✓ | 0.994 |
 
+### C7 — Long-context sweep (wikitext, May 2026, post-stride-fix)
+
+| S | HF top-1 | Ours top-1 | Match | Cos | max_abs | KL | top5_ov | ours_step_ms |
+|---|---:|---:|:---:|---:|---:|---:|---:|---:|
+| 32  | 3878 | 3878 | ✓ | 0.997634 | 2.034 | 0.0106 | 0.80 | 6962 (HF 1406) |
+| 64  | 17   | 17   | ✓ | 0.965956 | 2.737 | 0.0009 | 1.00 | 13845 (HF 465) |
+| 128 | 303  | 303  | ✓ | 0.992968 | 1.322 | 0.0045 | 0.80 | 27050 (HF 419) |
+| 256 | 17   | 17   | ✓ | 0.995505 | 1.221 | 0.0002 | 1.00 | 54193 (HF 531) |
+
+**Top-1 matches HF on every S.** KL ≤ 0.011 nats throughout — the
+distributions are close enough that argmax is stable. Cos dips to
+0.966 at S=64 (under the 0.99 gate in the test script), which is the
+remaining drift to investigate (probably DN-state accumulation across
+the host-loop prefill — needs Parallel-S kernel + chunked DN scan to
+verify against HF's full chunk).
+
+Wall-clock per step ≈ 215 ms — close to the HBM-bound 50 GB ÷ 273
+GB/s ≈ 183 ms theoretical floor. Parallel-S prefill (S2) is needed
+for usable wall-clock at S ≥ 1024.
+
 ### Outstanding
 
-- C7 (long context S=32–256 wikitext) — re-running after the stride
-  fix. Previous "hang" was a stride mismatch between the 192-byte
-  C++ struct and a 176-byte Python pack (PACK_MAX_PTR=21 in the
-  S1c commit miscomputed `((8 + 21*8 + 15)//16)*16 = 176` instead
-  of 192). The kernel read every layer past 0 from the wrong offset
-  and crashed in the FA gate/up matvec with an OOB load. Fix:
-  hardcode `PACK_STRUCT = 192` + asserts (commit c4b53e6).
+- Cos drift at S=64 (top-1 fine, distribution wider): investigate
+  whether DN state diverges vs HF's chunked path or whether it's
+  just the host-loop accumulating fp32 noise — needs S2 parallel
+  prefill to verify cleanly.
 - S>1024 untested; prefill_qwen3x_naive is host-looped so each S costs
   S × decode_kernel calls. Parallel-S prefill (S2) is the unblock.
 
