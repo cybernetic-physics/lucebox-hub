@@ -88,6 +88,53 @@ the full table.
 
 Need parallel-S prefill (S2) for usable long-context speed.
 
+### Sweep — `bench_pp_tg.py --prefill-mode hf`, gen=128 (May 2026)
+
+Fork's megakernel AR decode across S, HF batched prefill:
+
+| S    | pp BF16 ms / tok/s | pp NVFP4 ms / tok/s | tg128 BF16 tok/s | tg128 NVFP4 tok/s | NVFP4/BF16 speedup |
+|------|---:|---:|---:|---:|---:|
+| 16   |  351 / 45.6  |  384 / 41.7 | 4.46 | 12.46 | 2.80× |
+| 64   |  380 / 168   |  424 / 151  | 4.48 | 12.61 | 2.82× |
+| 256  |  554 / 463   |  579 / 442  | 4.31 | 12.69 | 2.94× |
+| 1024 | 1700 / 602   | 1679 / 610  | 3.89 | 12.41 | 3.19× |
+| 2048 | 3316 / 618   | 3371 / 608  | 4.48 | 12.46 | 2.78× |
+
+Decode is flat in S (KV reads negligible at ≤2048 on 27B; memory-bound on weights).
+Memory-bound ceiling at 700 GB/s LPDDR5X-8000:
+- BF16: 50 GB/tok → 14.0 tok/s ceiling; measured 4.48 → 32% of peak
+- NVFP4: 13 GB/tok → 53.7 tok/s ceiling; measured 12.46 → 23% of peak
+
+### Cross-implementation — fork vs upstream `Luce-Org/lucebox-hub@9f1b98b` on GB10
+
+Same model (Qwen3.6-27B), same hardware. Upstream's 27B path is `dflash/`
+(Q4_K_M GGUF via ggml/llama.cpp), built with `-DCMAKE_CUDA_ARCHITECTURES=121a`,
+ggml-cuda `dad4f26d7`. Weights: `unsloth/Qwen3.6-27B-GGUF` Q4_K_M (16 GB) +
+`Lucebox/Qwen3.6-27B-DFlash-GGUF` draft q8_0 (1.8 GB).
+
+**Decode tok/s, gen=128:**
+
+| S    | Fork BF16 | Fork NVFP4 | dflash AR (Q4_K_M) | dflash DDTree (budget=22) |
+|------|---:|---:|---:|---:|
+| 16   | 4.46 | **12.46** | 10.69 | 23.81 (33% accept) |
+| 64   | 4.48 | **12.61** | 10.37 | 13.49 (28% accept) |
+| 256  | 4.31 | **12.69** |  8.93 |  8.93 (17% accept) |
+| 1024 | 3.89 | **12.41** |  7.83 | **39.78** (53% accept, 8.53 commit/step) |
+| 2048 | 4.48 | **12.46** |  8.66 | 11.11 (16% accept) |
+
+Headlines:
+- Fork NVFP4 AR beats dflash AR Q4_K_M on every shape: 1.17× at S=16 → **1.58× at S=1024** → 1.44× at S=2048.
+  Same weight precision (~4 bits), same hardware. Win is in the megakernel
+  (LUT-shmem NVFP4 decode, `__hfma2` SIMD, HW `cvt.f16x2.e2m1x2`).
+- Fork BF16 < dflash AR because 50 GB/tok BF16 weight read > 16 GB/tok Q4_K_M even with dflash's host-loop overhead.
+- dflash DDTree is content-volatile in the same wikitext sweep (8.93–39.78
+  tok/s depending on draft acceptance). The S=1024 prompt happens to be
+  in-distribution → 3.2× fork NVFP4; S=2048 drifts → 16% accept → underperforms.
+  Apples-to-apples *kernel* comparison is the AR column.
+
+Raw data: `bench_results/bench_{bf16,nvfp4,bf16_s2048,dflash_ar,dflash_ddtree}.{log,json}`.
+Bench harness: `bench_results/bench_dflash_ar.sh`, `bench_results/bench_dflash_ddtree.sh`.
+
 ## Feature surface (today)
 
 | Feature | Status |

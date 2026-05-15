@@ -1,0 +1,16 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+tokenized 2200 tokens
+[bench] total tokens: 2200
+=== S=16 gen=128 ===
+  wall=58.12013864517212s  decode=11.969s (10.69 tok/s)  pp+init=46.15113864517212s
+=== S=64 gen=128 ===
+  wall=60.491594314575195s  decode=12.347s (10.37 tok/s)  pp+init=48.144594314575194s
+=== S=256 gen=128 ===
+  wall=93.10284757614136s  decode=14.331s (8.93 tok/s)  pp+init=78.77184757614135s
+=== S=1024 gen=128 ===
+  wall=201.8370749950409s  decode=16.339s (7.83 tok/s)  pp+init=185.4980749950409s
+=== S=2048 gen=128 ===
+  wall=330.68773794174194s  decode=14.784s (8.66 tok/s)  pp+init=315.90373794174195s
+[bench] wrote /home/sparkz/rl/lucebox-hub/bench_results/bench_dflash_ar.json
+[bench] tmpdir kept: /tmp/dflash_bench.8UIAqx
+AR EXIT 0

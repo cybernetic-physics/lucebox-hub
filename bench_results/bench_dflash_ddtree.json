@@ -1,0 +1,11 @@
+{"runs":[
+{"S":16,"gen":128,"wall_s":69.41517686843872,"log_tail":"[dflash] generated 128 tokens in 5.375 s  ->  23.81 tok/s|[dflash] 24 draft steps, accepted=128/384 (33.3% per step), avg commit/step=5.33|[dflash] output tail: 211388 455 369 449 6163 4383 1116 12069 321 32385 11745 641 198 1216 369 1786 3750 364 780 3364 |"}
+,
+{"S":64,"gen":128,"wall_s":70.56767201423645,"log_tail":"[dflash] generated 128 tokens in 9.491 s  ->  13.49 tok/s|[dflash] 29 draft steps, accepted=128/464 (27.6% per step), avg commit/step=4.41|[dflash] output tail: 1116 551 9434 303 279 4383 561 9135 321 15443 314 10721 78294 641 733 220 17 15 15 22 |"}
+,
+{"S":256,"gen":128,"wall_s":71.686687707901,"log_tail":"[dflash] generated 128 tokens in 14.326 s  ->  8.93 tok/s|[dflash] 48 draft steps, accepted=128/768 (16.7% per step), avg commit/step=2.67|[dflash] output tail: 864 56276 24379 90290 59797 1116 17432 1012 1368 581 321 8105 55357 641 1216 995 264 8376 3364 303 |"}
+,
+{"S":1024,"gen":128,"wall_s":68.37665724754333,"log_tail":"[dflash] generated 128 tokens in 3.217 s  ->  39.78 tok/s|[dflash] 15 draft steps, accepted=128/240 (53.3% per step), avg commit/step=8.53|[dflash] output tail: 211388 455 1116 852 557 303 279 22983 3896 314 17500 1116 12485 2871 321 90504 506 279 4893 641 |"}
+,
+{"S":2048,"gen":128,"wall_s":69.36159348487854,"log_tail":"[dflash] generated 128 tokens in 11.523 s  ->  11.11 tok/s|[dflash] 51 draft steps, accepted=128/816 (15.7% per step), avg commit/step=2.51|[dflash] output tail: 283 283 283 695 220 733 220 22 18 20 1116 506 279 4092 314 220 17 18 1116 15226 |"}
+]}

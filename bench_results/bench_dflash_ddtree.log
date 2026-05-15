@@ -1,0 +1,106 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+tokenized 2200 tokens
+=== S=16 gen=128 ===
+[step 5] committed=27 last_tok=3364 tree_N=23 accept=3 next=37755
+[step 6] committed=30 last_tok=37755 tree_N=23 accept=1 next=757
+[step 7] committed=31 last_tok=757 tree_N=23 accept=2 next=641
+[step 8] committed=33 last_tok=641 tree_N=23 accept=1 next=198
+[step 9] committed=34 last_tok=198 tree_N=23 accept=3 next=211388
+[step 10] committed=37 last_tok=211388 tree_N=23 accept=2 next=369
+[step 11] committed=39 last_tok=369 tree_N=23 accept=2 next=6163
+[step 12] committed=41 last_tok=6163 tree_N=23 accept=7 next=641
+[step 13] committed=48 last_tok=641 tree_N=23 accept=4 next=1786
+[step 14] committed=52 last_tok=1786 tree_N=23 accept=8 next=757
+[step 15] committed=60 last_tok=757 tree_N=23 accept=4 next=220
+[step 16] committed=64 last_tok=220 tree_N=23 accept=4 next=369
+[step 17] committed=68 last_tok=369 tree_N=23 accept=11 next=1216
+[step 18] committed=79 last_tok=1216 tree_N=23 accept=14 next=220
+[step 19] committed=93 last_tok=220 tree_N=23 accept=12 next=11745
+[step 20] committed=105 last_tok=11745 tree_N=23 accept=6 next=3750
+[step 21] committed=111 last_tok=3750 tree_N=23 accept=11 next=220
+[step 22] committed=122 last_tok=220 tree_N=23 accept=12 next=11745
+[step 23] committed=134 last_tok=11745 tree_N=23 accept=15 next=641
+[dflash] generated 128 tokens in 5.375 s  ->  23.81 tok/s
+=== S=64 gen=128 ===
+[step 10] committed=98 last_tok=551 tree_N=23 accept=3 next=279
+[step 11] committed=101 last_tok=279 tree_N=23 accept=3 next=28141
+[step 12] committed=104 last_tok=28141 tree_N=23 accept=1 next=641
+[step 13] committed=105 last_tok=641 tree_N=23 accept=2 next=220
+[step 14] committed=107 last_tok=220 tree_N=23 accept=7 next=9434
+[step 15] committed=114 last_tok=9434 tree_N=23 accept=4 next=561
+[step 16] committed=118 last_tok=561 tree_N=23 accept=1 next=9135
+[step 17] committed=119 last_tok=9135 tree_N=23 accept=1 next=321
+[step 18] committed=120 last_tok=321 tree_N=23 accept=2 next=314
+[step 19] committed=122 last_tok=314 tree_N=23 accept=2 next=78294
+[step 20] committed=124 last_tok=78294 tree_N=23 accept=2 next=733
+[step 21] committed=126 last_tok=733 tree_N=23 accept=11 next=4383
+[step 22] committed=137 last_tok=4383 tree_N=23 accept=2 next=9135
+[step 23] committed=139 last_tok=9135 tree_N=23 accept=6 next=641
+[step 24] committed=145 last_tok=641 tree_N=23 accept=7 next=1116
+[step 25] committed=152 last_tok=1116 tree_N=23 accept=7 next=9135
+[step 26] committed=159 last_tok=9135 tree_N=23 accept=12 next=21
+[step 27] committed=171 last_tok=21 tree_N=23 accept=14 next=641
+[step 28] committed=185 last_tok=641 tree_N=23 accept=16 next=15443
+[dflash] generated 128 tokens in 9.491 s  ->  13.49 tok/s
+=== S=256 gen=128 ===
+[step 29] committed=323 last_tok=995 tree_N=23 accept=4 next=303
+[step 30] committed=327 last_tok=303 tree_N=23 accept=12 next=1116
+[step 31] committed=339 last_tok=1116 tree_N=23 accept=2 next=1634
+[step 32] committed=341 last_tok=1634 tree_N=23 accept=2 next=641
+[step 33] committed=343 last_tok=641 tree_N=23 accept=4 next=15
+[step 34] committed=347 last_tok=15 tree_N=23 accept=10 next=1116
+[step 35] committed=357 last_tok=1116 tree_N=23 accept=2 next=42762
+[step 36] committed=359 last_tok=42762 tree_N=23 accept=2 next=8854
+[step 37] committed=361 last_tok=8854 tree_N=23 accept=2 next=1116
+[step 38] committed=363 last_tok=1116 tree_N=23 accept=3 next=24379
+[step 39] committed=366 last_tok=24379 tree_N=23 accept=1 next=90290
+[step 40] committed=367 last_tok=90290 tree_N=23 accept=1 next=59797
+[step 41] committed=368 last_tok=59797 tree_N=23 accept=2 next=17432
+[step 42] committed=370 last_tok=17432 tree_N=23 accept=1 next=1012
+[step 43] committed=371 last_tok=1012 tree_N=23 accept=1 next=1368
+[step 44] committed=372 last_tok=1368 tree_N=23 accept=1 next=581
+[step 45] committed=373 last_tok=581 tree_N=23 accept=3 next=55357
+[step 46] committed=376 last_tok=55357 tree_N=23 accept=3 next=995
+[step 47] committed=379 last_tok=995 tree_N=23 accept=16 next=1116
+[dflash] generated 128 tokens in 14.326 s  ->  8.93 tok/s
+=== S=1024 gen=128 ===
+[prefill] 1024 tokens in 2.44 s, last_tok=303
+[step 0] committed=1024 last_tok=303 tree_N=23 accept=5 next=561
+[step 1] committed=1029 last_tok=561 tree_N=23 accept=1 next=23679
+[step 2] committed=1030 last_tok=23679 tree_N=23 accept=1 next=10036
+[step 3] committed=1031 last_tok=10036 tree_N=23 accept=3 next=7124
+[step 4] committed=1034 last_tok=7124 tree_N=23 accept=14 next=346
+[step 5] committed=1048 last_tok=346 tree_N=23 accept=5 next=220
+[step 6] committed=1053 last_tok=220 tree_N=23 accept=2 next=220
+[step 7] committed=1055 last_tok=220 tree_N=23 accept=7 next=56276
+[step 8] committed=1062 last_tok=56276 tree_N=23 accept=16 next=264
+[step 9] committed=1078 last_tok=264 tree_N=23 accept=11 next=12485
+[step 10] committed=1089 last_tok=12485 tree_N=23 accept=15 next=11745
+[step 11] committed=1104 last_tok=11745 tree_N=23 accept=15 next=12
+[step 12] committed=1119 last_tok=12 tree_N=23 accept=13 next=211388
+[step 13] committed=1132 last_tok=211388 tree_N=23 accept=11 next=1116
+[step 14] committed=1143 last_tok=1116 tree_N=23 accept=14 next=42120
+[dflash] generated 128 tokens in 3.217 s  ->  39.78 tok/s
+=== S=2048 gen=128 ===
+[step 32] committed=2129 last_tok=39360 tree_N=23 accept=1 next=641
+[step 33] committed=2130 last_tok=641 tree_N=23 accept=2 next=2250
+[step 34] committed=2132 last_tok=2250 tree_N=23 accept=2 next=7157
+[step 35] committed=2134 last_tok=7157 tree_N=23 accept=2 next=1007
+[step 36] committed=2136 last_tok=1007 tree_N=23 accept=2 next=1116
+[step 37] committed=2138 last_tok=1116 tree_N=23 accept=1 next=321
+[step 38] committed=2139 last_tok=321 tree_N=23 accept=2 next=28296
+[step 39] committed=2141 last_tok=28296 tree_N=23 accept=2 next=264
+[step 40] committed=2143 last_tok=264 tree_N=23 accept=3 next=279
+[step 41] committed=2146 last_tok=279 tree_N=23 accept=1 next=12723
+[step 42] committed=2147 last_tok=12723 tree_N=23 accept=1 next=641
+[step 43] committed=2148 last_tok=641 tree_N=23 accept=3 next=283
+[step 44] committed=2151 last_tok=283 tree_N=23 accept=3 next=21948
+[step 45] committed=2154 last_tok=21948 tree_N=23 accept=5 next=695
+[step 46] committed=2159 last_tok=695 tree_N=23 accept=3 next=220
+[step 47] committed=2162 last_tok=220 tree_N=23 accept=2 next=18
+[step 48] committed=2164 last_tok=18 tree_N=23 accept=4 next=279
+[step 49] committed=2168 last_tok=279 tree_N=23 accept=6 next=1116
+[step 50] committed=2174 last_tok=1116 tree_N=23 accept=4 next=279
+[dflash] generated 128 tokens in 11.523 s  ->  11.11 tok/s
+[bench] wrote /home/sparkz/rl/lucebox-hub/bench_results/bench_dflash_ddtree.json  tmpdir=/tmp/dflash_ddtree.9wMn5T
+DDTREE EXIT 0

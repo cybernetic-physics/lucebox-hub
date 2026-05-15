@@ -1,0 +1,11 @@
+{"runs":[
+{"S":16,"gen":128,"wall_s":58.12013864517212,"decode_s":11.969,"decode_tok_s":10.69,"prefill_plus_init_s":46.15113864517212}
+,
+{"S":64,"gen":128,"wall_s":60.491594314575195,"decode_s":12.347,"decode_tok_s":10.37,"prefill_plus_init_s":48.144594314575194}
+,
+{"S":256,"gen":128,"wall_s":93.10284757614136,"decode_s":14.331,"decode_tok_s":8.93,"prefill_plus_init_s":78.77184757614135}
+,
+{"S":1024,"gen":128,"wall_s":201.8370749950409,"decode_s":16.339,"decode_tok_s":7.83,"prefill_plus_init_s":185.4980749950409}
+,
+{"S":2048,"gen":128,"wall_s":330.68773794174194,"decode_s":14.784,"decode_tok_s":8.66,"prefill_plus_init_s":315.90373794174195}
+]}
