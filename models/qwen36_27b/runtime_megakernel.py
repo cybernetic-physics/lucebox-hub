@@ -327,9 +327,13 @@ class Qwen36MegakernelDecoder:
                 and not getattr(self, "_force_slow_argmax", False)
                 and self.MODEL_ID in (0, 1)):
             if not hasattr(self, "_lm_head_scratch"):
-                # vocab/hidden are large; 32 blocks gives plenty of
-                # parallelism without per-block work dropping below 1 KB.
-                num_blocks = 32
+                # 2 blocks per SM (each 256 threads × 20 KB shmem ≈ 40 KB
+                # per SM, well under the 102 KB limit). Empirically the
+                # difference between 32/48/96 blocks is <1 % (the kernel
+                # is HBM-bound at ~238 GB/s reading the 2.5 GB lm_head),
+                # but 2/SM gives the best occupancy headroom.
+                sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+                num_blocks = sm_count * 2
                 self._lm_head_scratch = dict(
                     num_blocks=num_blocks,
                     out=torch.zeros(1, dtype=torch.int32, device="cuda"),
