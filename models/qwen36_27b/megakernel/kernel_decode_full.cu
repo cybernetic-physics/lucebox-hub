@@ -99,9 +99,14 @@ decode_kernel_impl(
     constexpr int CONV_CH  = Cfg::DN_CONV_CH;
     constexpr int CONV_K   = Cfg::DN_CONV_KERNEL;
 
-    __shared__ __align__(16)
-        char shmem_raw[(Cfg::INTERMEDIATE > Cfg::HIDDEN ? Cfg::INTERMEDIATE
-                                                        : Cfg::HIDDEN) * sizeof(float)];
+    // Dynamic shmem (extern __shared__): for Cfg_27B this region is
+    // max(INTERMEDIATE, HIDDEN) * sizeof(float) = 17408 * 4 = 69632
+    // bytes, which exceeds the 48 KB static-shmem ABI cap. The host
+    // launcher (launch_decode_impl below) opts the kernel into the
+    // 100 KB Blackwell shmem limit via cudaFuncSetAttribute(
+    // cudaFuncAttributeMaxDynamicSharedMemorySize, ...) before the
+    // cooperative-grid launch.
+    extern __shared__ __align__(16) char shmem_raw[];
     __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
 
     // 1. Embed lookup -> hidden_buffer (block 0 writes; everyone reads
@@ -142,6 +147,7 @@ decode_kernel_impl(
                     g_attn_out, g_mlp_inter,
                     dn_states + (size_t)dn_layer_idx * dn_state_stride,
                     conv_bufs + (size_t)dn_layer_idx * conv_stride,
+                    position,
                     hidden_buffer, shmem_bf16);
                 ++dn_layer_idx;
             } else {  // lt == 3 (FA_nvfp4)
@@ -166,6 +172,7 @@ decode_kernel_impl(
                     g_attn_out, g_mlp_inter,
                     dn_states + (size_t)dn_layer_idx * dn_state_stride,
                     conv_bufs + (size_t)dn_layer_idx * conv_stride,
+                    position,
                     hidden_buffer, shmem_bf16);
                 ++dn_layer_idx;
             } else {  // lt == 1
@@ -259,8 +266,20 @@ static cudaError_t launch_decode_impl(
     };
     dim3 grid(num_blocks);
     dim3 block(BLOCK_SIZE);
+    constexpr int DYN_SHMEM_BYTES =
+        (Cfg::INTERMEDIATE > Cfg::HIDDEN ? Cfg::INTERMEDIATE
+                                         : Cfg::HIDDEN) * (int)sizeof(float);
+    // Opt the kernel into the Blackwell extended shmem limit
+    // (sm_120/121 allows up to 100 KB dynamic shmem per block, vs
+    // the 48 KB default). Safe to call repeatedly; this is a
+    // per-kernel attribute and the value is idempotent.
+    cudaError_t e = cudaFuncSetAttribute(
+        (void *)decode_kernel_impl<Cfg, USE_NVFP4>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SHMEM_BYTES);
+    if (e != cudaSuccess) return e;
     return cudaLaunchCooperativeKernel(
-        (void *)decode_kernel_impl<Cfg, USE_NVFP4>, grid, block, args, 0, stream);
+        (void *)decode_kernel_impl<Cfg, USE_NVFP4>, grid, block, args,
+        DYN_SHMEM_BYTES, stream);
 }
 
 extern "C" cudaError_t launch_decode_0p8b(

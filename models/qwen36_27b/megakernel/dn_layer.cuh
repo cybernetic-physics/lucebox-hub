@@ -92,7 +92,8 @@ __device__ void delta_net_layer(
     float *__restrict__ g_dn_out,        // [DN_V_SIZE]
     float *__restrict__ g_mlp_inter,     // [INTER]
     float *__restrict__ dn_state,        // [DN_NUM_V_HEADS, DN_VAL, DN_KEY] persistent
-    float *__restrict__ conv_buf,        // [DN_CONV_CH, DN_CONV_KERNEL] persistent
+    float *__restrict__ conv_buf,        // [DN_CONV_CH, DN_CONV_KERNEL] persistent (ring buffer)
+    int position,                         // current decode position (for ring index)
     __nv_bfloat16 *__restrict__ hidden_out,
     __nv_bfloat16 *__restrict__ shmem)
 {
@@ -135,13 +136,21 @@ __device__ void delta_net_layer(
         __shared__ float s_v[Cfg::DN_VALUE_DIM];
 
         // Three regions to conv1d: Q[qk_head], K[qk_head], V[v_head].
-        // S8 NOTE: with V_PER_QK > 1, V-head siblings sharing a QK head
-        // redundantly do the Q/K conv1d AND write the same conv_buf
-        // slots in parallel. The writes are race-immune (identical
-        // values) but the work is duplicated V_PER_QK× per layer.
-        // A dedup attempt was reverted because non-owner blocks would
-        // need a grid.sync to see owner's conv_buf writes, which
-        // costs more than the dedup saves at V_PER_QK=3.
+        // RING BUFFER fix (replaces shift): all V-head siblings for the
+        // same qk_head wrote/read conv_buf via a 3-read-then-4-write
+        // shift, and the inter-block ordering of those writes was
+        // non-deterministic — a sibling could read a slot AFTER another
+        // sibling had overwritten it, producing a double-shift. That
+        // made the kernel produce different results on identical inputs
+        // (cos ~0.75 between two oneshot runs).
+        //
+        // Fix: index conv_buf as a ring of size CONV_K. The newest slot
+        // for position p is (p % CONV_K); slots for p-3..p are at
+        // ((p+1)%CONV_K, (p+2)%CONV_K, (p+3)%CONV_K, p%CONV_K). Every
+        // sibling writes the SAME slot with the SAME g_qkv[ch] value
+        // (race-immune). Reads of the other three slots only touch
+        // values written in previous positions (race-free).
+        const int write_slot = position & (CONV_K - 1);  // CONV_K=4
         struct Region { int ch_base; int count; float *dst; };
         Region regs[3] = {
             { qk_head * KEY,             KEY, s_q },
@@ -152,19 +161,14 @@ __device__ void delta_net_layer(
             const Region &R = regs[r];
             for (int c = threadIdx.x; c < R.count; c += BLOCK_SIZE) {
                 int ch = R.ch_base + c;
-                // Shift the conv ring buffer by 1 (kernel size CONV_K = 4).
-                float h0 = conv_buf[ch * CONV_K + 1];
-                float h1 = conv_buf[ch * CONV_K + 2];
-                float h2 = conv_buf[ch * CONV_K + 3];
-                conv_buf[ch * CONV_K + 0] = h0;
-                conv_buf[ch * CONV_K + 1] = h1;
-                conv_buf[ch * CONV_K + 2] = h2;
-                conv_buf[ch * CONV_K + 3] = g_qkv[ch];
+                conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
                 float co = 0.0f;
                 #pragma unroll
-                for (int t = 0; t < CONV_K; ++t)
-                    co += conv_buf[ch * CONV_K + t]
+                for (int t = 0; t < CONV_K; ++t) {
+                    int slot = (position + t + 1) & (CONV_K - 1);
+                    co += conv_buf[ch * CONV_K + slot]
                           * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
+                }
                 R.dst[c] = fast_silu(co);
             }
         }
@@ -323,6 +327,7 @@ __device__ void delta_net_layer_nvfp4(
     float *__restrict__ g_mlp_inter,
     float *__restrict__ dn_state,
     float *__restrict__ conv_buf,
+    int position,
     __nv_bfloat16 *__restrict__ hidden_out,
     __nv_bfloat16 *__restrict__ shmem)
 {
@@ -360,6 +365,8 @@ __device__ void delta_net_layer_nvfp4(
         __shared__ float s_k[Cfg::DN_KEY_DIM];
         __shared__ float s_v[Cfg::DN_VALUE_DIM];
 
+        // Ring-buffer conv_buf (see BF16 delta_net_layer comment).
+        const int write_slot = position & (CONV_K - 1);
         struct Region { int ch_base; int count; float *dst; };
         Region regs[3] = {
             { qk_head * KEY,             KEY, s_q },
@@ -370,18 +377,14 @@ __device__ void delta_net_layer_nvfp4(
             const Region &R = regs[r];
             for (int c = threadIdx.x; c < R.count; c += BLOCK_SIZE) {
                 int ch = R.ch_base + c;
-                float h0 = conv_buf[ch * CONV_K + 1];
-                float h1 = conv_buf[ch * CONV_K + 2];
-                float h2 = conv_buf[ch * CONV_K + 3];
-                conv_buf[ch * CONV_K + 0] = h0;
-                conv_buf[ch * CONV_K + 1] = h1;
-                conv_buf[ch * CONV_K + 2] = h2;
-                conv_buf[ch * CONV_K + 3] = g_qkv[ch];
+                conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
                 float co = 0.0f;
                 #pragma unroll
-                for (int t = 0; t < CONV_K; ++t)
-                    co += conv_buf[ch * CONV_K + t]
+                for (int t = 0; t < CONV_K; ++t) {
+                    int slot = (position + t + 1) & (CONV_K - 1);
+                    co += conv_buf[ch * CONV_K + slot]
                           * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
+                }
                 R.dst[c] = fast_silu(co);
             }
         }
