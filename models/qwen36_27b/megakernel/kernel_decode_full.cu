@@ -35,30 +35,31 @@
 
 namespace lucebox::qwen3x {
 
-// Variant per-layer weight pointer block. Sized to exactly 128 bytes
-// so the Python packer's stride-128 layout in weight_packer.py matches
-// `sizeof(LayerWeights<Cfg>)` exactly. The union holds the per-layer-
-// type pointer struct (FA = 11 ptrs, DN = 14 ptrs; DN is the larger).
+// Variant per-layer weight pointer block. 192 bytes so the union can hold
+// either a BF16 layer (DN_bf16 = 112B is biggest) or an NVFP4 layer
+// (DN_nvfp4 = 168B is biggest). Python packer stride must match exactly
+// — see PACK_STRUCT in weight_packer.py.
+//
+//   layer_type values:
+//     0 = DN_bf16   1 = FA_bf16   2 = DN_nvfp4   3 = FA_nvfp4
 template<typename Cfg>
 struct LayerWeights {
-    int layer_type;       // 0 = DN, 1 = FA
+    int layer_type;
     int _pad0;
     union {
-        FullAttnWeights<Cfg> fa;
-        DeltaNetWeights<Cfg> dn;
-        char _force_size[120];   // forces union to 120 bytes; total struct = 128
+        FullAttnWeights<Cfg>       fa;
+        DeltaNetWeights<Cfg>       dn;
+        FullAttnWeightsNVFP4<Cfg>  fa_nvfp4;
+        DeltaNetWeightsNVFP4<Cfg>  dn_nvfp4;
+        char _force_size[184];   // 184 + 8 header = 192 byte struct
     };
-    // Layout:
-    //   bytes [0..4)    layer_type
-    //   bytes [4..8)    _pad0
-    //   bytes [8..128)  union of FA(88B)/DN(112B), trailing bytes are pad
 };
-static_assert(sizeof(LayerWeights<Cfg_0p8B>) == 128,
-              "LayerWeights<Cfg_0p8B> must be 128 bytes");
-static_assert(sizeof(LayerWeights<Cfg_27B>)  == 128,
-              "LayerWeights<Cfg_27B> must be 128 bytes");
+static_assert(sizeof(LayerWeights<Cfg_0p8B>) == 192,
+              "LayerWeights<Cfg_0p8B> must be 192 bytes");
+static_assert(sizeof(LayerWeights<Cfg_27B>)  == 192,
+              "LayerWeights<Cfg_27B> must be 192 bytes");
 
-template<typename Cfg>
+template<typename Cfg, bool USE_NVFP4 = false>
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 decode_kernel_impl(
     const __nv_bfloat16 *__restrict__ embed_weight,        // [VOCAB, HIDDEN]
@@ -124,28 +125,55 @@ decode_kernel_impl(
     #pragma unroll 1
     for (int layer = 0; layer < Cfg::NUM_LAYERS; ++layer) {
         const __nv_bfloat16 *layer_input = hidden_buffer;
-        if (layer_weights[layer].layer_type == 0) {
-            delta_net_layer<Cfg>(
-                grid, layer_weights[layer].dn, layer_input,
-                g_residual,
-                g_qkv_scratch, g_z_scratch,
-                g_beta_scratch, g_alpha_scratch,
-                g_attn_out, g_mlp_inter,
-                dn_states + (size_t)dn_layer_idx * dn_state_stride,
-                conv_bufs + (size_t)dn_layer_idx * conv_stride,
-                hidden_buffer, shmem_bf16);
-            ++dn_layer_idx;
+        int lt = layer_weights[layer].layer_type;
+        if constexpr (USE_NVFP4) {
+            if (lt == 2) {
+                delta_net_layer_nvfp4<Cfg>(
+                    grid, layer_weights[layer].dn_nvfp4, layer_input,
+                    g_residual,
+                    g_qkv_scratch, g_z_scratch,
+                    g_beta_scratch, g_alpha_scratch,
+                    g_attn_out, g_mlp_inter,
+                    dn_states + (size_t)dn_layer_idx * dn_state_stride,
+                    conv_bufs + (size_t)dn_layer_idx * conv_stride,
+                    hidden_buffer, shmem_bf16);
+                ++dn_layer_idx;
+            } else {  // lt == 3 (FA_nvfp4)
+                full_attention_layer_nvfp4<Cfg>(
+                    grid, layer_weights[layer].fa_nvfp4, layer_input,
+                    fa_k_cache + (size_t)fa_layer_idx * fa_kv_stride,
+                    fa_v_cache + (size_t)fa_layer_idx * fa_kv_stride,
+                    g_residual, g_qkv_scratch, g_kv_scratch,
+                    g_attn_out, g_fa_partials,
+                    g_rope_inv_freq, yp, sections,
+                    position, max_seq_len, pos_h, pos_w,
+                    shmem_bf16, hidden_buffer);
+                ++fa_layer_idx;
+            }
         } else {
-            full_attention_layer<Cfg>(
-                grid, layer_weights[layer].fa, layer_input,
-                fa_k_cache + (size_t)fa_layer_idx * fa_kv_stride,
-                fa_v_cache + (size_t)fa_layer_idx * fa_kv_stride,
-                g_residual, g_qkv_scratch, g_kv_scratch,
-                g_attn_out, g_fa_partials,
-                g_rope_inv_freq, yp, sections,
-                position, max_seq_len, pos_h, pos_w,
-                shmem_bf16, hidden_buffer);
-            ++fa_layer_idx;
+            if (lt == 0) {
+                delta_net_layer<Cfg>(
+                    grid, layer_weights[layer].dn, layer_input,
+                    g_residual,
+                    g_qkv_scratch, g_z_scratch,
+                    g_beta_scratch, g_alpha_scratch,
+                    g_attn_out, g_mlp_inter,
+                    dn_states + (size_t)dn_layer_idx * dn_state_stride,
+                    conv_bufs + (size_t)dn_layer_idx * conv_stride,
+                    hidden_buffer, shmem_bf16);
+                ++dn_layer_idx;
+            } else {  // lt == 1
+                full_attention_layer<Cfg>(
+                    grid, layer_weights[layer].fa, layer_input,
+                    fa_k_cache + (size_t)fa_layer_idx * fa_kv_stride,
+                    fa_v_cache + (size_t)fa_layer_idx * fa_kv_stride,
+                    g_residual, g_qkv_scratch, g_kv_scratch,
+                    g_attn_out, g_fa_partials,
+                    g_rope_inv_freq, yp, sections,
+                    position, max_seq_len, pos_h, pos_w,
+                    shmem_bf16, hidden_buffer);
+                ++fa_layer_idx;
+            }
         }
         // Debug capture: write hidden_buffer to layer-indexed slot if requested.
         if (g_layer_outputs != nullptr) {

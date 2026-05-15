@@ -227,4 +227,100 @@ __device__ __forceinline__ void matvec_o_residual(
                                in_dim, out_dim, num_blocks);
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 fused / residual matvec variants. Mirror the BF16 trio so each layer
+// only needs to swap the weight argument + matvec call. Group size pinned at
+// 32 to match the packer in nvfp4_pack.py.
+// ---------------------------------------------------------------------------
+
+template<typename Cfg, int GROUP_SIZE = 32>
+__device__ void matvec_gate_up_silu_nvfp4(
+    const __nv_bfloat16 *__restrict__ s_input,
+    PackedMatrixNVFP4 gate_w,
+    PackedMatrixNVFP4 up_w,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int rs = block_id * rows_per_block;
+    int re = (rs + rows_per_block < out_dim) ? rs + rows_per_block : out_dim;
+    int row_bytes  = in_dim / 2;
+    int row_scales = in_dim / GROUP_SIZE;
+
+    for (int m_base = rs; m_base < re; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < re) {
+            const uint8_t *g_row = gate_w.data + (size_t)m * row_bytes;
+            const __half  *gs_row = gate_w.scales + (size_t)m * row_scales;
+            const uint8_t *u_row = up_w.data + (size_t)m * row_bytes;
+            const __half  *us_row = up_w.scales + (size_t)m * row_scales;
+            float gs = 0.0f, us = 0.0f;
+            #pragma unroll 4
+            for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+                uint32_t gp = load_32bit(reinterpret_cast<const uint32_t *>(g_row + (k / 2)));
+                uint32_t up = load_32bit(reinterpret_cast<const uint32_t *>(u_row + (k / 2)));
+                int si = k / GROUP_SIZE;
+                float g_scale = __half2float(__ldg(gs_row + si));
+                float u_scale = __half2float(__ldg(us_row + si));
+                gs += dot8_nvfp4_bf16(gp, g_scale, s_input + k);
+                us += dot8_nvfp4_bf16(up, u_scale, s_input + k);
+            }
+            gs = warp_reduce_sum_x(gs);
+            us = warp_reduce_sum_x(us);
+            if (lane_id == 0) output[m] = fast_silu(gs) * us;
+        }
+    }
+}
+
+template<typename Cfg, int GROUP_SIZE = 32>
+__device__ void matvec_down_residual_nvfp4(
+    const float *__restrict__ s_input,
+    PackedMatrixNVFP4 weight,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int rs = block_id * rows_per_block;
+    int re = (rs + rows_per_block < out_dim) ? rs + rows_per_block : out_dim;
+    int row_bytes  = in_dim / 2;
+    int row_scales = in_dim / GROUP_SIZE;
+
+    for (int m_base = rs; m_base < re; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < re) {
+            const uint8_t *w_row = weight.data + (size_t)m * row_bytes;
+            const __half  *s_row = weight.scales + (size_t)m * row_scales;
+            float sum = 0.0f;
+            for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+                uint32_t packed = load_32bit(
+                    reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
+                float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
+                sum += dot8_nvfp4_f32(packed, scale, s_input + k);
+            }
+            sum = warp_reduce_sum_x(sum);
+            if (lane_id == 0)
+                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+        }
+    }
+}
+
+template<typename Cfg, int GROUP_SIZE = 32>
+__device__ __forceinline__ void matvec_o_residual_nvfp4(
+    const float *__restrict__ s_input,
+    PackedMatrixNVFP4 weight,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    matvec_down_residual_nvfp4<Cfg, GROUP_SIZE>(s_input, weight, residual,
+                                                  hidden_out, in_dim, out_dim, num_blocks);
+}
+
 }  // namespace lucebox::qwen3x

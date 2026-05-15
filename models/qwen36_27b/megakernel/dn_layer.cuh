@@ -296,4 +296,213 @@ __device__ void delta_net_layer(
     grid.sync();
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4-weighted DN layer. Swaps the five linear projections (qkv, z, beta,
+// alpha, out, gate, up, down) to NVFP4 matvecs. Conv1d, a_log, dt_bias,
+// norm_weight, input/post-attn layernorm stay BF16 — they are small or
+// require precision the FP4 LUT can't preserve.
+// ---------------------------------------------------------------------------
+template<typename Cfg>
+__device__ void delta_net_layer_nvfp4(
+    AtomicGridSync &grid,
+    const DeltaNetWeightsNVFP4<Cfg> &w,
+    const __nv_bfloat16 *__restrict__ input,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_qkv,
+    float *__restrict__ g_z,
+    float *__restrict__ g_beta,
+    float *__restrict__ g_alpha,
+    float *__restrict__ g_dn_out,
+    float *__restrict__ g_mlp_inter,
+    float *__restrict__ dn_state,
+    float *__restrict__ conv_buf,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    __nv_bfloat16 *__restrict__ shmem)
+{
+    constexpr int H        = Cfg::HIDDEN;
+    constexpr int INTER    = Cfg::INTERMEDIATE;
+    constexpr int V_HEADS  = Cfg::DN_NUM_V_HEADS;
+    constexpr int QK_HEADS = Cfg::DN_NUM_QK_HEADS;
+    constexpr int V_PER_QK = Cfg::DN_V_PER_QK;
+    constexpr int KEY      = Cfg::DN_KEY_DIM;
+    constexpr int VAL      = Cfg::DN_VALUE_DIM;
+    constexpr int QK_SIZE  = Cfg::DN_QK_SIZE;
+    constexpr int V_SIZE   = Cfg::DN_V_SIZE;
+    constexpr int CONV_CH  = Cfg::DN_CONV_CH;
+    constexpr int CONV_K   = Cfg::DN_CONV_KERNEL;
+
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    __nv_bfloat16 *s_norm = shmem;
+    rmsnorm_capture<Cfg>(input, w.input_layernorm_weight, s_norm, g_residual);
+
+    matvec_nvfp4<Cfg>(s_norm, w.qkv_proj,   g_qkv,   H, CONV_CH, num_blocks);
+    matvec_nvfp4<Cfg>(s_norm, w.z_proj,     g_z,     H, V_SIZE,  num_blocks);
+    matvec_nvfp4<Cfg>(s_norm, w.beta_proj,  g_beta,  H, V_HEADS, num_blocks);
+    matvec_nvfp4<Cfg>(s_norm, w.alpha_proj, g_alpha, H, V_HEADS, num_blocks);
+    grid.sync();
+
+    if (block_id < V_HEADS) {
+        int v_head  = block_id;
+        int qk_head = v_head / V_PER_QK;
+
+        __shared__ float s_q[Cfg::DN_KEY_DIM];
+        __shared__ float s_k[Cfg::DN_KEY_DIM];
+        __shared__ float s_v[Cfg::DN_VALUE_DIM];
+
+        struct Region { int ch_base; int count; float *dst; };
+        Region regs[3] = {
+            { qk_head * KEY,             KEY, s_q },
+            { QK_SIZE + qk_head * KEY,   KEY, s_k },
+            { 2*QK_SIZE + v_head  * VAL, VAL, s_v },
+        };
+        for (int r = 0; r < 3; ++r) {
+            const Region &R = regs[r];
+            for (int c = threadIdx.x; c < R.count; c += BLOCK_SIZE) {
+                int ch = R.ch_base + c;
+                float h0 = conv_buf[ch * CONV_K + 1];
+                float h1 = conv_buf[ch * CONV_K + 2];
+                float h2 = conv_buf[ch * CONV_K + 3];
+                conv_buf[ch * CONV_K + 0] = h0;
+                conv_buf[ch * CONV_K + 1] = h1;
+                conv_buf[ch * CONV_K + 2] = h2;
+                conv_buf[ch * CONV_K + 3] = g_qkv[ch];
+                float co = 0.0f;
+                #pragma unroll
+                for (int t = 0; t < CONV_K; ++t)
+                    co += conv_buf[ch * CONV_K + t]
+                          * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
+                R.dst[c] = fast_silu(co);
+            }
+        }
+
+        if (threadIdx.x == 0) {
+            g_beta[v_head] = fast_sigmoid(g_beta[v_head]);
+            float a_log_val = __bfloat162float(__ldg(w.a_log + v_head));
+            float dt_b      = __bfloat162float(__ldg(w.dt_bias + v_head));
+            float x  = g_alpha[v_head] + dt_b;
+            float sp = (x > 20.0f) ? x : logf(1.0f + fast_exp(x));
+            g_alpha[v_head] = fast_exp(-fast_exp(a_log_val) * sp);
+        }
+        __syncthreads();
+
+        constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+        if (warp_id == 0) {
+            float sq = 0.0f;
+            for (int i = lane_id; i < KEY; i += WARP_SIZE) sq += s_q[i] * s_q[i];
+            sq = warp_reduce_sum_x(sq);
+            float n = rsqrtf(sq + 1e-6f) * Q_SCALE;
+            n = __shfl_sync(0xffffffff, n, 0);
+            for (int i = lane_id; i < KEY; i += WARP_SIZE) s_q[i] *= n;
+        }
+        if (warp_id == 1) {
+            float sq = 0.0f;
+            for (int i = lane_id; i < KEY; i += WARP_SIZE) sq += s_k[i] * s_k[i];
+            sq = warp_reduce_sum_x(sq);
+            float n = rsqrtf(sq + 1e-6f);
+            n = __shfl_sync(0xffffffff, n, 0);
+            for (int i = lane_id; i < KEY; i += WARP_SIZE) s_k[i] *= n;
+        }
+        __syncthreads();
+
+        float decay = g_alpha[v_head];
+        float beta  = g_beta[v_head];
+
+        __shared__ float s_kq;
+        if (warp_id == 0) {
+            float kq = 0.0f;
+            for (int i = lane_id; i < KEY; i += WARP_SIZE) kq += s_k[i] * s_q[i];
+            kq = warp_reduce_sum_x(kq);
+            if (lane_id == 0) s_kq = kq;
+        }
+        __syncthreads();
+        float kq = s_kq;
+
+        float *state = dn_state + (size_t)v_head * KEY * VAL;
+        float *out_head = g_dn_out + v_head * VAL;
+
+        constexpr int J_PER_WARP = VAL / NUM_WARPS;
+        constexpr int I_PER_LANE = KEY / WARP_SIZE;
+
+        #pragma unroll
+        for (int jj = 0; jj < J_PER_WARP; ++jj) {
+            int j = warp_id * J_PER_WARP + jj;
+            float s_regs[I_PER_LANE], stk = 0.0f, sqv = 0.0f;
+            #pragma unroll
+            for (int ii = 0; ii < I_PER_LANE; ++ii) {
+                int i  = lane_id + ii * WARP_SIZE;
+                float sv = state[j * KEY + i];
+                s_regs[ii] = sv;
+                stk += sv * s_k[i];
+                sqv += sv * s_q[i];
+            }
+            stk = warp_reduce_sum_x(stk);
+            sqv = warp_reduce_sum_x(sqv);
+            stk = __shfl_sync(0xffffffff, stk, 0);
+            sqv = __shfl_sync(0xffffffff, sqv, 0);
+            float error_j = (s_v[j] - stk) * beta;
+            float o_j = decay * sqv + error_j * kq;
+            if (lane_id == 0) out_head[j] = o_j;
+            #pragma unroll
+            for (int ii = 0; ii < I_PER_LANE; ++ii) {
+                int i = lane_id + ii * WARP_SIZE;
+                state[j * KEY + i] = s_regs[ii] * decay + s_k[i] * error_j;
+            }
+        }
+
+        __syncthreads();
+        {
+            __shared__ float s_grms[NUM_WARPS];
+            float ss = 0.0f;
+            for (int i = threadIdx.x; i < VAL; i += BLOCK_SIZE)
+                ss += out_head[i] * out_head[i];
+            ss = warp_reduce_sum_x(ss);
+            if (lane_id == 0) s_grms[warp_id] = ss;
+            __syncthreads();
+            if (warp_id == 0) {
+                float v = (lane_id < NUM_WARPS) ? s_grms[lane_id] : 0.0f;
+                v = warp_reduce_sum_x(v);
+                if (lane_id == 0) s_grms[0] = rsqrtf(v / float(VAL) + 1e-6f);
+            }
+            __syncthreads();
+            float rstd = s_grms[0];
+            for (int i = threadIdx.x; i < VAL; i += BLOCK_SIZE) {
+                float normed = out_head[i] * rstd
+                               * __bfloat162float(__ldg(w.norm_weight + i));
+                float gate   = fast_silu(g_z[v_head * VAL + i]);
+                out_head[i]  = normed * gate;
+            }
+        }
+    }
+    grid.sync();
+
+    {
+        float *s_dn = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < V_SIZE; i += BLOCK_SIZE) s_dn[i] = g_dn_out[i];
+        __syncthreads();
+        matvec_o_residual_nvfp4<Cfg>(s_dn, w.out_proj, g_residual, hidden_out,
+                                       V_SIZE, H, num_blocks);
+    }
+    grid.sync();
+
+    __nv_bfloat16 *s_act = shmem;
+    rmsnorm_capture<Cfg>(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+
+    matvec_gate_up_silu_nvfp4<Cfg>(s_act, w.gate_proj, w.up_proj,
+                                    g_mlp_inter, H, INTER, num_blocks);
+    grid.sync();
+
+    {
+        float *s_mlp = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < INTER; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+        __syncthreads();
+        matvec_down_residual_nvfp4<Cfg>(s_mlp, w.down_proj, g_residual, hidden_out,
+                                          INTER, H, num_blocks);
+    }
+    grid.sync();
+}
+
 }  // namespace lucebox::qwen3x

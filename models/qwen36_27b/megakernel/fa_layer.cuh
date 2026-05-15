@@ -339,4 +339,229 @@ __device__ void full_attention_layer(
     grid.sync();
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4-weighted variant. Same control flow; swaps each projection's matvec.
+// Norms, RoPE, gate, attention scan stay BF16/FP32 as before — only the four
+// big projections (Q-gate, K, V, O) and the three MLP projections are NVFP4.
+// ---------------------------------------------------------------------------
+template<typename Cfg>
+__device__ void full_attention_layer_nvfp4(
+    AtomicGridSync &grid,
+    const FullAttnWeightsNVFP4<Cfg> &w,
+    const __nv_bfloat16 *__restrict__ input,
+    __nv_bfloat16 *__restrict__ k_cache,
+    __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_q,
+    float *__restrict__ g_kv,
+    float *__restrict__ g_attn_out,
+    float *__restrict__ g_fa_partials,
+    float *__restrict__ g_rope_inv_freq,
+    const YarnParams &yp,
+    const MRopeSections &sections,
+    int position, int max_seq_len,
+    int pos_h, int pos_w,
+    __nv_bfloat16 *__restrict__ shmem,
+    __nv_bfloat16 *__restrict__ hidden_out)
+{
+    constexpr int H      = Cfg::HIDDEN;
+    constexpr int Q_H    = Cfg::FA_NUM_Q_HEADS;
+    constexpr int KV_H   = Cfg::FA_NUM_KV_HEADS;
+    constexpr int D      = Cfg::FA_HEAD_DIM;
+    constexpr int GQA    = Cfg::FA_GQA_RATIO;
+    constexpr int Q_SIZE = Cfg::FA_Q_SIZE;
+    constexpr int QPROJ  = Cfg::FA_QPROJ_SIZE;
+    constexpr int KV_SIZE = Cfg::FA_KV_SIZE;
+
+    int block_id  = blockIdx.x;
+    int num_blocks = gridDim.x;
+    int warp_id   = threadIdx.x / WARP_SIZE;
+    int lane_id   = threadIdx.x % WARP_SIZE;
+    __nv_bfloat16 *s_norm = shmem;
+
+    rmsnorm_capture<Cfg>(input, w.input_layernorm_weight, s_norm, g_residual);
+
+    matvec_nvfp4<Cfg>(s_norm, w.q_proj, g_q, H, QPROJ, num_blocks);
+    matvec_nvfp4<Cfg>(s_norm, w.k_proj, g_kv, H, KV_SIZE, num_blocks);
+    matvec_nvfp4<Cfg>(s_norm, w.v_proj, g_kv + KV_SIZE, H, KV_SIZE, num_blocks);
+    grid.sync();
+
+    if (block_id == 0) {
+        float *k_buf = g_kv;
+        float *v_buf = g_kv + KV_SIZE;
+        for (int h = warp_id; h < KV_H; h += NUM_WARPS) {
+            float *kh = k_buf + h * D;
+            head_norm_rope<Cfg>(kh, w.k_norm_weight, position, pos_h, pos_w,
+                                g_rope_inv_freq, yp, sections, lane_id);
+            __nv_bfloat16 *kc = k_cache + (size_t)h * max_seq_len * D
+                                 + (size_t)position * D;
+            __nv_bfloat16 *vc = v_cache + (size_t)h * max_seq_len * D
+                                 + (size_t)position * D;
+            for (int i = lane_id; i < D; i += WARP_SIZE) {
+                kc[i] = __float2bfloat16(kh[i]);
+                vc[i] = __float2bfloat16(v_buf[h * D + i]);
+            }
+        }
+    }
+
+    int hpb = (Q_H + num_blocks - 1) / num_blocks;
+    int hs = block_id * hpb;
+    int he = min(hs + hpb, Q_H);
+    for (int qh = hs; qh < he; ++qh) {
+        if (warp_id == 0) {
+            float *qhp = g_q + qh * D * 2;
+            head_norm_rope<Cfg>(qhp, w.q_norm_weight, position, pos_h, pos_w,
+                                g_rope_inv_freq, yp, sections, lane_id);
+        }
+    }
+    grid.sync();
+
+    {
+        int cache_len = position + 1;
+        float attn_scale = 1.0f / sqrtf(float(D));
+        constexpr int EPL = D / WARP_SIZE;
+        constexpr int PARTIAL_STRIDE = D + 2;
+
+        int num_splits = num_blocks / Q_H;
+        if (num_splits < 1) num_splits = 1;
+        int my_qh    = block_id % Q_H;
+        int my_split = block_id / Q_H;
+        bool active = (block_id < Q_H * num_splits);
+
+        __shared__ float s_max[NUM_WARPS];
+        __shared__ float s_sum[NUM_WARPS];
+        __shared__ float s_out[NUM_WARPS * Cfg::FA_HEAD_DIM];
+
+        if (active) {
+            int per_split = (cache_len + num_splits - 1) / num_splits;
+            int t_start = my_split * per_split;
+            int t_end   = min(t_start + per_split, cache_len);
+            int kvh = my_qh / GQA;
+            const float *qh = g_q + my_qh * D * 2;
+            float q_local[EPL];
+            #pragma unroll
+            for (int e = 0; e < EPL; ++e) q_local[e] = qh[lane_id * EPL + e];
+
+            float partial_max = -INFINITY, partial_sum = 0.0f;
+            float partial_acc[EPL];
+            #pragma unroll
+            for (int e = 0; e < EPL; ++e) partial_acc[e] = 0.0f;
+
+            for (int t = t_start + warp_id; t < t_end; t += NUM_WARPS) {
+                const __nv_bfloat16 *k_p = k_cache + (size_t)kvh * max_seq_len * D + (size_t)t * D;
+                const __nv_bfloat16 *v_p = v_cache + (size_t)kvh * max_seq_len * D + (size_t)t * D;
+                float score = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e)
+                    score += q_local[e] * __bfloat162float(__ldg(k_p + lane_id * EPL + e));
+                score = warp_reduce_sum_x(score) * attn_scale;
+                score = __shfl_sync(0xffffffff, score, 0);
+
+                float old_max = partial_max;
+                partial_max = fmaxf(partial_max, score);
+                float exp_diff = fast_exp(old_max - partial_max);
+                partial_sum = partial_sum * exp_diff + fast_exp(score - partial_max);
+                float wt = fast_exp(score - partial_max);
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e)
+                    partial_acc[e] = partial_acc[e] * exp_diff
+                                     + wt * __bfloat162float(__ldg(v_p + lane_id * EPL + e));
+            }
+            if (lane_id == 0) { s_max[warp_id] = partial_max; s_sum[warp_id] = partial_sum; }
+            #pragma unroll
+            for (int e = 0; e < EPL; ++e)
+                s_out[warp_id * D + lane_id * EPL + e] = partial_acc[e];
+            __syncthreads();
+
+            if (warp_id == 0) {
+                float bm = -INFINITY;
+                for (int w_ = 0; w_ < NUM_WARPS; ++w_) bm = fmaxf(bm, s_max[w_]);
+                float bs = 0.0f;
+                float bo[EPL];
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e) bo[e] = 0.0f;
+                for (int w_ = 0; w_ < NUM_WARPS; ++w_) {
+                    if (s_max[w_] > -INFINITY) {
+                        float sc = fast_exp(s_max[w_] - bm);
+                        bs += s_sum[w_] * sc;
+                        #pragma unroll
+                        for (int e = 0; e < EPL; ++e)
+                            bo[e] += s_out[w_ * D + lane_id * EPL + e] * sc;
+                    }
+                }
+                int slot = (my_qh * num_splits + my_split) * PARTIAL_STRIDE;
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e) g_fa_partials[slot + lane_id * EPL + e] = bo[e];
+                if (lane_id == 0) {
+                    g_fa_partials[slot + D]     = bm;
+                    g_fa_partials[slot + D + 1] = bs;
+                }
+            }
+        }
+    }
+    grid.sync();
+
+    {
+        int num_splits = num_blocks / Q_H;
+        if (num_splits < 1) num_splits = 1;
+        constexpr int EPL = D / WARP_SIZE;
+        constexpr int PARTIAL_STRIDE = D + 2;
+
+        if (block_id < Q_H) {
+            int qh = block_id;
+            const float *qhp = g_q + qh * D * 2;
+            const float *gate = qhp + D;
+            if (warp_id == 0) {
+                float gm = -INFINITY;
+                for (int s = 0; s < num_splits; ++s)
+                    gm = fmaxf(gm, g_fa_partials[(qh * num_splits + s) * PARTIAL_STRIDE + D]);
+                float gs = 0.0f;
+                float go[EPL];
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e) go[e] = 0.0f;
+                for (int s = 0; s < num_splits; ++s) {
+                    float m = g_fa_partials[(qh * num_splits + s) * PARTIAL_STRIDE + D];
+                    if (m == -INFINITY) continue;
+                    float ss = g_fa_partials[(qh * num_splits + s) * PARTIAL_STRIDE + D + 1];
+                    float ww = fast_exp(m - gm);
+                    gs += ss * ww;
+                    #pragma unroll
+                    for (int e = 0; e < EPL; ++e)
+                        go[e] += g_fa_partials[(qh * num_splits + s) * PARTIAL_STRIDE
+                                                + lane_id * EPL + e] * ww;
+                }
+                float rcp = (gs > 0.0f) ? (1.0f / gs) : 0.0f;
+                #pragma unroll
+                for (int e = 0; e < EPL; ++e) {
+                    int idx = lane_id * EPL + e;
+                    g_attn_out[qh * D + idx] = go[e] * rcp * fast_sigmoid(gate[idx]);
+                }
+            }
+        }
+    }
+    grid.sync();
+
+    matvec_o_residual_nvfp4<Cfg>(g_attn_out, w.o_proj, g_residual, hidden_out,
+                                   Q_SIZE, H, num_blocks);
+    grid.sync();
+
+    __nv_bfloat16 *s_act = shmem;
+    rmsnorm_capture<Cfg>(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+
+    constexpr int INTER = Cfg::INTERMEDIATE;
+    float *g_mlp_inter = g_attn_out;
+    matvec_gate_up_silu_nvfp4<Cfg>(s_act, w.gate_proj, w.up_proj,
+                                    g_mlp_inter, H, INTER, num_blocks);
+    grid.sync();
+
+    {
+        float *s_mlp = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < INTER; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+        __syncthreads();
+        matvec_down_residual_nvfp4<Cfg>(s_mlp, w.down_proj, g_residual, hidden_out,
+                                          INTER, H, num_blocks);
+    }
+    grid.sync();
+}
+
 }  // namespace lucebox::qwen3x

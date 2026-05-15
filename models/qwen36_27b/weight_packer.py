@@ -290,28 +290,56 @@ def load_27b_weights(
 # ---------------------------------------------------------------------------
 # Pack layer_data into the device-side LayerWeights<Cfg> blob the kernel reads.
 # ---------------------------------------------------------------------------
-# Matches LayerWeights<Cfg> in kernel_decode_full.cu:
-#   { int layer_type; int _pad; void* ptrs[max(11_FA, 14_DN)=14]; }
-#   header = 8 bytes, ptrs = 14 * 8 = 112  -> struct_size = 120, align to 128.
+# Matches LayerWeights<Cfg> in kernel_decode_full.cu (192 bytes).
+#   { int layer_type; int _pad; union(<= 184 B); }
+#   Max ptr count:
+#     DN_bf16   = 14 ptrs (112 B)
+#     FA_bf16   = 11 ptrs ( 88 B)
+#     FA_nvfp4  = 4 bf16 ptrs + 7 * PackedMatrixNVFP4 (2 ptrs ea) = 18 ptrs (144 B)
+#     DN_nvfp4  = 5 bf16 ptrs + 8 * PackedMatrixNVFP4 (2 ptrs ea) = 21 ptrs (168 B)
 PACK_HEADER  = 8
-PACK_MAX_PTR = 14
-PACK_STRUCT  = ((PACK_HEADER + PACK_MAX_PTR * 8 + 15) // 16) * 16   # 128
+PACK_MAX_PTR = 21
+PACK_STRUCT  = ((PACK_HEADER + PACK_MAX_PTR * 8 + 15) // 16) * 16   # 192
 
 def pack_layer_weights(layer_data: list[dict]) -> torch.Tensor:
     """Return a uint8 CUDA tensor laid out exactly like
-    `const LayerWeights<Cfg>[]` that the kernel takes."""
+    `const LayerWeights<Cfg>[]` that the kernel takes.
+
+    Each `ld["ptrs"]` entry is either:
+        - a torch.Tensor on CUDA (one ptr slot, used for BF16 layers and
+          for BF16 norms/scalars in NVFP4 layers), or
+        - a (data: torch.Tensor, scales: torch.Tensor) tuple (two ptr
+          slots, matching PackedMatrixNVFP4 = {data, scales}).
+    """
     n = len(layer_data)
     buf = bytearray(n * PACK_STRUCT)
     for i, ld in enumerate(layer_data):
         off = i * PACK_STRUCT
         ctypes.c_int32.from_buffer(buf, off).value = int(ld["type"])
         ctypes.c_int32.from_buffer(buf, off + 4).value = 0
+        slot = 0
         for j, t in enumerate(ld["ptrs"]):
-            if not t.is_cuda:
-                raise ValueError(f"layer {i} ptr {j} not on CUDA")
-            if not t.is_contiguous():
-                raise ValueError(f"layer {i} ptr {j} not contiguous")
-            ctypes.c_uint64.from_buffer(buf, off + PACK_HEADER + j * 8).value = t.data_ptr()
+            if isinstance(t, tuple):
+                data, scales = t
+                for x in (data, scales):
+                    if not x.is_cuda:
+                        raise ValueError(f"layer {i} ptr {j} not on CUDA")
+                    if not x.is_contiguous():
+                        raise ValueError(f"layer {i} ptr {j} not contiguous")
+                    ctypes.c_uint64.from_buffer(
+                        buf, off + PACK_HEADER + slot * 8).value = x.data_ptr()
+                    slot += 1
+            else:
+                if not t.is_cuda:
+                    raise ValueError(f"layer {i} ptr {j} not on CUDA")
+                if not t.is_contiguous():
+                    raise ValueError(f"layer {i} ptr {j} not contiguous")
+                ctypes.c_uint64.from_buffer(
+                    buf, off + PACK_HEADER + slot * 8).value = t.data_ptr()
+                slot += 1
+        if slot > PACK_MAX_PTR:
+            raise ValueError(
+                f"layer {i} packs {slot} ptr slots; PACK_MAX_PTR={PACK_MAX_PTR}")
     return torch.frombuffer(bytes(buf), dtype=torch.uint8).cuda().contiguous()
 
 
