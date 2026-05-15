@@ -275,10 +275,16 @@ class Qwen36MegakernelDecoder:
         If `use_hf_prefill=True`, uses the HF model's batched forward
         for prefill (~50× faster at S=256) and our megakernel for
         decode. Requires `hf_model=hf` was passed at init time.
-        If None (default), auto-picks based on `hf_model` availability.
+
+        Default OFF: prefill_via_hf's KV/DN-state copy from HF's cache
+        has a known correctness issue — first decoded token matches
+        HF, but subsequent decodes diverge (out-of-range token ids).
+        Likely a remaining DN cache-layout mismatch beyond the
+        transpose fix in commit 8e8d225. Opt-in only until F9
+        regression test catches the exact layout difference.
         """
         if use_hf_prefill is None:
-            use_hf_prefill = self.weights.get("_hf_keepalive") is not None
+            use_hf_prefill = False  # see docstring
         if use_hf_prefill:
             next_id = self.prefill_via_hf(prompt_ids)
         else:
