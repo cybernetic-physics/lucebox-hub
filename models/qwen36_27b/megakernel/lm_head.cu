@@ -102,8 +102,13 @@ __global__ void lm_head_argmax_nvfp4_kernel(
 {
     constexpr int H = Cfg::HIDDEN;
     constexpr int V = Cfg::VOCAB_SIZE;
-    __shared__ float s_hidden[Cfg::HIDDEN];
-    for (int i = threadIdx.x; i < H; i += LM_BLOCK_SIZE) s_hidden[i] = hidden[i];
+    // Convert hidden fp32 -> bf16 once into shmem so the dot can use the
+    // fast hfma2 path. Precision: hidden values are post-RMSnorm and live
+    // in roughly [-3, 3]; bf16 handles this with ~7-bit relative error,
+    // negligible vs the FP4 weight quantization error itself.
+    __shared__ __nv_bfloat16 s_hidden[Cfg::HIDDEN];
+    for (int i = threadIdx.x; i < H; i += LM_BLOCK_SIZE)
+        s_hidden[i] = __float2bfloat16(hidden[i]);
     __syncthreads();
 
     int warp_id = threadIdx.x / LM_WARP_SIZE;
@@ -113,6 +118,7 @@ __global__ void lm_head_argmax_nvfp4_kernel(
     int re = min(rs + rpb, V);
     int row_bytes  = H / 2;
     int row_scales = H / GROUP_SIZE;
+    int main_end = (H / (LM_WARP_SIZE * 32)) * (LM_WARP_SIZE * 32);
 
     float local_max = -INFINITY;
     int   local_max_idx = -1;
@@ -120,13 +126,22 @@ __global__ void lm_head_argmax_nvfp4_kernel(
         const uint8_t *w_row = data + (size_t)m * row_bytes;
         const __half  *s_row = scales + (size_t)m * row_scales;
         float sum = 0.0f;
+        // Main loop: uint4 (16-byte) loads, 32-element chunks per lane,
+        // hfma2 SIMD via dot32_nvfp4_bf16.
         #pragma unroll 2
-        for (int k = lane_id * 8; k < H; k += LM_WARP_SIZE * 8) {
+        for (int k = lane_id * 32; k < main_end; k += LM_WARP_SIZE * 32) {
+            uint4 packed4 = load_128bit(
+                reinterpret_cast<const uint4 *>(w_row + (k / 2)));
+            float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
+            sum += dot32_nvfp4_bf16(packed4, scale, s_hidden + k, nullptr);
+        }
+        // Tail: uint32 loads, 8-element chunks (covers any HIDDEN not a
+        // multiple of 1024). For Cfg_27B HIDDEN=5120 = 5*1024, no tail.
+        for (int k = main_end + lane_id * 8; k < H; k += LM_WARP_SIZE * 8) {
             uint32_t packed = load_32bit(
                 reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
             float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
-            // Reuse dot8_nvfp4_f32 — activations in s_hidden are fp32.
-            sum += dot8_nvfp4_f32(packed, scale, s_hidden + k, nullptr);
+            sum += dot8_nvfp4_bf16(packed, scale, s_hidden + k, nullptr);
         }
         sum = warp_reduce_sum_x(sum);
         if (lane_id == 0 && sum > local_max) {
