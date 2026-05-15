@@ -106,35 +106,66 @@ class GenerationConfig:
 import json
 import re
 
-# Qwen3 native tool-call format embeds `<tool_call>{...}</tool_call>`
-# blocks in the model output. Also accept Hermes-style (compatible).
-_TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
-)
+# Qwen3 tool-call formats accepted. Order matters: longest/most specific first.
+_TOOL_CALL_PATTERNS = [
+    # 1. Qwen3 native ChatML: <|tool_call|>{...}<|/tool_call|>
+    re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", re.DOTALL),
+    # 2. Hermes / generic: <tool_call>{...}</tool_call>
+    re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
+    # 3. qwen3_coder XML-like: <function=name>{...}</function>
+    re.compile(r"<function=([^>]+)>\s*(\{.*?\})\s*</function>", re.DOTALL),
+]
 
 def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     """Extract tool-call blocks from model output. Returns
     (text_without_tool_calls, list_of_tool_calls).
+
+    Supports three formats:
+      <|tool_call|>JSON<|/tool_call|>           - Qwen3 native ChatML
+      <tool_call>JSON</tool_call>               - Hermes / OpenAI-ish
+      <function=NAME>JSON</function>            - qwen3_coder XML-like
+
+    The function arguments may be a JSON string OR a dict; both are
+    normalized to dict.
     """
     calls: list[ToolCall] = []
-    def _take(m: re.Match) -> str:
-        raw = m.group(1)
-        try:
-            obj = json.loads(raw)
-            # Qwen3 format: {"name": ..., "arguments": {...}}
-            # Hermes format: {"name": ..., "arguments": {...}}
-            name = str(obj.get("name", "unknown"))
-            args = obj.get("arguments", {})
-            if isinstance(args, str):
-                # Some templates serialize arguments as a JSON string.
-                try: args = json.loads(args)
-                except Exception: args = {"_raw": args}
-            calls.append(ToolCall(name=name, arguments=args, raw=m.group(0)))
-        except json.JSONDecodeError:
-            calls.append(ToolCall(name="<parse_error>", arguments={"_raw": raw},
-                                  raw=m.group(0)))
-        return ""
-    stripped = _TOOL_CALL_RE.sub(_take, text)
+    stripped = text
+
+    # Try patterns in priority order.
+    for i, pat in enumerate(_TOOL_CALL_PATTERNS):
+        def _take(m: re.Match, _i=i) -> str:
+            if _i == 2:
+                # qwen3_coder: name in group(1), args JSON in group(2)
+                name = m.group(1).strip()
+                raw = m.group(2)
+                try:
+                    args = json.loads(raw)
+                except json.JSONDecodeError:
+                    calls.append(ToolCall(name="<parse_error>",
+                                          arguments={"_raw": raw},
+                                          raw=m.group(0)))
+                    return ""
+                if isinstance(args, str):
+                    try: args = json.loads(args)
+                    except Exception: args = {"_raw": args}
+                calls.append(ToolCall(name=name, arguments=args, raw=m.group(0)))
+                return ""
+            # Hermes / Qwen3-native: single JSON blob with name + arguments.
+            raw = m.group(1)
+            try:
+                obj = json.loads(raw)
+                name = str(obj.get("name", "unknown"))
+                args = obj.get("arguments", {})
+                if isinstance(args, str):
+                    try: args = json.loads(args)
+                    except Exception: args = {"_raw": args}
+                calls.append(ToolCall(name=name, arguments=args, raw=m.group(0)))
+            except json.JSONDecodeError:
+                calls.append(ToolCall(name="<parse_error>",
+                                      arguments={"_raw": raw},
+                                      raw=m.group(0)))
+            return ""
+        stripped = pat.sub(_take, stripped)
     return stripped.strip(), calls
 
 

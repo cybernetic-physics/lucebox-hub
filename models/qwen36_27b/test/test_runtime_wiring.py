@@ -77,6 +77,27 @@ def test_parse_tool_calls_args_as_string():
     assert calls[0].arguments == {"text": "hi"}
 
 
+def test_parse_tool_calls_qwen3_native():
+    """Qwen3 native ChatML format: <|tool_call|>{...}<|/tool_call|>"""
+    raw = ("Sure.\n"
+           '<|tool_call|>{"name": "search", "arguments": {"q": "weather"}}<|/tool_call|>')
+    stripped, calls = parse_tool_calls(raw)
+    assert len(calls) == 1
+    assert calls[0].name == "search"
+    assert calls[0].arguments == {"q": "weather"}
+    assert "<|tool_call|>" not in stripped
+
+
+def test_parse_tool_calls_qwen3_coder():
+    """qwen3_coder XML-like: <function=NAME>{...}</function>"""
+    raw = '<function=calc>{"a": 3, "b": 4}</function>'
+    stripped, calls = parse_tool_calls(raw)
+    assert len(calls) == 1
+    assert calls[0].name == "calc"
+    assert calls[0].arguments == {"a": 3, "b": 4}
+    assert "<function=" not in stripped
+
+
 def test_parse_tool_calls_multiple():
     raw = ('do these:\n'
            '<tool_call>{"name":"a","arguments":{}}</tool_call>'
@@ -175,6 +196,8 @@ def main():
         test_split_thinking_absent,
         test_parse_tool_calls_single,
         test_parse_tool_calls_args_as_string,
+        test_parse_tool_calls_qwen3_native,
+        test_parse_tool_calls_qwen3_coder,
         test_parse_tool_calls_multiple,
         test_parse_tool_calls_malformed_does_not_crash,
         test_generation_config_defaults,
