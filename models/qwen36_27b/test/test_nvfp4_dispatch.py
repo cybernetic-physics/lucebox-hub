@@ -29,13 +29,8 @@ from weight_packer import (
 import importlib.util as _u
 _spec = _u.spec_from_file_location(
     "qwen3x_C",
-    os.path.join(os.path.dirname(THIS), "qwen36_27b/megakernel/"
-                                          "qwen3x_C.cpython-312-aarch64-linux-gnu.so"))
-if _spec is None:  # tests run from repo root
-    _spec = _u.spec_from_file_location(
-        "qwen3x_C",
-        "/home/sparkz/rl/lucebox-hub/models/qwen36_27b/megakernel/"
-        "qwen3x_C.cpython-312-aarch64-linux-gnu.so")
+    "/home/sparkz/rl/lucebox-hub/models/qwen36_27b/megakernel/"
+    "qwen3x_C.cpython-312-aarch64-linux-gnu.so")
 _m = _u.module_from_spec(_spec); _spec.loader.exec_module(_m)
 
 

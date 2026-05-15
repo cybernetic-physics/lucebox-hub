@@ -86,7 +86,8 @@ decode_kernel_impl(
     int position,
     int pos_h, int pos_w,  // 0 for text-only
     int max_seq_len,
-    __nv_bfloat16 *__restrict__ g_layer_outputs)  // optional [NUM_LAYERS, HIDDEN]
+    __nv_bfloat16 *__restrict__ g_layer_outputs,  // optional [NUM_LAYERS, HIDDEN]
+    const int *__restrict__ input_token_id_dev)   // optional device ptr; overrides input_token_id when non-null
 {
     AtomicGridSync grid{};
     constexpr int H        = Cfg::HIDDEN;
@@ -104,9 +105,14 @@ decode_kernel_impl(
     __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
 
     // 1. Embed lookup -> hidden_buffer (block 0 writes; everyone reads
-    //    through hidden_buffer below).
+    //    through hidden_buffer below). If `input_token_id_dev` is non-
+    //    null, read the token id from device memory (lets the caller
+    //    chain decode<-lm_head_argmax without host sync between
+    //    iterations; required for CUDA Graph capture).
+    int tok_id = input_token_id;
+    if (input_token_id_dev != nullptr) tok_id = input_token_id_dev[0];
     if (blockIdx.x == 0) {
-        const __nv_bfloat16 *erow = embed_weight + (size_t)input_token_id * H;
+        const __nv_bfloat16 *erow = embed_weight + (size_t)tok_id * H;
         for (int i = threadIdx.x; i < H; i += BLOCK_SIZE) hidden_buffer[i] = erow[i];
     }
     // 2. Precompute RoPE inv-freq table (lane-bounded, runs once).
@@ -236,6 +242,7 @@ static cudaError_t launch_decode_impl(
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
     int num_blocks,
     void *g_layer_outputs,
+    const void *input_token_id_dev,
     cudaStream_t stream)
 {
     void *args[] = {
@@ -248,6 +255,7 @@ static cudaError_t launch_decode_impl(
         &yp,
         &input_token_id, &position, &pos_h, &pos_w, &max_seq_len,
         &g_layer_outputs,
+        &input_token_id_dev,
     };
     dim3 grid(num_blocks);
     dim3 block(BLOCK_SIZE);
@@ -264,7 +272,8 @@ extern "C" cudaError_t launch_decode_0p8b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_0p8B, false>(
         embed_weight, final_norm_weight, layer_weights,
@@ -274,7 +283,7 @@ extern "C" cudaError_t launch_decode_0p8b(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, g_layer_outputs, stream);
+        num_blocks, g_layer_outputs, input_token_id_dev, stream);
 }
 
 extern "C" cudaError_t launch_decode_27b(
@@ -286,7 +295,8 @@ extern "C" cudaError_t launch_decode_27b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_27B, false>(
         embed_weight, final_norm_weight, layer_weights,
@@ -296,7 +306,7 @@ extern "C" cudaError_t launch_decode_27b(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, g_layer_outputs, stream);
+        num_blocks, g_layer_outputs, input_token_id_dev, stream);
 }
 
 extern "C" cudaError_t launch_decode_0p8b_nvfp4(
@@ -308,7 +318,8 @@ extern "C" cudaError_t launch_decode_0p8b_nvfp4(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_0p8B, true>(
         embed_weight, final_norm_weight, layer_weights,
@@ -318,7 +329,7 @@ extern "C" cudaError_t launch_decode_0p8b_nvfp4(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, g_layer_outputs, stream);
+        num_blocks, g_layer_outputs, input_token_id_dev, stream);
 }
 
 extern "C" cudaError_t launch_decode_27b_nvfp4(
@@ -330,7 +341,8 @@ extern "C" cudaError_t launch_decode_27b_nvfp4(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream)
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream)
 {
     return launch_decode_impl<Cfg_27B, true>(
         embed_weight, final_norm_weight, layer_weights,
@@ -340,7 +352,7 @@ extern "C" cudaError_t launch_decode_27b_nvfp4(
         g_z_scratch, g_beta_scratch, g_alpha_scratch,
         g_normalized, g_fa_partials, g_rope_inv_freq, yp,
         input_token_id, position, pos_h, pos_w, max_seq_len,
-        num_blocks, g_layer_outputs, stream);
+        num_blocks, g_layer_outputs, input_token_id_dev, stream);
 }
 
 // Explicit instantiations.
@@ -352,7 +364,7 @@ template __global__ void decode_kernel_impl<Cfg_0p8B>(
     float*, float*, float*, float*, float*, float*, float*, float*,
     float*, float*, YarnParams,
     int, int, int, int, int,
-    __nv_bfloat16*);
+    __nv_bfloat16*, const int*);
 template __global__ void decode_kernel_impl<Cfg_27B>(
     const __nv_bfloat16*, const __nv_bfloat16*,
     const LayerWeights<Cfg_27B>*,
@@ -361,6 +373,6 @@ template __global__ void decode_kernel_impl<Cfg_27B>(
     float*, float*, float*, float*, float*, float*, float*, float*,
     float*, float*, YarnParams,
     int, int, int, int, int,
-    __nv_bfloat16*);
+    __nv_bfloat16*, const int*);
 
 }  // namespace lucebox::qwen3x

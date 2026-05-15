@@ -48,7 +48,8 @@ extern "C" cudaError_t launch_decode_0p8b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream);
 
 extern "C" cudaError_t launch_decode_27b(
     void *embed_weight, void *final_norm_weight, void *layer_weights,
@@ -59,7 +60,8 @@ extern "C" cudaError_t launch_decode_27b(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream);
 
 extern "C" cudaError_t launch_decode_0p8b_nvfp4(
     void *embed_weight, void *final_norm_weight, void *layer_weights,
@@ -70,7 +72,8 @@ extern "C" cudaError_t launch_decode_0p8b_nvfp4(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream);
 
 extern "C" cudaError_t launch_decode_27b_nvfp4(
     void *embed_weight, void *final_norm_weight, void *layer_weights,
@@ -81,7 +84,8 @@ extern "C" cudaError_t launch_decode_27b_nvfp4(
     void *g_normalized, void *g_fa_partials, void *g_rope_inv_freq,
     YarnParams yp,
     int input_token_id, int position, int pos_h, int pos_w, int max_seq_len,
-    int num_blocks, void *g_layer_outputs, cudaStream_t stream);
+    int num_blocks, void *g_layer_outputs,
+    const void *input_token_id_dev, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Naive prefill: S sequential decode calls. Token i is read from
@@ -134,7 +138,7 @@ static cudaError_t prefill_naive_impl(
             // text-only: pass pos for all 3 MRoPE axes so all rotary
             // pairs rotate (matches HF's text-only position_ids).
             (int)tok, pos, pos, pos, max_seq_len, num_blocks,
-            capture_this_step, stream);
+            capture_this_step, /*input_token_id_dev=*/nullptr, stream);
         if (err != cudaSuccess) return err;
     }
     return cudaSuccess;

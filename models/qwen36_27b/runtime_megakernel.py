@@ -284,6 +284,61 @@ class Qwen36MegakernelDecoder:
             if eos_id is not None and next_id == eos_id: break
         return torch.tensor(new_tokens, dtype=torch.int32)
 
+    def decode_chain(self, n_tokens: int) -> torch.Tensor:
+        """Async decode that keeps the next-token id on-device between
+        steps. After a prefill, calls decode_qwen3x N times consecutively
+        without any host syncs — the LM head argmax writes the token id
+        into self._lm_head_scratch["out"] (int32 device tensor), and the
+        next decode_qwen3x reads it from there.
+
+        Returns a CPU int32 tensor of the N decoded token ids. Only one
+        host sync at the end (the final .cpu() copy).
+
+        Saves ~50 us of host-sync overhead per token, but more
+        importantly is CUDA-Graph-capturable (subsequent work).
+        """
+        # First touch primes _lm_head_scratch (via decode then ignore).
+        if not hasattr(self, "_lm_head_scratch"):
+            _ = self._argmax_from_normalized()
+        s = self._lm_head_scratch
+        ops = torch.ops.qwen3x_C
+        device_token = s["out"]  # int32 [1], on device
+
+        # Collect on-device per-step output by capturing each into a slot
+        # of a host-staged buffer. Avoid item() per iteration.
+        out_history = torch.empty(n_tokens, dtype=torch.int32, device="cuda")
+
+        for i in range(n_tokens):
+            ops.decode_qwen3x(
+                self.MODEL_ID,
+                self.weights["embed_weight"], self.weights["final_norm_weight"],
+                self.layer_blob,
+                self.sc.fa_k_cache, self.sc.fa_v_cache,
+                self.sc.dn_states, self.sc.conv_bufs,
+                self.sc.hidden_buffer, self.sc.g_residual,
+                self.sc.g_qkv_scratch, self.sc.g_kv_scratch,
+                self.sc.g_attn_out, self.sc.g_mlp_inter,
+                self.sc.g_z_scratch, self.sc.g_beta_scratch, self.sc.g_alpha_scratch,
+                self.sc.g_normalized, self.sc.g_fa_partials, self.sc.g_rope_inv_freq,
+                -1, self.position, self.position, self.position,
+                self.max_seq,
+                float(self.yarn["scale"]), float(self.yarn["beta_fast"]),
+                float(self.yarn["beta_slow"]),
+                int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),
+                int(self.num_blocks),
+                self.layer_capture,
+                device_token,                  # NEW: read token from device
+            )
+            ops.lm_head_argmax(
+                self.MODEL_ID, self.sc.g_normalized,
+                self.weights["lm_head_weight"],
+                device_token, s["block_max_vals"], s["block_max_idxs"],
+                s["num_blocks"])
+            # Copy device_token into our history buffer (still no host sync).
+            out_history[i].copy_(device_token[0])
+            self.position += 1
+        return out_history.cpu()
+
     def decode(self, token_id: int) -> int:
         """One decode step. Advances position by 1."""
         ops = torch.ops.qwen3x_C

@@ -46,25 +46,25 @@ extern "C" cudaError_t launch_decode_0p8b(
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, void*, cudaStream_t);
+    int, int, int, int, int, int, void*, const void*, cudaStream_t);
 extern "C" cudaError_t launch_decode_27b(
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, void*, cudaStream_t);
+    int, int, int, int, int, int, void*, const void*, cudaStream_t);
 extern "C" cudaError_t launch_decode_0p8b_nvfp4(
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, void*, cudaStream_t);
+    int, int, int, int, int, int, void*, const void*, cudaStream_t);
 extern "C" cudaError_t launch_decode_27b_nvfp4(
     void*, void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     YarnParamsHost,
-    int, int, int, int, int, int, void*, cudaStream_t);
+    int, int, int, int, int, int, void*, const void*, cudaStream_t);
 
 extern "C" cudaError_t launch_prefill_naive_0p8b(
     const int32_t*, int,
@@ -213,7 +213,8 @@ void decode_qwen3x(
     double yarn_scale, double yarn_beta_fast, double yarn_beta_slow,
     int64_t yarn_orig_ctx, bool yarn_enabled,
     int64_t num_blocks,
-    c10::optional<torch::Tensor> g_layer_outputs)
+    c10::optional<torch::Tensor> g_layer_outputs,
+    c10::optional<torch::Tensor> input_token_id_dev)
 {
     TORCH_CHECK(model_id >= 0 && model_id <= 3,
                 "model_id must be 0..3 (0=0.8B bf16, 1=27B bf16, "
@@ -244,6 +245,14 @@ void decode_qwen3x(
                     "g_layer_outputs must be contiguous CUDA bf16");
         layer_outs_ptr = t.data_ptr();
     }
+    const void *tok_dev_ptr = nullptr;
+    if (input_token_id_dev.has_value()) {
+        const auto &t = *input_token_id_dev;
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous()
+                    && t.scalar_type() == torch::kInt32 && t.numel() >= 1,
+                    "input_token_id_dev must be contig CUDA int32 [>=1]");
+        tok_dev_ptr = t.data_ptr();
+    }
     cudaError_t err = launcher(
         embed_weight.data_ptr(), final_norm_weight.data_ptr(),
         layer_weights.data_ptr(),
@@ -256,7 +265,7 @@ void decode_qwen3x(
         g_normalized.data_ptr(), g_fa_partials.data_ptr(), g_rope_inv_freq.data_ptr(),
         yp,
         (int)input_token_id, (int)position, (int)pos_h, (int)pos_w, (int)max_seq_len,
-        nb, layer_outs_ptr, stream);
+        nb, layer_outs_ptr, tok_dev_ptr, stream);
     TORCH_CHECK(err == cudaSuccess,
                 "decode_qwen3x launch failed: ", cudaGetErrorString(err));
 }
@@ -409,7 +418,8 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "int input_token_id, int position, int pos_h, int pos_w, int max_seq_len, "
             "float yarn_scale, float yarn_beta_fast, float yarn_beta_slow, "
             "int yarn_orig_ctx, bool yarn_enabled, int num_blocks, "
-            "Tensor(q!)? g_layer_outputs) -> ()");
+            "Tensor(q!)? g_layer_outputs, "
+            "Tensor? input_token_id_dev=None) -> ()");
     ops.impl("decode_qwen3x", torch::kCUDA, &decode_qwen3x);
 
     ops.def("lm_head_argmax(int model_id, Tensor hidden, "
