@@ -224,7 +224,9 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   matches BF16 path within 1% PPL drift on wikitext.
 
 ### S2. Parallel-S prefill kernel
-- **Status**: TODO  | **Prio**: P1  | **Effort**: L  | **Deps**: C5
+- **Status**: TODO (plan written)  | **Prio**: P1  | **Effort**: L  | **Deps**: C5
+- See `megakernel/PREFILL_S2_PLAN.md` for the porting checklist from
+  0.8B's `prefill_megakernel.cu` (~1100 lines).
 - Replace `prefill_qwen3x_naive` (host-loop over S decode calls) with a
   `prefill_megakernel<Cfg>(S, ...)` that processes the S-dim in
   parallel. Structure:
@@ -242,7 +244,9 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   fp32-accumulation noise, **at least 8× faster**.
 
 ### S3. NVFP4 KV cache wired into the megakernel FA path
-- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: S1
+- **Status**: TODO (plan written)  | **Prio**: P1  | **Effort**: S  | **Deps**: S1
+- See `megakernel/KV_S3_PLAN.md` — reuses 0.8B's nvfp4_kv.cuh
+  helpers; head_dim=256 matches both Cfgs.
 - `nvfp4_kv.cuh` helpers already work standalone; need to wire them
   into `fa_layer.cuh`'s K/V read/write sites. Add `Cfg::USE_NVFP4_KV`
   trait; conditional inclusion.
@@ -262,12 +266,12 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   (currently expected to be > 80%).
 
 ### S5. Multi-Token Prediction (MTP) wire-up
-- **Status**: TODO  | **Prio**: P1  | **Effort**: M  | **Deps**: S1
-- Qwen3.6-27B ships a native NEXTN head: a single transformer layer at
-  `mtp.layers.0.*` in the safetensors. Layout matches a standard FA
-  layer.
-- Wire `mtp_speculative.MTPDecoder._mtp_predict` to call this head
-  instead of the LM-head approximation it uses now.
+- **Status**: WIP  | **Prio**: P1  | **Effort**: M  | **Deps**: S1
+- Probe script at `test/test_s5_mtp_probe.py` reports the actual
+  state_dict layout — run that against HF to discover the exact key
+  prefix (mtp.layers vs model.mtp_head vs nextn.head).
+- Wire `mtp_speculative.MTPDecoder._mtp_predict` to call the real
+  head instead of the LM-head approximation it uses now.
 - **Acceptance**: chain MTP achieves AL ≥ 3 on natural text.
 
 ### S6. Tree-verify parallel forward kernel
@@ -282,10 +286,12 @@ These workstreams parallelize. Order by speed-per-effort ratio.
   the qwen35_27b DFlash + DDTree results.
 
 ### S7. cuBLASLt FP4 LM head
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: S1
-- Re-use the 0.8B cuBLASLt FP4-LM-head plan from
-  `models/qwen35_0p8b/kernel_gb10_nvfp4.cu:lm_head_plan()` at the 27B
-  vocab=248320 / hidden=5120 shapes.
+- **Status**: WIP  | **Prio**: P2  | **Effort**: S  | **Deps**: S1
+- S7a: BF16 LM head argmax kernel (skips fp32 cast + python matmul,
+  saves ~30 ms per decode step) — **DONE**. See megakernel/lm_head.cu.
+- S7b: cuBLASLt FP4 LM head — TODO. Re-use the 0.8B cuBLASLt FP4-LM-head
+  plan from `models/qwen35_0p8b/kernel_gb10_nvfp4.cu:lm_head_plan()`
+  at the 27B vocab=248320 / hidden=5120 shapes.
 - **Acceptance**: LM head GEMV at < 1 ms at FP4.
 
 ---
