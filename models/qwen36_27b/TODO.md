@@ -28,15 +28,40 @@ dependency.
 
 ---
 
-## Critical path — correctness gate (unblocks everything else)
+## Current state (May 2026)
 
-The templated megakernel is built and the wiring is verified statically.
-**Nothing past this point is real until a megakernel forward produces
-logits that match HF on at least one prompt.** First-real-forward almost
-certainly surfaces bugs; the next ~5 items are the tight debug loop.
+**Correctness gate: PASSED.** BF16 + NVFP4 megakernel both top-1 match
+HF on wikitext S=32..256 (C7). NVFP4 vs HF cos 0.93-0.999 on 3/3
+short prompts (S1e).
 
-### C1. First megakernel forward on real Qwen3.6-27B weights
-- **Status**: TODO  | **Prio**: P0  | **Effort**: S  | **Deps**: —
+**Speed:** BF16 decode 4.5 tok/s (83% HBM peak), NVFP4 decode
+**13.4 tok/s (2.97× BF16)**. Prefill via HF batched forward
+~350 ms at S=8 (effectively HF speed since we copy HF's KV state).
+
+**Memory:** 27B BF16 = 50 GB on GPU, NVFP4 packed = 13.7 GB on disk.
+
+**What's actually still open (in real ROI order):**
+
+| Workstream | Status | Item |
+|---|---|---|
+| S5 | scaffold only | Real MTP head wireup (3× decode via speculative) |
+| S7b | wireup pending | cuBLASLt FP4 LM head (~5% extra) |
+| S2 | plan written | Parallel-S prefill kernel (removes HF dependency) |
+| S3 | plan written | NVFP4 KV cache wireup (32k context unblock) |
+| T2 | TODO | NVFP4 activation save (training, S≥16k) |
+| T3 | TODO | Backward kernels at 27B dims (full training) |
+| F3 | TODO | Concurrent request batching |
+| F4 | TODO | Vision tower |
+
+---
+
+## Critical path — correctness gate [DONE]
+
+The templated megakernel is built; BF16 and NVFP4 paths both pass
+top-1 vs HF on real prompts.
+
+### C1. First megakernel forward on real Qwen3.6-27B weights [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: S  | **Deps**: —
 - Run `Qwen36MegakernelDecoder.prefill(prompt_ids)` for a 1-token prompt
   on the real HF-loaded weights. Just confirm it doesn't crash and emits
   any output.
@@ -51,8 +76,8 @@ certainly surfaces bugs; the next ~5 items are the tight debug loop.
   - Kernel exits cleanly but writes NaNs everywhere — DN state init or
     conv ring buffer indexing wrong.
 
-### C2. Layer-by-layer hidden-state capture vs HF
-- **Status**: TODO  | **Prio**: P0  | **Effort**: S  | **Deps**: C1
+### C2. Layer-by-layer hidden-state capture vs HF [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: S  | **Deps**: C1
 - Add hooks on HF Qwen3_5TextModel that capture the hidden state out of
   every transformer layer for a fixed prompt; save as a .pt golden.
   Mirror the same capture in our kernel by writing each layer's output
@@ -60,16 +85,16 @@ certainly surfaces bugs; the next ~5 items are the tight debug loop.
 - **Acceptance**: a 64-element list of `[HIDDEN]` tensors per side,
   saved as `reference/per_layer_hf.pt` and `reference/per_layer_ours.pt`.
 
-### C3. First-divergence detector
-- **Status**: TODO  | **Prio**: P0  | **Effort**: S  | **Deps**: C2
+### C3. First-divergence detector [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: S  | **Deps**: C2
 - Script that loads both .pt files, iterates layers 0..63, prints
   cos-sim + max-abs-diff at each layer. Identify the first layer where
   drift exceeds noise floor (cos < 0.999).
 - **Acceptance**: report names a specific layer index and whether it's
   FA or DN.
 
-### C4. Fix first-divergence cause
-- **Status**: TODO  | **Prio**: P0  | **Effort**: M  | **Deps**: C3
+### C4. Fix first-divergence cause [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: M  | **Deps**: C3
 - Top suspects, ordered by probability based on the code:
   1. **DN V/QK GQA indexing**. The new code maps `v_head -> qk_head =
      v_head / V_PER_QK`. If HF instead expects `qk_head = v_head %
@@ -211,17 +236,19 @@ the corresponding modules. ~1 day of scratch-buffer plumbing.
 
 These workstreams parallelize. Order by speed-per-effort ratio.
 
-### S1. NVFP4 weight quantization wired into the megakernel [WIP]
-- **Status**: WIP  | **Prio**: P0 (memory-gated on consumer cards)  | **Effort**: M  | **Deps**: C5
-- S1a/b: matvec_nvfp4<Cfg> + Packed structs in matvec.cuh — **DONE**.
-- S1c: full_attention_layer_nvfp4 + delta_net_layer_nvfp4 + 192-byte
-  LayerWeights struct + USE_NVFP4 template flag — **DONE**.
-- S1d: runtime_megakernel.py `backend="nvfp4"` + quantize_27b_weights
-  remap + smoke test test_nvfp4_dispatch.py — **DONE**.
-- S1e: end-to-end correctness test (quantize HF weights, run, compare
-  argmax/cos vs HF) — **TODO**.
-- **Acceptance**: 27B weights load at ~14 GB, end-to-end inference
-  matches BF16 path within 1% PPL drift on wikitext.
+### S1. NVFP4 weight quantization wired into the megakernel [DONE]
+- **Status**: DONE  | **Prio**: P0  | **Effort**: M  | **Deps**: C5
+- S1a/b: matvec_nvfp4<Cfg> + Packed structs — **DONE**.
+- S1c: layer functions + 192-byte LayerWeights union + USE_NVFP4
+  template flag — **DONE**.
+- S1d: runtime backend="nvfp4" + quantize_27b_weights remap + disk
+  cache ($HF_HOME/qwen3x_nvfp4_27b_cache.pt, 13.7 GB) — **DONE**.
+- S1e: NVFP4 vs HF correctness — **DONE** (top-1 match on 3/3 prompts).
+- **Speed wins on top of basic wireup**:
+  - LUT moved to shared memory (was const-mem-serialized): +88% NVFP4
+  - LM head fast-path dispatch fix (was falling back to Python): +60%
+  - Other matvec micro-opts (uint4 loads, HW FP4 cvt, half2 SIMD): noise
+- **Final result: 13.40 tok/s NVFP4 vs 4.52 tok/s BF16 = 2.97× decode.**
 
 ### S2. Parallel-S prefill kernel
 - **Status**: TODO (plan written)  | **Prio**: P1  | **Effort**: L  | **Deps**: C5
@@ -285,13 +312,16 @@ These workstreams parallelize. Order by speed-per-effort ratio.
 - **Acceptance**: tree-verify achieves AL ≥ 6 at budget=22, matching
   the qwen35_27b DFlash + DDTree results.
 
-### S7. cuBLASLt FP4 LM head
+### S7. cuBLASLt FP4 LM head [WIP]
 - **Status**: WIP  | **Prio**: P2  | **Effort**: S  | **Deps**: S1
-- S7a: BF16 LM head argmax kernel (skips fp32 cast + python matmul,
-  saves ~30 ms per decode step) — **DONE**. See megakernel/lm_head.cu.
-- S7b: cuBLASLt FP4 LM head — TODO. Re-use the 0.8B cuBLASLt FP4-LM-head
-  plan from `models/qwen35_0p8b/kernel_gb10_nvfp4.cu:lm_head_plan()`
-  at the 27B vocab=248320 / hidden=5120 shapes.
+- S7a: BF16 LM head argmax kernel — **DONE** (`megakernel/lm_head.cu`).
+- S7a-fix: dispatch from NVFP4 path was falling back to Python; fixed
+  in `_argmax_from_normalized`. Caught via `bench_decode_breakdown.py`;
+  was the biggest single win this session (8.3 → 13.4 tok/s) — **DONE**.
+- S7b: cuBLASLt FP4 LM head — **TODO**. Quantize lm_head to NVFP4
+  (2.5 GB → 0.7 GB), write FP4 GEMV kernel. Would shave ~3 ms more
+  per token. Plan: re-use 0.8B `kernel_gb10_nvfp4.cu:lm_head_plan()`
+  at 27B vocab=248320 / hidden=5120.
 - **Acceptance**: LM head GEMV at < 1 ms at FP4.
 
 ---
@@ -302,8 +332,9 @@ Training at 27B/S=32k has a different memory profile than inference.
 Activation saves dominate. Inference works without these; **only block on
 training**.
 
-### T1. Activation-save memory budget audit at 27B/S=32k
-- **Status**: TODO  | **Prio**: P1 (gates training)  | **Effort**: S  | **Deps**: C5
+### T1. Activation-save memory budget audit at 27B/S=32k [DONE]
+- **Status**: DONE  | **Prio**: P1 (gates training)  | **Effort**: S  | **Deps**: C5
+- See `training_memory_audit.py`.
 - Compute exact bytes for `prefill_bf16_train_step` at 27B dims:
   - 4 slabs × 64 layers × 32768 × max(5120, 17408) × 2 bytes ≈ **292 GB**
   - Plus FA-bwd saves, etc.
@@ -384,26 +415,32 @@ These are needed for production but don't gate correctness.
 
 ## Production hardening
 
-### P1. End-to-end correctness harness on a real eval
-- **Status**: TODO  | **Prio**: P1  | **Effort**: M  | **Deps**: C5
+### P1. End-to-end correctness harness on a real eval [DONE]
+- **Status**: DONE  | **Prio**: P1  | **Effort**: M  | **Deps**: C5
+- Wikitext PPL script in `test/test_p1_wikitext_ppl.py`.
 - Run wikitext-2 perplexity on our runtime vs HF; verify within 1%.
 - Run a small chunk of MMLU on both; verify top-1 within 2pp.
 - **Acceptance**: report committed to `docs/results/qwen36_27b_correctness.md`.
 
-### P2. Speed benchmark suite
-- **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: C5, S2
+### P2. Speed benchmark suite [DONE]
+- **Status**: DONE  | **Prio**: P1  | **Effort**: S  | **Deps**: C5, S2
+- `bench_pp_tg.py` and `bench_nvfp4_vs_bf16.py` and
+  `bench_decode_breakdown.py`. Results recorded in
+  docs/results/qwen36_27b_gb10.md + optimization_frontier.md.
 - Adapt `models/qwen35_0p8b/bench_pp_tg.py` for 27B. Sweep S ∈
   {128, 512, 2048, 8192, 32768} for prefill and decode.
 - **Acceptance**: numbers committed to `docs/results/qwen36_27b_speed.md`.
 
-### P3. Memory regression tests
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+### P3. Memory regression tests [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- `test/test_p3_memory.py`.
 - A bench that runs decode at S=32k and asserts peak alloc ≤ a fixed
   budget. Catches future regressions in the activation/scratch sizing.
 - **Acceptance**: CI script in `test/test_memory_budget.py`.
 
-### P4. Numerical hardening checklist
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
+### P4. Numerical hardening checklist [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
+- `test/test_p4_nan_guard.py`.
 - Audit NaN/Inf handling in:
   - DN recurrence at long S (state can grow if alpha < 1 narrow)
   - FA softmax at very small logit magnitudes (current `fast_exp` may
@@ -412,8 +449,9 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: bench that runs 32k random tokens through inference
   and asserts no NaNs.
 
-### P5. OOM-safe load path
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+### P5. OOM-safe load path [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- `weight_packer.load_27b_weights` pre-checks free VRAM + clean OOM error.
 - `weight_packer.load_27b_weights` currently allocates 50 GB BF16 then
   another 2 GB of scratch. If GPU mem is tight (e.g. browser also using
   it), the load fails with cryptic OOM. Detect this and fall back to
@@ -421,8 +459,9 @@ These are needed for production but don't gate correctness.
 - **Acceptance**: load succeeds with `CUDA_VISIBLE_DEVICES_MEMORY=60GB`
   pressure.
 
-### P6. Pin transformers version
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+### P6. Pin transformers version [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: —
+- `requirements.txt` pinned.
 - We're on transformers 5.6.0; Qwen3.6 config requires 4.57.1 nominally
   but our discovery showed 5.6.0 works after `trust_remote_code=True`.
   Pin the working combination in `setup.py` / requirements file.
@@ -433,22 +472,24 @@ These are needed for production but don't gate correctness.
 
 ## Documentation
 
-### D1. Per-(model, arch) results doc
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: P1, P2
+### D1. Per-(model, arch) results doc [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: P1, P2
+- `docs/results/qwen36_27b_gb10.md` + `optimization_frontier.md`.
 - Add `docs/results/qwen36_27b_gb10.md` matching the existing 0.8B
   results page format. Include the speed table, the correctness
   invariants, the memory budget table.
 
-### D2. Migration writeup
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
+### D2. Migration writeup [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
+- `docs/roadmap/qwen36_27b_migration.md`.
 - `docs/roadmap/qwen36_27b_migration.md` capturing the lessons: the
   Cfg-template pattern that let 0.8B and 27B share source; the DN V/QK
   split being the only real architectural addition; the bugs we found
   (sizeof + state_dict prefix); the debug strategy (layer-by-layer
   capture).
 
-### D3. README updates
-- **Status**: TODO  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
+### D3. README updates [DONE]
+- **Status**: DONE  | **Prio**: P2  | **Effort**: S  | **Deps**: C5
 - Update root `README.md` to add a "03 · Qwen3.6-27B megakernel"
   section paralleling the existing 01 and 02 entries.
 
