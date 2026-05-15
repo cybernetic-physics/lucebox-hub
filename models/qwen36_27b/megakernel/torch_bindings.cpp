@@ -95,6 +95,15 @@ extern "C" cudaError_t launch_prefill_naive_27b_nvfp4(
     YarnParamsHost,
     int, int, void*, int, cudaStream_t);
 
+extern "C" cudaError_t launch_lm_head_argmax_0p8b(
+    void *hidden, void *lm_head_weight, void *out_token_id,
+    void *block_max_vals, void *block_max_idxs,
+    int num_blocks, cudaStream_t stream);
+extern "C" cudaError_t launch_lm_head_argmax_27b(
+    void *hidden, void *lm_head_weight, void *out_token_id,
+    void *block_max_vals, void *block_max_idxs,
+    int num_blocks, cudaStream_t stream);
+
 extern "C" void launch_mlp_smoke_0p8b(
     const void *input, const void *gain,
     const void *w_gate, const void *w_up, const void *w_down,
@@ -318,6 +327,49 @@ void prefill_qwen3x_naive(
                 "prefill_qwen3x_naive launch failed: ", cudaGetErrorString(err));
 }
 
+// LM head argmax — fast path bypassing the python fp32 cast + matmul.
+void lm_head_argmax(
+    int64_t model_id,
+    torch::Tensor hidden,           // [HIDDEN] fp32
+    torch::Tensor lm_head_weight,   // [VOCAB, HIDDEN] bf16
+    torch::Tensor out_token_id,     // [1] int32
+    torch::Tensor block_max_vals,   // [num_blocks] fp32
+    torch::Tensor block_max_idxs,   // [num_blocks] int32
+    int64_t num_blocks)
+{
+    TORCH_CHECK(model_id == 0 || model_id == 1,
+                "lm_head_argmax model_id must be 0 (0.8B) or 1 (27B)");
+    TORCH_CHECK(hidden.is_cuda() && hidden.is_contiguous()
+                && hidden.scalar_type() == torch::kFloat32,
+                "hidden must be contig CUDA fp32");
+    TORCH_CHECK(lm_head_weight.is_cuda() && lm_head_weight.is_contiguous()
+                && lm_head_weight.scalar_type() == torch::kBFloat16,
+                "lm_head_weight must be contig CUDA bf16");
+    TORCH_CHECK(out_token_id.is_cuda() && out_token_id.is_contiguous()
+                && out_token_id.scalar_type() == torch::kInt32
+                && out_token_id.numel() == 1,
+                "out_token_id must be contig CUDA int32 [1]");
+    TORCH_CHECK(block_max_vals.is_cuda() && block_max_vals.is_contiguous()
+                && block_max_vals.scalar_type() == torch::kFloat32
+                && block_max_vals.numel() == num_blocks,
+                "block_max_vals must be contig CUDA fp32 [num_blocks]");
+    TORCH_CHECK(block_max_idxs.is_cuda() && block_max_idxs.is_contiguous()
+                && block_max_idxs.scalar_type() == torch::kInt32
+                && block_max_idxs.numel() == num_blocks,
+                "block_max_idxs must be contig CUDA int32 [num_blocks]");
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    auto launcher = (model_id == 0) ? &launch_lm_head_argmax_0p8b
+                                    : &launch_lm_head_argmax_27b;
+    cudaError_t err = launcher(
+        hidden.data_ptr(), lm_head_weight.data_ptr(),
+        out_token_id.data_ptr(),
+        block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+        (int)num_blocks, stream);
+    TORCH_CHECK(err == cudaSuccess,
+                "lm_head_argmax launch failed: ", cudaGetErrorString(err));
+}
+
 TORCH_LIBRARY(qwen3x_C, ops) {
     ops.def("mlp_smoke_0p8b(Tensor input, Tensor gain, "
             "Tensor w_gate, Tensor w_up, Tensor w_down, "
@@ -359,6 +411,12 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "int yarn_orig_ctx, bool yarn_enabled, int num_blocks, "
             "Tensor(q!)? g_layer_outputs) -> ()");
     ops.impl("decode_qwen3x", torch::kCUDA, &decode_qwen3x);
+
+    ops.def("lm_head_argmax(int model_id, Tensor hidden, "
+            "Tensor lm_head_weight, Tensor(a!) out_token_id, "
+            "Tensor(b!) block_max_vals, Tensor(c!) block_max_idxs, "
+            "int num_blocks) -> ()");
+    ops.impl("lm_head_argmax", torch::kCUDA, &lm_head_argmax);
 }
 
 REGISTER_EXTENSION(qwen3x_C)

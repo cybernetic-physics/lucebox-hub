@@ -225,11 +225,39 @@ class Qwen36MegakernelDecoder:
         return self._argmax_from_normalized()
 
     def _argmax_from_normalized(self) -> int:
-        """LM head argmax over g_normalized @ lm_head.T. fp32 matmul."""
+        """LM head argmax over g_normalized @ lm_head.T.
+
+        Uses the fast bf16 kernel `lm_head_argmax` for the BF16 backend
+        (skips the fp32 cast + python matmul). NVFP4 path still falls
+        back to the python matmul because the NVFP4 LM head GEMV is
+        a separate (deferred) item — see TODO S7.
+        """
+        # Fast path: BF16 weights + on-GPU kernel.
+        lm_head = self.weights["lm_head_weight"]
+        if (lm_head.dtype == torch.bfloat16
+                and not getattr(self, "_force_slow_argmax", False)
+                and self.MODEL_ID in (0, 1)):
+            if not hasattr(self, "_lm_head_scratch"):
+                # vocab/hidden are large; 32 blocks gives plenty of
+                # parallelism without per-block work dropping below 1 KB.
+                num_blocks = 32
+                self._lm_head_scratch = dict(
+                    num_blocks=num_blocks,
+                    out=torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    block_max_vals=torch.zeros(num_blocks, dtype=torch.float32, device="cuda"),
+                    block_max_idxs=torch.zeros(num_blocks, dtype=torch.int32, device="cuda"),
+                )
+            s = self._lm_head_scratch
+            torch.ops.qwen3x_C.lm_head_argmax(
+                self.MODEL_ID, self.sc.g_normalized, lm_head,
+                s["out"], s["block_max_vals"], s["block_max_idxs"],
+                s["num_blocks"])
+            return int(s["out"].item())
+
+        # Fallback: fp32 matmul.
         hidden = self.sc.g_normalized.to(torch.float32)
-        lm_head = self.weights["lm_head_weight"].to(torch.float32)
-        # logits shape: [VOCAB]
-        logits = hidden @ lm_head.t()
+        lm_head_f32 = lm_head.to(torch.float32)
+        logits = hidden @ lm_head_f32.t()
         return int(logits.argmax().item())
 
     def logits_for_last(self) -> torch.Tensor:
