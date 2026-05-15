@@ -214,13 +214,15 @@ the corresponding modules. ~1 day of scratch-buffer plumbing.
 
 These workstreams parallelize. Order by speed-per-effort ratio.
 
-### S1. NVFP4 weight quantization wired into the megakernel
-- **Status**: TODO  | **Prio**: P0 (memory-gated on consumer cards)  | **Effort**: M  | **Deps**: C5
-- Python plumbing exists (`nvfp4_27b.py`). Missing: an NVFP4-aware
-  matvec in `matvec.cuh` that takes the packed `(data, scales)` tensor
-  pair. Pattern is in `models/qwen35_0p8b/kernel_gb10_nvfp4.cu:matvec_nvfp4`.
-- Add `Cfg::USE_NVFP4_WEIGHTS` trait; specialize the FA/DN/MLP layers
-  to call `matvec_nvfp4<Cfg>` when set.
+### S1. NVFP4 weight quantization wired into the megakernel [WIP]
+- **Status**: WIP  | **Prio**: P0 (memory-gated on consumer cards)  | **Effort**: M  | **Deps**: C5
+- S1a/b: matvec_nvfp4<Cfg> + Packed structs in matvec.cuh — **DONE**.
+- S1c: full_attention_layer_nvfp4 + delta_net_layer_nvfp4 + 192-byte
+  LayerWeights struct + USE_NVFP4 template flag — **DONE**.
+- S1d: runtime_megakernel.py `backend="nvfp4"` + quantize_27b_weights
+  remap + smoke test test_nvfp4_dispatch.py — **DONE**.
+- S1e: end-to-end correctness test (quantize HF weights, run, compare
+  argmax/cos vs HF) — **TODO**.
 - **Acceptance**: 27B weights load at ~14 GB, end-to-end inference
   matches BF16 path within 1% PPL drift on wikitext.
 

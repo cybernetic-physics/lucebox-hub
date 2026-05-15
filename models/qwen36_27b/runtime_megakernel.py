@@ -158,9 +158,14 @@ class Qwen36MegakernelDecoder:
         self.sc.dn_states.zero_()
         self.sc.conv_bufs.zero_()
 
-    def prefill(self, prompt_ids: torch.Tensor) -> int:
+    def prefill(self, prompt_ids: torch.Tensor, start_position: int = 0) -> int:
         """Run prefill over `prompt_ids` (CPU/CUDA long or int32 1-D).
-        Updates the position counter; returns the next-token argmax."""
+        Sets the position counter to `start_position + len(prompt_ids)`;
+        returns the next-token argmax.
+
+        For multi-turn KV cache reuse, pass `start_position=self.position`
+        and only the *new* tokens in `prompt_ids` — the cached prefix
+        stays untouched (F2)."""
         if not prompt_ids.is_cuda:
             prompt_ids = prompt_ids.cuda()
         if prompt_ids.dtype != torch.int32:
@@ -185,8 +190,9 @@ class Qwen36MegakernelDecoder:
             int(self.yarn["orig_ctx"]), bool(self.yarn["enabled"]),
             int(self.num_blocks),
             self.layer_capture,
+            int(start_position),
         )
-        self.position = int(prompt_ids.numel())
+        self.position = start_position + int(prompt_ids.numel())
         return self._argmax_from_normalized()
 
     def decode(self, token_id: int) -> int:
