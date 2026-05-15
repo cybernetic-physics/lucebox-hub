@@ -20,6 +20,7 @@
 
 #include "Cfg.cuh"
 #include "helpers.cuh"
+#include "matvec.cuh"   // for PackedMatrixNVFP4 + fp4x2_to_h2
 
 namespace lucebox::qwen3x {
 
@@ -59,6 +60,73 @@ __global__ void lm_head_argmax_kernel(
             const __nv_bfloat16 *wp = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
             #pragma unroll
             for (int i = 0; i < 8; ++i) sum += __bfloat162float(wp[i]) * s_hidden[k + i];
+        }
+        sum = warp_reduce_sum_x(sum);
+        if (lane_id == 0 && sum > local_max) {
+            local_max = sum; local_max_idx = m;
+        }
+    }
+    local_max     = __shfl_sync(0xffffffff, local_max,     0);
+    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+
+    __shared__ float wm[LM_NUM_WARPS];
+    __shared__ int   wi[LM_NUM_WARPS];
+    if (lane_id == 0) { wm[warp_id] = local_max; wi[warp_id] = local_max_idx; }
+    __syncthreads();
+    if (warp_id == 0) {
+        float mv = (lane_id < LM_NUM_WARPS) ? wm[lane_id] : -INFINITY;
+        int   mi = (lane_id < LM_NUM_WARPS) ? wi[lane_id] : -1;
+        #pragma unroll
+        for (int o = LM_WARP_SIZE / 2; o > 0; o /= 2) {
+            float ov = __shfl_down_sync(0xffffffff, mv, o);
+            int   oi = __shfl_down_sync(0xffffffff, mi, o);
+            if (ov > mv) { mv = ov; mi = oi; }
+        }
+        if (lane_id == 0) {
+            block_max_vals[blockIdx.x] = mv;
+            block_max_idxs[blockIdx.x] = mi;
+        }
+    }
+}
+
+// NVFP4 LM head: reads packed FP4 weights (data + scales) instead of bf16.
+// Reduces HBM read by ~3.5x vs bf16 (2.5 GB → 0.7 GB), should shave
+// ~7 ms/step from the current ~10 ms BF16 LM head.
+template<typename Cfg, int GROUP_SIZE = 32>
+__global__ void lm_head_argmax_nvfp4_kernel(
+    const float       *__restrict__ hidden,      // [HIDDEN] fp32
+    const uint8_t     *__restrict__ data,        // [VOCAB, HIDDEN/2] FP4 packed
+    const __half      *__restrict__ scales,      // [VOCAB, HIDDEN/GROUP_SIZE] fp16
+    float *__restrict__ block_max_vals,
+    int   *__restrict__ block_max_idxs)
+{
+    constexpr int H = Cfg::HIDDEN;
+    constexpr int V = Cfg::VOCAB_SIZE;
+    __shared__ float s_hidden[Cfg::HIDDEN];
+    for (int i = threadIdx.x; i < H; i += LM_BLOCK_SIZE) s_hidden[i] = hidden[i];
+    __syncthreads();
+
+    int warp_id = threadIdx.x / LM_WARP_SIZE;
+    int lane_id = threadIdx.x % LM_WARP_SIZE;
+    int rpb = (V + gridDim.x - 1) / gridDim.x;
+    int rs = blockIdx.x * rpb;
+    int re = min(rs + rpb, V);
+    int row_bytes  = H / 2;
+    int row_scales = H / GROUP_SIZE;
+
+    float local_max = -INFINITY;
+    int   local_max_idx = -1;
+    for (int m = rs + warp_id; m < re; m += LM_NUM_WARPS) {
+        const uint8_t *w_row = data + (size_t)m * row_bytes;
+        const __half  *s_row = scales + (size_t)m * row_scales;
+        float sum = 0.0f;
+        #pragma unroll 2
+        for (int k = lane_id * 8; k < H; k += LM_WARP_SIZE * 8) {
+            uint32_t packed = load_32bit(
+                reinterpret_cast<const uint32_t *>(w_row + (k / 2)));
+            float scale = __half2float(__ldg(s_row + (k / GROUP_SIZE)));
+            // Reuse dot8_nvfp4_f32 — activations in s_hidden are fp32.
+            sum += dot8_nvfp4_f32(packed, scale, s_hidden + k, nullptr);
         }
         sum = warp_reduce_sum_x(sum);
         if (lane_id == 0 && sum > local_max) {
@@ -154,6 +222,39 @@ extern "C" cudaError_t launch_lm_head_argmax_27b(
 {
     return launch_lm_head_argmax_impl<Cfg_27B>(
         hidden, lm_head_weight, out_token_id,
+        block_max_vals, block_max_idxs, num_blocks, stream);
+}
+
+// NVFP4 LM head launcher.
+template<typename Cfg>
+static cudaError_t launch_lm_head_argmax_nvfp4_impl(
+    void *hidden, void *lm_head_data, void *lm_head_scales,
+    void *out_token_id, void *block_max_vals, void *block_max_idxs,
+    int num_blocks, cudaStream_t stream)
+{
+    lm_head_argmax_nvfp4_kernel<Cfg><<<num_blocks, LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)hidden,
+        (const uint8_t *)lm_head_data,
+        (const __half *)lm_head_scales,
+        (float *)block_max_vals,
+        (int *)block_max_idxs);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    lm_head_argmax_reduce_kernel<<<1, LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)block_max_vals,
+        (const int *)block_max_idxs,
+        (int *)out_token_id,
+        num_blocks);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t launch_lm_head_argmax_27b_nvfp4(
+    void *hidden, void *lm_head_data, void *lm_head_scales,
+    void *out_token_id, void *block_max_vals, void *block_max_idxs,
+    int num_blocks, cudaStream_t stream)
+{
+    return launch_lm_head_argmax_nvfp4_impl<Cfg_27B>(
+        hidden, lm_head_data, lm_head_scales, out_token_id,
         block_max_vals, block_max_idxs, num_blocks, stream);
 }
 

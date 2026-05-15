@@ -124,12 +124,20 @@ class Qwen36MegakernelDecoder:
         if backend == "nvfp4":
             if verbose: print("[megakernel] quantizing layer weights to NVFP4...",
                               flush=True)
-            from nvfp4_27b import quantize_27b_weights
+            from nvfp4_27b import (quantize_27b_weights, quantize_lm_head_nvfp4,
+                                     DEFAULT_NVFP4_LM_CACHE)
             quantized = quantize_27b_weights(self.weights["layer_data"], verbose=verbose)
             # Remap type: 0 (DN_bf16) -> 2 (DN_nvfp4); 1 (FA_bf16) -> 3 (FA_nvfp4).
             for ld in quantized:
                 ld["type"] = int(ld["type"]) + 2
             self.weights["layer_data"] = quantized
+            # Also quantize the LM head for the fast FP4 argmax kernel
+            # (saves ~7 ms/decode step at 27B / vocab=248320 / hidden=5120).
+            lm = quantize_lm_head_nvfp4(self.weights["lm_head_weight"],
+                                          cache_path=DEFAULT_NVFP4_LM_CACHE,
+                                          verbose=verbose)
+            self.weights["lm_head_nvfp4_data"]   = lm["packed"]
+            self.weights["lm_head_nvfp4_scales"] = lm["scales"]
 
         if verbose: print("[megakernel] packing layer pointers...", flush=True)
         self.layer_blob = pack_layer_weights(self.weights["layer_data"])
@@ -503,6 +511,28 @@ class Qwen36MegakernelDecoder:
         Cfg_27B shape, so we map both 1 and 3 to the 27B kernel.
         """
         lm_head = self.weights["lm_head_weight"]
+        # FP4 fast path first (NVFP4 backend with quantized lm_head).
+        lm_data = self.weights.get("lm_head_nvfp4_data")
+        lm_scales = self.weights.get("lm_head_nvfp4_scales")
+        if (lm_data is not None and lm_scales is not None
+                and not getattr(self, "_force_slow_argmax", False)
+                and self.MODEL_ID == 3):
+            if not hasattr(self, "_lm_head_scratch"):
+                sm = torch.cuda.get_device_properties(0).multi_processor_count
+                nb = sm * 2
+                self._lm_head_scratch = dict(
+                    num_blocks=nb,
+                    out=torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    block_max_vals=torch.zeros(nb, dtype=torch.float32, device="cuda"),
+                    block_max_idxs=torch.zeros(nb, dtype=torch.int32, device="cuda"),
+                )
+            s = self._lm_head_scratch
+            torch.ops.qwen3x_C.lm_head_argmax_nvfp4(
+                self.sc.g_normalized, lm_data, lm_scales,
+                s["out"], s["block_max_vals"], s["block_max_idxs"],
+                s["num_blocks"])
+            return int(s["out"].item())
+
         if (lm_head.dtype == torch.bfloat16
                 and not getattr(self, "_force_slow_argmax", False)):
             if not hasattr(self, "_lm_head_scratch"):

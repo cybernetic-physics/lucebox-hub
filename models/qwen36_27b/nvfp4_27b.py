@@ -207,6 +207,40 @@ def quantize_27b_weights(layer_data: list[dict],
     return out
 
 
+def quantize_lm_head_nvfp4(lm_head_weight: torch.Tensor,
+                            group_size: int = NVFP4_GROUP_SIZE,
+                            cache_path: str | None = None,
+                            verbose: bool = True) -> dict:
+    """Quantize the LM head [VOCAB, HIDDEN] to NVFP4.
+    Returns {"packed": uint8 [VOCAB, HIDDEN/2], "scales": fp16 [VOCAB, HIDDEN/G]}.
+    Optionally cached separately from the layer cache."""
+    if cache_path and os.path.exists(cache_path):
+        if verbose: print(f"  [nvfp4-lm] loading cached <- {cache_path}", flush=True)
+        cached = torch.load(cache_path, map_location="cuda", weights_only=False)
+        if (cached.get("group_size") == group_size
+                and cached["packed"].shape[0] == lm_head_weight.shape[0]):
+            return {"packed": cached["packed"], "scales": cached["scales"]}
+        if verbose: print(f"  [nvfp4-lm] cache mismatch, re-quantizing")
+
+    quantize = _import_quantizer()
+    if verbose: print(f"  [nvfp4-lm] quantizing lm_head "
+                       f"{tuple(lm_head_weight.shape)} -> NVFP4 ...", flush=True)
+    packed = quantize(lm_head_weight, group_size)
+    out = {"packed": packed["packed"].cuda().contiguous(),
+           "scales": packed["scales"].cuda().contiguous()}
+
+    if cache_path:
+        if verbose: print(f"  [nvfp4-lm] writing cache -> {cache_path}", flush=True)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save({"group_size": group_size, **out}, cache_path)
+    return out
+
+
+DEFAULT_NVFP4_LM_CACHE = os.path.join(
+    os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+    "qwen3x_nvfp4_27b_lm_head_cache.pt")
+
+
 # ---------------------------------------------------------------------------
 # Footprint estimator
 # ---------------------------------------------------------------------------

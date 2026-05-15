@@ -103,6 +103,10 @@ extern "C" cudaError_t launch_lm_head_argmax_27b(
     void *hidden, void *lm_head_weight, void *out_token_id,
     void *block_max_vals, void *block_max_idxs,
     int num_blocks, cudaStream_t stream);
+extern "C" cudaError_t launch_lm_head_argmax_27b_nvfp4(
+    void *hidden, void *lm_head_data, void *lm_head_scales,
+    void *out_token_id, void *block_max_vals, void *block_max_idxs,
+    int num_blocks, cudaStream_t stream);
 
 extern "C" void launch_mlp_smoke_0p8b(
     const void *input, const void *gain,
@@ -336,6 +340,38 @@ void prefill_qwen3x_naive(
                 "prefill_qwen3x_naive launch failed: ", cudaGetErrorString(err));
 }
 
+// NVFP4 LM head argmax: takes packed (data, scales) instead of bf16 weight.
+void lm_head_argmax_nvfp4(
+    torch::Tensor hidden,            // [HIDDEN] fp32
+    torch::Tensor lm_head_data,      // [VOCAB, HIDDEN/2] uint8 packed FP4
+    torch::Tensor lm_head_scales,    // [VOCAB, HIDDEN/32] fp16
+    torch::Tensor out_token_id,      // [1] int32
+    torch::Tensor block_max_vals,
+    torch::Tensor block_max_idxs,
+    int64_t num_blocks)
+{
+    TORCH_CHECK(hidden.is_cuda() && hidden.is_contiguous()
+                && hidden.scalar_type() == torch::kFloat32,
+                "hidden must be contig CUDA fp32");
+    TORCH_CHECK(lm_head_data.is_cuda() && lm_head_data.is_contiguous()
+                && lm_head_data.scalar_type() == torch::kUInt8,
+                "lm_head_data must be contig CUDA uint8 [VOCAB, HIDDEN/2]");
+    TORCH_CHECK(lm_head_scales.is_cuda() && lm_head_scales.is_contiguous()
+                && lm_head_scales.scalar_type() == torch::kHalf,
+                "lm_head_scales must be contig CUDA fp16 [VOCAB, HIDDEN/32]");
+    TORCH_CHECK(out_token_id.is_cuda() && out_token_id.scalar_type() == torch::kInt32
+                && out_token_id.numel() == 1, "out_token_id [1] int32 CUDA");
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    cudaError_t err = launch_lm_head_argmax_27b_nvfp4(
+        hidden.data_ptr(), lm_head_data.data_ptr(), lm_head_scales.data_ptr(),
+        out_token_id.data_ptr(),
+        block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+        (int)num_blocks, stream);
+    TORCH_CHECK(err == cudaSuccess,
+                "lm_head_argmax_nvfp4 launch failed: ", cudaGetErrorString(err));
+}
+
 // LM head argmax — fast path bypassing the python fp32 cast + matmul.
 void lm_head_argmax(
     int64_t model_id,
@@ -427,6 +463,12 @@ TORCH_LIBRARY(qwen3x_C, ops) {
             "Tensor(b!) block_max_vals, Tensor(c!) block_max_idxs, "
             "int num_blocks) -> ()");
     ops.impl("lm_head_argmax", torch::kCUDA, &lm_head_argmax);
+
+    ops.def("lm_head_argmax_nvfp4(Tensor hidden, "
+            "Tensor lm_head_data, Tensor lm_head_scales, "
+            "Tensor(a!) out_token_id, Tensor(b!) block_max_vals, "
+            "Tensor(c!) block_max_idxs, int num_blocks) -> ()");
+    ops.impl("lm_head_argmax_nvfp4", torch::kCUDA, &lm_head_argmax_nvfp4);
 }
 
 REGISTER_EXTENSION(qwen3x_C)
