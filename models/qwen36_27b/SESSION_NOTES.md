@@ -224,3 +224,60 @@ lines, the cause was immediate.
 - **F4** vision tower (M)
 - **S7b** cuBLASLt FP4 LM head (S)
 - **S1e** actually run the NVFP4 correctness test (slow, ~30 min/run)
+
+---
+
+# Addendum — Session 3 (May 15, 2026)
+
+## TL;DR
+
+**F2 is actually fixed now.** The "F2 multi-turn fail" reported as
+`smoke-only / dispatch test passes with zeros` in Session 2 turned
+out to be a **kernel-nondeterminism** bug, not a multi-turn-specific
+bug. Two one-shot prefills of the same input were giving cos~0.75
+between runs because V_PER_QK=3 siblings raced on conv_buf shift
+writes. Fix is a position-indexed ring buffer (`dn_layer.cuh`).
+
+`test_f2_singlerunner.py` now passes on real HF weights:
+cos=1.000000, top-1 matches one-shot.
+
+## What landed
+
+| Area | What | Status |
+|---|---|---|
+| F2 | conv_buf ring-buffer race fix | done + verified |
+| Build | dynamic shmem opt-in for 27B (>48KB ABI cap) | done |
+| Carveout | `cudaSharedmemCarveoutMaxShared` on the decode kernel | done |
+| C7 rerun | post-fix numbers in `docs/results/qwen36_27b_gb10.md` | done |
+| F10 | NEW bug filed — multi-decoder NaN | investigated |
+
+## The conv_buf race in one paragraph
+
+`dn_layer.cuh` step 3 did a 3-read-then-4-write shift on conv_buf
+(read slots 1,2,3; write slots 0,1,2,3). For V_PER_QK=3, three
+sibling blocks process the SAME Q/K channels in parallel and ALL
+issue the shift. The reads-before-writes ordering held WITHIN a
+block but NOT across blocks: a sibling could read slot 1 AFTER
+another sibling had overwritten it, producing a double-shift. So
+two oneshot prefills with identical inputs gave different conv_buf
+state at the next position → cos~0.75 across runs. Fix: each
+position writes ONE slot (`p % CONV_K`) with the same value across
+siblings (race-immune), and reads index by `(p+t+1) % CONV_K`.
+
+## F10 — multi-decoder NaN (open)
+
+Creating multiple `Qwen36MegakernelDecoder` instances in one Python
+process causes the second+ decoder's prefill to NaN on real HF
+weights. Workaround: use one decoder + `reset()`. Investigation
+notes + 9 repros under `test/debug_multi_decoder*.py`. Not caused
+by:
+- pack_layer_weights buffer aliasing
+- pytorch caching allocator overlap
+- `cudaFuncSetAttribute` re-entry
+- Shmem carveout default
+- HF tensor lifetime
+
+Compute-sanitizer memcheck + initcheck report 0 errors on the
+NaN-producing kernel. Suspected per-process kernel state that
+goes bad after N launches (cooperative-grid sync table?), invisible
+to memcheck. Needs CUDA-driver-level trace to root-cause.
