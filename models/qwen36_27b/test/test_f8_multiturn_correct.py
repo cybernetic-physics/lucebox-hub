@@ -44,21 +44,29 @@ def main():
     S2 = S - S1
     print(f"\nprompt: {prompt!r}  ({S} tokens; split {S1} + {S2})")
 
-    # Path A: one-shot prefill.
-    dec_a = Qwen36MegakernelDecoder(max_seq=256, verbose=False,
-                                      hf_model=hf, tokenizer=tok)
-    dec_a.prefill(ids); torch.cuda.synchronize()
-    logits_a = dec_a.logits_for_last().cpu()
-    top1_a = int(logits_a.argmax().item())
+    # NOTE: this test uses ONE decoder and `reset()` between paths
+    # because of the F10 bug (creating two decoders in the same
+    # process makes the second one NaN — see TODO.md F10 and
+    # test/debug_multi_decoder*.py). Single-decoder with reset()
+    # exercises the same F2 logic — fa_k/v_cache, dn_state, conv_buf
+    # are all cleared by reset() between paths.
+    dec = Qwen36MegakernelDecoder(max_seq=256, verbose=False,
+                                    hf_model=hf, tokenizer=tok)
 
-    # Path B: split prefill via start_position.
-    dec_b = Qwen36MegakernelDecoder(max_seq=256, verbose=False,
-                                      hf_model=hf, tokenizer=tok)
-    dec_b.prefill(ids[:S1])
-    dec_b.prefill(ids[S1:], start_position=S1)
+    # Path B (split) FIRST so a passing run leaves the decoder in
+    # the "interesting" state — useful if anyone is poking at it
+    # interactively after the test.
+    dec.prefill(ids[:S1])
+    dec.prefill(ids[S1:], start_position=S1)
     torch.cuda.synchronize()
-    logits_b = dec_b.logits_for_last().cpu()
+    logits_b = dec.logits_for_last().cpu()
     top1_b = int(logits_b.argmax().item())
+
+    # Path A: one-shot prefill on fresh state.
+    dec.reset()
+    dec.prefill(ids); torch.cuda.synchronize()
+    logits_a = dec.logits_for_last().cpu()
+    top1_a = int(logits_a.argmax().item())
 
     cos = F.cosine_similarity(logits_a.unsqueeze(0).to(torch.float32),
                                 logits_b.unsqueeze(0).to(torch.float32),
