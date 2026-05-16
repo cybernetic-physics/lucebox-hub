@@ -462,18 +462,36 @@ These are needed for production but don't gate correctness.
 
 ### F10. Multi-decoder NaN [NEW]
 - **Status**: BROKEN  | **Prio**: P2  | **Effort**: M  | **Deps**: —
-- Creating two `Qwen36MegakernelDecoder` instances in one Python
-  process makes the SECOND one's prefill produce NaN on real HF
-  weights. The first decoder's prefill is fine (even after the
-  second is created). Random small weights don't trigger this.
-- Repro: `test/debug_multi_decoder3.py`. Trial 1 (alone) OK; trial 2
-  (after del + empty_cache) OK; trial 3 (two decoders alive
-  simultaneously) NaN on the second.
-- Isolation: replicated by creating a fresh decoder; not caused by
-  `_unify_from_hf_model`, `pack_layer_weights`, or `alloc_scratch`
-  individually. Only the full `__init__` triggers it.
-- Workaround: use ONE decoder + `dec.reset()` between independent
-  prefills.
+- Creating multiple `Qwen36MegakernelDecoder` instances in one Python
+  process causes prefill to produce NaN on real HF weights once
+  enough kernel launches have accumulated. Random small weights
+  don't trigger this.
+- Repros under `test/debug_multi_decoder*.py`:
+  - `debug_multi_decoder.py`: 3 trials in a for-loop, reassigning
+    `dec` (old GC'd). Trial 0 OK, trials 1+ NaN.
+  - `debug_multi_decoder7.py`: two decoders both kept alive. dec1 OK,
+    dec2 OK.
+  - `debug_multi_decoder8.py`: 3 trials, keeping ALL in a list.
+    Trial 0 *itself* NaN (because we already ran 3 prefills under
+    Case A earlier in the same process — accumulated bad state).
+  - `debug_multi_decoder5.py`: dec1 and dec2 blobs are byte-identical
+    on GPU; HF weight data_ptrs match across decoders.
+  - `debug_multi_decoder7.py`: dec1's scratch is NOT corrupted by
+    dec2's prefill, even when dec2 NaNs.
+- Ruled out: pack_layer_weights buffer aliasing (verified clone
+  isolation); pytorch caching-allocator overlap (verified non-overlap
+  in `debug_multi_decoder7.py`); cudaFuncSetAttribute re-entry
+  (one-shot guard in `kernel_decode_full.cu` did not change
+  behavior); HF weight tensor lifetime (`_hf_keepalive` holds
+  the model across decoders).
+- Compute-sanitizer (memcheck + initcheck) reports 0 errors on the
+  failing kernel.
+- Suspected: some per-process kernel state (dynamic-shmem
+  carveout? cooperative-grid sync table?) gets into a bad state
+  after N launches, but the corruption is invisible to memcheck.
+  Needs a CUDA-driver-level trace.
+- Workaround: use ONE decoder + `dec.reset()`. The single-decoder
+  F2 test (`test_f2_singlerunner.py`) covers the real F2 use case.
 
 ### F9. HF cache-layout regression test
 - **Status**: TODO  | **Prio**: P1  | **Effort**: S  | **Deps**: —

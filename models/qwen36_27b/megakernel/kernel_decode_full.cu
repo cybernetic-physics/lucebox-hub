@@ -271,12 +271,18 @@ static cudaError_t launch_decode_impl(
                                          : Cfg::HIDDEN) * (int)sizeof(float);
     // Opt the kernel into the Blackwell extended shmem limit
     // (sm_120/121 allows up to 100 KB dynamic shmem per block, vs
-    // the 48 KB default). Safe to call repeatedly; this is a
-    // per-kernel attribute and the value is idempotent.
-    cudaError_t e = cudaFuncSetAttribute(
-        (void *)decode_kernel_impl<Cfg, USE_NVFP4>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SHMEM_BYTES);
-    if (e != cudaSuccess) return e;
+    // the 48 KB default). The attribute is per-kernel and persists
+    // for the lifetime of the CUDA context; set it once with a
+    // function-local static guard so we don't pay the syscall
+    // every launch.
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaError_t e = cudaFuncSetAttribute(
+            (void *)decode_kernel_impl<Cfg, USE_NVFP4>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SHMEM_BYTES);
+        if (e != cudaSuccess) return e;
+        attr_set = true;
+    }
     return cudaLaunchCooperativeKernel(
         (void *)decode_kernel_impl<Cfg, USE_NVFP4>, grid, block, args,
         DYN_SHMEM_BYTES, stream);
