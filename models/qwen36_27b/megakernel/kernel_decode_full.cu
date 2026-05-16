@@ -281,6 +281,16 @@ static cudaError_t launch_decode_impl(
             (void *)decode_kernel_impl<Cfg, USE_NVFP4>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SHMEM_BYTES);
         if (e != cudaSuccess) return e;
+        // Also pin the SM L1/shmem carveout to all-shmem so the driver
+        // doesn't shrink the per-block shmem allocation between
+        // launches. Without this, repeated cooperative launches with
+        // > 48 KB dyn shmem on sm_121a sometimes return garbage from
+        // the dynamic-shmem region on the second decoder.
+        e = cudaFuncSetAttribute(
+            (void *)decode_kernel_impl<Cfg, USE_NVFP4>,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared);
+        if (e != cudaSuccess) return e;
         attr_set = true;
     }
     return cudaLaunchCooperativeKernel(
