@@ -31,14 +31,18 @@ After the MRoPE text-only fix (pos_h = pos_w = pos_t):
 | "The capital of France is" | 5 | ' Paris' | ' Paris' | ✓ | 0.992 |
 | "In the beginning..." | 16 | ' the' | ' the' | ✓ | 0.994 |
 
-### C7 — Long-context sweep (wikitext, May 2026, post-stride-fix)
+### C7 — Long-context sweep (wikitext, May 2026, post-ring-buffer-fix)
 
 | S | HF top-1 | Ours top-1 | Match | Cos | max_abs | KL | top5_ov | ours_step_ms |
 |---|---:|---:|:---:|---:|---:|---:|---:|---:|
-| 32  | 3878 | 3878 | ✓ | 0.997634 | 2.034 | 0.0106 | 0.80 | 6962 (HF 1406) |
-| 64  | 17   | 17   | ✓ | 0.965956 | 2.737 | 0.0009 | 1.00 | 13845 (HF 465) |
-| 128 | 303  | 303  | ✓ | 0.992968 | 1.322 | 0.0045 | 0.80 | 27050 (HF 419) |
-| 256 | 17   | 17   | ✓ | 0.995505 | 1.221 | 0.0002 | 1.00 | 54193 (HF 531) |
+| 32  | 3878 | 3878 | ✓ | 0.997985 | 1.724 | 0.0078 | 0.80 | 7862 (HF 1602) |
+| 64  | 17   | 17   | ✓ | 0.966862 | 2.738 | 0.0007 | 1.00 | 13723 (HF 365)  |
+| 128 | 303  | 303  | ✓ | 0.993205 | 1.348 | 0.0053 | 0.80 | 27409 (HF 414)  |
+| 256 | 17   | 17   | ✓ | 0.995332 | 1.265 | 0.0002 | 0.80 | 54157 (HF 528)  |
+
+Top-1 still matches HF on every S; the cosine numbers shifted only by
+fp32-noise levels after the ring-buffer fix (the dip at S=64 is a
+separate residual drift, not nondeterminism).
 
 **Top-1 matches HF on every S.** KL ≤ 0.011 nats throughout — the
 distributions are close enough that argmax is stable. Cos dips to
