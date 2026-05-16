@@ -151,26 +151,38 @@ __device__ void delta_net_layer(
         // (race-immune). Reads of the other three slots only touch
         // values written in previous positions (race-free).
         const int write_slot = position & (CONV_K - 1);  // CONV_K=4
-        struct Region { int ch_base; int count; float *dst; };
-        Region regs[3] = {
-            { qk_head * KEY,             KEY, s_q },
-            { QK_SIZE + qk_head * KEY,   KEY, s_k },
-            { 2*QK_SIZE + v_head  * VAL, VAL, s_v },
-        };
-        for (int r = 0; r < 3; ++r) {
-            const Region &R = regs[r];
-            for (int c = threadIdx.x; c < R.count; c += BLOCK_SIZE) {
-                int ch = R.ch_base + c;
-                conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
-                float co = 0.0f;
-                #pragma unroll
-                for (int t = 0; t < CONV_K; ++t) {
-                    int slot = (position + t + 1) & (CONV_K - 1);
-                    co += conv_buf[ch * CONV_K + slot]
-                          * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
-                }
-                R.dst[c] = fast_silu(co);
+        // Flatten Q/K/V into one channel loop so all 12 warps run
+        // concurrently. The previous nested `for (r in 0..3)` left
+        // 3/4 of the block idle per region — KEY=VAL=128 ≤ 4 warps,
+        // and the regions ran sequentially. ncu profile (May 2026)
+        // flagged this as ~25% utilization on the conv1d phase.
+        // Now: total = 2*KEY + VAL = 384 channels in one pass with
+        // BLOCK_SIZE=512 threads (12 active warps). Warp boundaries
+        // align with KEY/2*KEY transitions (KEY=128 is a multiple of
+        // 32), so no intra-warp divergence.
+        const int qk_K_base  = qk_head * KEY;             // Q channels
+        const int qk_K2_base = QK_SIZE + qk_head * KEY;   // K channels
+        const int v_V_base   = 2 * QK_SIZE + v_head * VAL; // V channels
+        constexpr int TOTAL = 2 * KEY + VAL;
+        for (int c = threadIdx.x; c < TOTAL; c += BLOCK_SIZE) {
+            int ch, dst_idx;
+            float *dst_buf;
+            if (c < KEY) {
+                ch = qk_K_base + c;          dst_buf = s_q;  dst_idx = c;
+            } else if (c < 2 * KEY) {
+                ch = qk_K2_base + (c - KEY); dst_buf = s_k;  dst_idx = c - KEY;
+            } else {
+                ch = v_V_base + (c - 2*KEY); dst_buf = s_v;  dst_idx = c - 2*KEY;
             }
+            conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
+            float co = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < CONV_K; ++t) {
+                int slot = (position + t + 1) & (CONV_K - 1);
+                co += conv_buf[ch * CONV_K + slot]
+                      * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
+            }
+            dst_buf[dst_idx] = fast_silu(co);
         }
 
         // Beta / alpha activations — per V head.
@@ -365,28 +377,33 @@ __device__ void delta_net_layer_nvfp4(
         __shared__ float s_k[Cfg::DN_KEY_DIM];
         __shared__ float s_v[Cfg::DN_VALUE_DIM];
 
-        // Ring-buffer conv_buf (see BF16 delta_net_layer comment).
+        // Ring-buffer conv_buf (see BF16 delta_net_layer comment) +
+        // flattened Q/K/V loop (12 active warps vs 4 in the old per-
+        // region pass — see ncu finding in SESSION_NOTES).
         const int write_slot = position & (CONV_K - 1);
-        struct Region { int ch_base; int count; float *dst; };
-        Region regs[3] = {
-            { qk_head * KEY,             KEY, s_q },
-            { QK_SIZE + qk_head * KEY,   KEY, s_k },
-            { 2*QK_SIZE + v_head  * VAL, VAL, s_v },
-        };
-        for (int r = 0; r < 3; ++r) {
-            const Region &R = regs[r];
-            for (int c = threadIdx.x; c < R.count; c += BLOCK_SIZE) {
-                int ch = R.ch_base + c;
-                conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
-                float co = 0.0f;
-                #pragma unroll
-                for (int t = 0; t < CONV_K; ++t) {
-                    int slot = (position + t + 1) & (CONV_K - 1);
-                    co += conv_buf[ch * CONV_K + slot]
-                          * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
-                }
-                R.dst[c] = fast_silu(co);
+        const int qk_K_base  = qk_head * KEY;
+        const int qk_K2_base = QK_SIZE + qk_head * KEY;
+        const int v_V_base   = 2 * QK_SIZE + v_head * VAL;
+        constexpr int TOTAL = 2 * KEY + VAL;
+        for (int c = threadIdx.x; c < TOTAL; c += BLOCK_SIZE) {
+            int ch, dst_idx;
+            float *dst_buf;
+            if (c < KEY) {
+                ch = qk_K_base + c;          dst_buf = s_q;  dst_idx = c;
+            } else if (c < 2 * KEY) {
+                ch = qk_K2_base + (c - KEY); dst_buf = s_k;  dst_idx = c - KEY;
+            } else {
+                ch = v_V_base + (c - 2*KEY); dst_buf = s_v;  dst_idx = c - 2*KEY;
             }
+            conv_buf[ch * CONV_K + write_slot] = g_qkv[ch];
+            float co = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < CONV_K; ++t) {
+                int slot = (position + t + 1) & (CONV_K - 1);
+                co += conv_buf[ch * CONV_K + slot]
+                      * __bfloat162float(__ldg(w.conv1d_weight + ch * CONV_K + t));
+            }
+            dst_buf[dst_idx] = fast_silu(co);
         }
 
         if (threadIdx.x == 0) {
