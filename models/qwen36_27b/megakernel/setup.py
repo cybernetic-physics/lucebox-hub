@@ -51,10 +51,10 @@ setup(
                     "--use_fast_math",
                     "-std=c++17",
                     "-lineinfo",
-                    # Add "-DDECODE_NAN_CANARY" here to enable the
-                    # per-layer printf hash trace in
-                    # `kernel_decode_full.cu` (F10 debug; off by
-                    # default — costs nothing in production builds).
+                    # Add "-DDECODE_NAN_CANARY" or "-DDN_SUBOP_CANARY"
+                    # here to enable per-layer / per-sub-op printf hash
+                    # traces (F10 debug; off by default — cost nothing
+                    # in production builds).
                 ],
             },
         ),

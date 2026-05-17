@@ -126,6 +126,26 @@ __device__ void delta_net_layer(
     matvec_bf16<Cfg>(s_norm, w.alpha_proj_weight,  g_alpha, H, V_HEADS, num_blocks);
     grid.sync();
 
+#ifdef DN_SUBOP_CANARY
+    // F10 sub-op fingerprint. Hashes inputs/outputs of the projection
+    // phase. Only triggers at position 0 (first decode token) to keep
+    // output tractable. To target a specific layer, filter by the
+    // dn_state base pointer (it's unique per layer).
+    if (position == 0 && block_id == 0 && threadIdx.x == 0) {
+        uint32_t sh = 0;
+        const uint16_t *sn = reinterpret_cast<const uint16_t *>(s_norm);
+        for (int i = 0; i < H; ++i) sh ^= ((uint32_t)sn[i]) << ((i & 1) * 16);
+        uint32_t qkv_h = 0;
+        const uint32_t *qkv_u = reinterpret_cast<const uint32_t *>(g_qkv);
+        for (int i = 0; i < CONV_CH; ++i) qkv_h ^= qkv_u[i] * (uint32_t)(i + 1);
+        uint32_t z_h = 0;
+        const uint32_t *z_u = reinterpret_cast<const uint32_t *>(g_z);
+        for (int i = 0; i < V_SIZE; ++i) z_h ^= z_u[i] * (uint32_t)(i + 1);
+        printf("[DN-sub] dn_state_p=%p  s_norm=0x%08x  qkv=0x%08x  z=0x%08x\n",
+               (void *)dn_state, sh, qkv_h, z_h);
+    }
+#endif
+
     // 3. Conv1d + SiLU + recurrence. One block per V head.
     if (block_id < V_HEADS) {
         int v_head  = block_id;
@@ -290,6 +310,23 @@ __device__ void delta_net_layer(
     }
     grid.sync();
 
+#ifdef DN_SUBOP_CANARY
+    // Hash g_dn_out per v_head and report which v_head first NaNs.
+    if (position == 0 && block_id == 0 && threadIdx.x == 0) {
+        int first_nan_vh = -1;
+        for (int vh = 0; vh < V_HEADS && first_nan_vh < 0; ++vh) {
+            for (int i = 0; i < VAL; ++i) {
+                if (!isfinite(g_dn_out[vh * VAL + i])) { first_nan_vh = vh; break; }
+            }
+        }
+        uint32_t h = 0;
+        const uint32_t *u = reinterpret_cast<const uint32_t *>(g_dn_out);
+        for (int i = 0; i < V_SIZE; ++i) h ^= u[i] * (uint32_t)(i + 1);
+        printf("[DN-sub] dn_state_p=%p  post-recurrence g_dn_out=0x%08x first_nan_vh=%d\n",
+               (void *)dn_state, h, first_nan_vh);
+    }
+#endif
+
     // 4. Out projection + residual.
     {
         float *s_dn = reinterpret_cast<float *>(shmem);
@@ -299,6 +336,22 @@ __device__ void delta_net_layer(
                                 V_SIZE, H, num_blocks);
     }
     grid.sync();
+
+#ifdef DN_SUBOP_CANARY
+    // Hash hidden_out after o_proj + residual.
+    if (position == 0 && block_id == 0 && threadIdx.x == 0) {
+        uint32_t h = 0;
+        const uint16_t *u = reinterpret_cast<const uint16_t *>(hidden_out);
+        bool nan = false;
+        for (int i = 0; i < H; ++i) {
+            h ^= ((uint32_t)u[i]) << ((i & 1) * 16);
+            float v = __bfloat162float(hidden_out[i]);
+            if (!isfinite(v)) nan = true;
+        }
+        printf("[DN-sub] dn_state_p=%p  post-oproj hidden_out=0x%08x nan=%d\n",
+               (void *)dn_state, h, (int)nan);
+    }
+#endif
 
     // 5. Post-attn RMSNorm + MLP (uses same shmem region; residual is
     //    `hidden_out` here, captured into g_residual by rmsnorm_capture).

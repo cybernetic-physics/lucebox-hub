@@ -485,6 +485,22 @@ These are needed for production but don't gate correctness.
     Something about the 43rd consecutive DN layer's compute, on
     real HF weight magnitudes, hits a race the small-weight test
     doesn't.
+- **Further narrowing** via `-DDN_SUBOP_CANARY` per-sub-op fingerprints
+  (see `dn_layer.cuh`):
+  - PRE-rmsnorm (block 0's `s_norm` shmem hash): BIT-IDENTICAL (`0xf8a0fa73`)
+  - POST-qkv-proj (`g_qkv` hash): BIT-IDENTICAL (`0x5e63bab5`)
+  - POST-z-proj   (`g_z` hash):   BIT-IDENTICAL (`0xc99bf2c0`)
+  - POST-recurrence: dec1 hash `0x719cd965` finite; dec2 hash
+    `0x8965a34e` **NaN starting at v_head=0**.
+  - POST-oproj (after step 4): dec1 finite, dec2 already NaN.
+- So the racing op is INSIDE `delta_net_layer` step 3 (conv1d +
+  beta/alpha activation + L2 norm + recurrence + group RMSnorm)
+  for v_head=0 of layer 57. With bit-identical inputs and a
+  freshly-zeroed dn_state/conv_buf, dec1 produces finite output
+  while dec2 produces NaN — strong evidence of an inter-block or
+  warp-level race that the small-weight determinism test misses
+  (probably because real HF weight magnitudes are needed to
+  trigger the actual numerical divergence).
 - Repros under `test/debug_multi_decoder*.py`:
   - `debug_multi_decoder.py`: 3 trials in a for-loop, reassigning
     `dec` (old GC'd). Trial 0 OK, trials 1+ NaN.
