@@ -126,6 +126,24 @@ decode_kernel_impl(
     }
     grid.sync();
 
+#ifdef DECODE_NAN_CANARY
+    // F10 debug: check hidden_buffer for NaN after embed lookup. If
+    // the embed write came from a stale/corrupted weight pointer, we
+    // see NaN here. One print only (block 0, lane 0).
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int i = 0; i < H; ++i) {
+            float v = __bfloat162float(hidden_buffer[i]);
+            if (!isfinite(v)) {
+                printf("[NaN-canary] embed lookup produced non-finite at i=%d "
+                       "(tok_id=%d, embed_ptr=%p)\n",
+                       i, tok_id, (const void*)embed_weight);
+                break;
+            }
+        }
+    }
+    grid.sync();
+#endif
+
     // 3. Layer loop.
     int fa_kv_stride = KV_H * max_seq_len * HEAD;
     size_t dn_state_stride = (size_t)V_HEADS * KEY * VAL;
@@ -137,6 +155,29 @@ decode_kernel_impl(
     for (int layer = 0; layer < Cfg::NUM_LAYERS; ++layer) {
         const __nv_bfloat16 *layer_input = hidden_buffer;
         int lt = layer_weights[layer].layer_type;
+#ifdef DECODE_NAN_CANARY
+        // Probe the per-layer DN state and conv buffer at the START of
+        // each DN layer. If they're not zero on iter 0, something
+        // upstream corrupted them.
+        if ((lt == 0 || lt == 2) && position == 0 && layer >= 40 &&
+            blockIdx.x == 0 && threadIdx.x == 0) {
+            float *cb = conv_bufs + (size_t)dn_layer_idx * conv_stride;
+            float *ds = dn_states + (size_t)dn_layer_idx * dn_state_stride;
+            float cb_max = 0.0f, ds_max = 0.0f;
+            bool cb_nan = false, ds_nan = false;
+            for (size_t i = 0; i < conv_stride; ++i) {
+                if (!isfinite(cb[i])) { cb_nan = true; break; }
+                cb_max = fmaxf(cb_max, fabsf(cb[i]));
+            }
+            for (size_t i = 0; i < dn_state_stride; ++i) {
+                if (!isfinite(ds[i])) { ds_nan = true; break; }
+                ds_max = fmaxf(ds_max, fabsf(ds[i]));
+            }
+            printf("[NaN-canary] PRE layer %2d dn_idx=%d: conv_buf max=%.4g nan=%d  "
+                   "dn_state max=%.4g nan=%d\n",
+                   layer, dn_layer_idx, cb_max, cb_nan, ds_max, ds_nan);
+        }
+#endif
         if constexpr (USE_NVFP4) {
             if (lt == 2) {
                 delta_net_layer_nvfp4<Cfg>(
@@ -199,6 +240,33 @@ decode_kernel_impl(
             }
             grid.sync();
         }
+#ifdef DECODE_NAN_CANARY
+        // F10 debug: check hidden_buffer + a sample of state at each
+        // layer. Print once per layer (block 0 thread 0) when NaN/Inf
+        // first appears, including max_abs of hidden_buffer + state.
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            float h_max = 0.0f;
+            int   h_nan_i = -1;
+            for (int i = 0; i < H; ++i) {
+                float v = __bfloat162float(hidden_buffer[i]);
+                if (!isfinite(v)) { h_nan_i = i; break; }
+                h_max = fmaxf(h_max, fabsf(v));
+            }
+            // F10 debug: print every layer in window 40..63 + on NaN.
+            if (h_nan_i >= 0 || (layer >= 40 && position == 0)) {
+                // XOR all bf16 values into a uint32 fingerprint. Two
+                // bit-identical hidden_buffers MUST share this hash.
+                uint32_t hash = 0;
+                const uint16_t *as_u16 = reinterpret_cast<const uint16_t *>(hidden_buffer);
+                for (int i = 0; i < H; ++i) {
+                    hash ^= ((uint32_t)as_u16[i]) << ((i & 1) * 16);
+                }
+                printf("[NaN-canary] layer %2d (type=%d) pos=%d: max_abs=%.4g "
+                       "hash=0x%08x nan_at=%d\n",
+                       layer, lt, position, h_max, hash, h_nan_i);
+            }
+        }
+#endif
     }
 
     // 4. Final RMSNorm (block 0 only; result lives in g_normalized as fp32

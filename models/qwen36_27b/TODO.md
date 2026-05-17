@@ -460,12 +460,31 @@ These are needed for production but don't gate correctness.
   because of the multi-decoder NaN bug, not because of F2. Either
   rewrite to use one decoder, or fix the multi-decoder bug.
 
-### F10. Multi-decoder NaN [NEW]
+### F10. Multi-decoder NaN — narrowed to DN layer 57 [NEW]
 - **Status**: BROKEN  | **Prio**: P2  | **Effort**: M  | **Deps**: —
 - Creating multiple `Qwen36MegakernelDecoder` instances in one Python
   process causes prefill to produce NaN on real HF weights once
   enough kernel launches have accumulated. Random small weights
   don't trigger this.
+- **Narrowed to DN layer 57 (dn_layer_idx=43)** via the per-layer
+  XOR-hash canary in `kernel_decode_full.cu` (compile with
+  `-DDECODE_NAN_CANARY` to enable). Pattern:
+  - Trial 0 (first decoder): every layer 0..63 finite, all hashes
+    consistent run-to-run.
+  - Trial 1+ (subsequent decoders): layers 0..56 produce
+    BIT-IDENTICAL hidden_buffer hashes vs trial 0 (e.g.,
+    `layer 56 hash=0x861bf8e5` in both). PRE-layer-57 conv_buf and
+    dn_state are verified all-zero. Yet **layer 57's compute
+    produces NaN** in dec2 while dec1's compute produces 69.5.
+  - Identical inputs + identical buffers + identical pointers
+    (blob byte-identical, weight data_ptrs match HF) → different
+    outputs. This is a second nondeterminism class that the
+    random-weight `test_kernel_determinism.py` doesn't catch.
+  - Compute-sanitizer memcheck + initcheck report 0 errors.
+  - Layer 57 is DN (not FA). The previous DN layer (56) is clean.
+    Something about the 43rd consecutive DN layer's compute, on
+    real HF weight magnitudes, hits a race the small-weight test
+    doesn't.
 - Repros under `test/debug_multi_decoder*.py`:
   - `debug_multi_decoder.py`: 3 trials in a for-loop, reassigning
     `dec` (old GC'd). Trial 0 OK, trials 1+ NaN.
