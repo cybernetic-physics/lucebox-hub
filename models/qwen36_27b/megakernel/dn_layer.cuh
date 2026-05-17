@@ -132,17 +132,31 @@ __device__ void delta_net_layer(
     // output tractable. To target a specific layer, filter by the
     // dn_state base pointer (it's unique per layer).
     if (position == 0 && block_id == 0 && threadIdx.x == 0) {
+        auto hash_f = [](const float *p, int n) {
+            uint32_t h = 0;
+            const uint32_t *u = reinterpret_cast<const uint32_t *>(p);
+            for (int i = 0; i < n; ++i) h ^= u[i] * (uint32_t)(i + 1);
+            return h;
+        };
+        auto first_nan = [](const float *p, int n) {
+            for (int i = 0; i < n; ++i) if (!isfinite(p[i])) return i;
+            return -1;
+        };
         uint32_t sh = 0;
         const uint16_t *sn = reinterpret_cast<const uint16_t *>(s_norm);
         for (int i = 0; i < H; ++i) sh ^= ((uint32_t)sn[i]) << ((i & 1) * 16);
-        uint32_t qkv_h = 0;
-        const uint32_t *qkv_u = reinterpret_cast<const uint32_t *>(g_qkv);
-        for (int i = 0; i < CONV_CH; ++i) qkv_h ^= qkv_u[i] * (uint32_t)(i + 1);
-        uint32_t z_h = 0;
-        const uint32_t *z_u = reinterpret_cast<const uint32_t *>(g_z);
-        for (int i = 0; i < V_SIZE; ++i) z_h ^= z_u[i] * (uint32_t)(i + 1);
-        printf("[DN-sub] dn_state_p=%p  s_norm=0x%08x  qkv=0x%08x  z=0x%08x\n",
-               (void *)dn_state, sh, qkv_h, z_h);
+        printf("[DN-sub] dn_state_p=%p  s_norm=0x%08x  qkv=%08x(nan@%d)  "
+               "z=%08x  beta[0:3]=%f,%f,%f  alpha[0:3]=%f,%f,%f  "
+               "alpha[24:26]=%f,%f  alpha[47]=%f  alpha_nan@%d  weight_p=%p\n",
+               (void *)dn_state, sh,
+               hash_f(g_qkv, CONV_CH), first_nan(g_qkv, CONV_CH),
+               hash_f(g_z, V_SIZE),
+               g_beta[0], g_beta[1], g_beta[2],
+               g_alpha[0], g_alpha[1], g_alpha[2],
+               g_alpha[24], g_alpha[25],
+               g_alpha[47],
+               first_nan(g_alpha, V_HEADS),
+               (void *)w.alpha_proj_weight);
     }
 #endif
 
@@ -312,6 +326,8 @@ __device__ void delta_net_layer(
 
 #ifdef DN_SUBOP_CANARY
     // Hash g_dn_out per v_head and report which v_head first NaNs.
+    // Also print g_alpha[0] and g_beta[0] POST-activation (they got
+    // overwritten in step 3 by sigmoid/expm1) to verify no NaN there.
     if (position == 0 && block_id == 0 && threadIdx.x == 0) {
         int first_nan_vh = -1;
         for (int vh = 0; vh < V_HEADS && first_nan_vh < 0; ++vh) {
@@ -322,8 +338,9 @@ __device__ void delta_net_layer(
         uint32_t h = 0;
         const uint32_t *u = reinterpret_cast<const uint32_t *>(g_dn_out);
         for (int i = 0; i < V_SIZE; ++i) h ^= u[i] * (uint32_t)(i + 1);
-        printf("[DN-sub] dn_state_p=%p  post-recurrence g_dn_out=0x%08x first_nan_vh=%d\n",
-               (void *)dn_state, h, first_nan_vh);
+        printf("[DN-sub] dn_state_p=%p  post-rec g_dn_out=0x%08x first_nan_vh=%d  "
+               "post-act beta[0]=%f alpha[0]=%f  dn_out[0]=%f\n",
+               (void *)dn_state, h, first_nan_vh, g_beta[0], g_alpha[0], g_dn_out[0]);
     }
 #endif
 

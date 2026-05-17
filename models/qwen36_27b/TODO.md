@@ -490,17 +490,22 @@ These are needed for production but don't gate correctness.
   - PRE-rmsnorm (block 0's `s_norm` shmem hash): BIT-IDENTICAL (`0xf8a0fa73`)
   - POST-qkv-proj (`g_qkv` hash): BIT-IDENTICAL (`0x5e63bab5`)
   - POST-z-proj   (`g_z` hash):   BIT-IDENTICAL (`0xc99bf2c0`)
-  - POST-recurrence: dec1 hash `0x719cd965` finite; dec2 hash
-    `0x8965a34e` **NaN starting at v_head=0**.
-  - POST-oproj (after step 4): dec1 finite, dec2 already NaN.
-- So the racing op is INSIDE `delta_net_layer` step 3 (conv1d +
-  beta/alpha activation + L2 norm + recurrence + group RMSnorm)
-  for v_head=0 of layer 57. With bit-identical inputs and a
-  freshly-zeroed dn_state/conv_buf, dec1 produces finite output
-  while dec2 produces NaN — strong evidence of an inter-block or
-  warp-level race that the small-weight determinism test misses
-  (probably because real HF weight magnitudes are needed to
-  trigger the actual numerical divergence).
+  - POST-{beta,alpha}-proj at layer 57: **THE NAN RANDOMIZES**. Across
+    runs, sometimes `g_alpha[0]=nan` while `g_beta[0]=1.692904`
+    (finite), sometimes `g_beta[0]=nan,nan,nan` while
+    `g_alpha[0]=1.086951` (finite). The dec1 trial always finishes
+    these projections finitely.
+  - POST-recurrence: NaN propagates from whichever projection NaN'd.
+- This is a **true timing-dependent race in `matvec_bf16`** (not a
+  bug in the recurrence). Bit-identical `s_norm` + same weight
+  pointer for the offending projection → different output across
+  consecutive launches. The `is the projection that NaNs` depends on
+  GPU block scheduling, hence the randomization.
+- `compute-sanitizer memcheck + initcheck`: 0 errors.
+- Random small weights don't trigger — probably because the
+  intermediate dot-product magnitudes are well below the bf16/fp32
+  range where the race can produce NaN (likely an uninitialized-read
+  pattern that lands on zero memory in the small-weight case).
 - Repros under `test/debug_multi_decoder*.py`:
   - `debug_multi_decoder.py`: 3 trials in a for-loop, reassigning
     `dec` (old GC'd). Trial 0 OK, trials 1+ NaN.
