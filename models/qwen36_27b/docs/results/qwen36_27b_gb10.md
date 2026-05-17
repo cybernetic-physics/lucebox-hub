@@ -109,6 +109,23 @@ Memory-bound ceiling at 700 GB/s LPDDR5X-8000:
 - BF16: 50 GB/tok → 14.0 tok/s ceiling; measured 4.48 → 32% of peak
 - NVFP4: 13 GB/tok → 53.7 tok/s ceiling; measured 12.46 → 23% of peak
 
+### Sweep — post conv1d ring-buffer + flatten (May 16 2026)
+
+After the ring-buffer fix (`dn_layer.cuh:153-180`) replaced the 7-op
+shift with a 1-write ring update, and the Q/K/V flatten put 12 active
+warps in the conv1d phase instead of 4:
+
+| S    | pp BF16 (naive) tok/s | tg64 BF16 tok/s | tg64 NVFP4 tok/s | Δ NVFP4 |
+|------|---:|---:|---:|---:|
+| 16   | 4.7 |  4.52 | **14.46** | +16% |
+| 64   | 4.7 |  4.51 | **14.37** | +14% |
+| 256  | 4.7 |  4.50 | **14.28** | +13% |
+
+BF16 unchanged (it's bottlenecked by MLP HBM reads, not conv1d
+compute — see Nsight Compute finding). NVFP4 gains because the
+conv1d phase is a larger fraction of its decode time (matvec is
+~4× cheaper in NVFP4) so cutting conv1d ops is visible end-to-end.
+
 ### Cross-implementation — fork vs upstream `Luce-Org/lucebox-hub@9f1b98b` on GB10
 
 Same model (Qwen3.6-27B), same hardware. Upstream's 27B path is `dflash/`
